@@ -121,6 +121,41 @@ else
   warn "xrdp service is not active — check: sudo systemctl status xrdp"
 fi
 
+# ── Sanity-check: does the target user have a password set? ─────────
+# xrdp authenticates via PAM, which means a Linux *password* is what gets
+# typed at the RDP login screen. SSH-key-only setups often leave accounts
+# with NP (no password) or L (locked), which xrdp will silently reject
+# with a generic "authentication failed" error that's painful to debug.
+#
+# passwd -S output: "user STATUS date min max warn inactive"
+# STATUS field: P = usable password, L = locked, NP = no password set
+password_status=""
+if sudo passwd -S "$target_user" >/dev/null 2>&1; then
+  password_status="$(sudo passwd -S "$target_user" 2>/dev/null | awk '{print $2}')"
+fi
+
+case "$password_status" in
+  P)
+    ok "user '$target_user' has a password set (xrdp login will work)"
+    ;;
+  L)
+    warn "user '$target_user' has a LOCKED password — xrdp login will fail"
+    warn "  fix:  sudo passwd -u $target_user    # unlock"
+    warn "        sudo passwd $target_user       # or set a new one"
+    ;;
+  NP|"")
+    warn "user '$target_user' has NO password set — xrdp login will fail"
+    warn "  this is normal for SSH-key-only servers, but xrdp needs a password"
+    warn "  fix:  sudo passwd $target_user"
+    warn ""
+    warn "  Use a strong one — xrdp on 127.0.0.1 isn't public, but PAM is PAM."
+    ;;
+  *)
+    warn "unexpected passwd status for '$target_user': '$password_status'"
+    warn "  if xrdp login fails, try: sudo passwd $target_user"
+    ;;
+esac
+
 # ── Print connection instructions ──────────────────────────────────
 echo ""
 info "Remote desktop ready. To connect from your Mac:"
