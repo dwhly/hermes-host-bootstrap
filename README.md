@@ -29,7 +29,38 @@ container runtime, media tooling, security baseline, and Hermes itself.
 tiers, with sane defaults. Re-running it is safe — every step checks
 before it acts.
 
-### Tiers
+### Roles
+
+The script also asks *what is this machine for?* — because a VPS and your
+Mac want very different software.
+
+| Role     | Auto-detected when… | Skips                                | Adds                                  |
+|----------|---------------------|--------------------------------------|---------------------------------------|
+| `server` | Linux, no `$DISPLAY` | Ghostty, MS Remote Desktop, mac apps | xrdp/XFCE (with `--tier=full`)        |
+| `client` | macOS               | xrdp, server-side daemons            | Ghostty, MS Remote Desktop, Tailscale GUI |
+| `both`   | Linux with a desktop | nothing                              | both sides                            |
+
+Override with `--role=server|client|both` if auto-detect gets it wrong.
+
+Examples:
+
+```bash
+# Fresh VPS — server bits only (auto-detected)
+./bootstrap.sh --tier=recommended
+
+# Fresh VPS but you want a remote desktop too
+./bootstrap.sh --tier=full              # xrdp + XFCE included
+
+# New Mac — client bits only (auto-detected)
+./bootstrap.sh --tier=recommended
+
+# Desktop Linux you use as your daily driver AND as a Hermes host
+./bootstrap.sh --tier=full --role=both
+```
+
+---
+
+## Tiers
 
 | Tier | What you get | When to use |
 |------|--------------|-------------|
@@ -43,23 +74,27 @@ Manifests: [`tiers/minimal.txt`](tiers/minimal.txt) ·
 
 ### Module layout
 
-The work is split across numbered modules in `lib/`. The runner just
-sorts them and executes in order:
+The work is split across prefixed modules in `lib/`. Numeric prefixes
+run in order (`00 → 90`), then letter-prefixed modules run last
+(`A0`, `M5`, …):
 
 ```
 lib/
-├── common.sh         shared helpers (logging, apt_install, ensure_line, tier_allows, …)
-├── 00-preflight.sh   hostname, tz, apt upgrade, swap, enable-linger
-├── 10-security.sh    openssh, ufw, fail2ban, unattended-upgrades, ssh hardening
-├── 20-buildchain.sh  build-essential + libs (so pip/cargo wheels compile)
-├── 30-shell.sh       tmux, zsh, oh-my-zsh, neovim, mosh, micro
-├── 40-cli.sh         rg, fd, fzf, bat, jq, htop, btop, eza, zoxide, delta, …
-├── 50-languages.sh   python + uv + pipx, fnm + Node LTS, Rust
-├── 60-containers.sh  Docker + compose, user added to docker group
-├── 70-network.sh     Tailscale, cloudflared
-├── 80-media.sh       ffmpeg, imagemagick, poppler, tesseract, pandoc, espeak-ng
-├── 90-agents.sh      hermes, gh, Claude Code CLI, Codex CLI, faster-whisper
-└── 95-ghostty.sh     Ghostty terminal — auto-skipped on headless hosts
+├── common.sh             shared helpers (logging, apt_install, ensure_line,
+│                         tier_allows, role_includes, …)
+├── 00-preflight.sh       hostname, tz, apt upgrade, swap, enable-linger
+├── 10-security.sh        openssh, ufw, fail2ban, unattended-upgrades, ssh hardening
+├── 20-buildchain.sh      build-essential + libs (so pip/cargo wheels compile)
+├── 30-shell.sh           tmux, zsh, oh-my-zsh, neovim, mosh, micro
+├── 40-cli.sh             rg, fd, fzf, bat, jq, htop, btop, eza, zoxide, delta, …
+├── 50-languages.sh       python + uv + pipx, fnm + Node LTS, Rust
+├── 60-containers.sh      Docker + compose, user added to docker group
+├── 70-network.sh         Tailscale, cloudflared
+├── 80-media.sh           ffmpeg, imagemagick, poppler, tesseract, pandoc, espeak-ng
+├── 90-agents.sh          hermes, gh, Claude Code CLI, Codex CLI, faster-whisper
+├── 95-ghostty.sh         Ghostty terminal — client/both role only
+├── A0-remote-desktop.sh  xrdp + XFCE (opt-in: --tier=full or --only=A0-remote-desktop)
+└── M5-mac-client.sh      MS Remote Desktop + Tailscale GUI (macOS client only)
 ```
 
 Each module can also be run on its own:
@@ -166,6 +201,44 @@ The script prints a checklist at the end. The short version:
 - macOS 14 (Sonoma) and 15 (Sequoia)
 
 Probably works on Ubuntu 22.04 too. PRs welcome for Fedora / Arch / WSL.
+
+---
+
+## Remote desktop on the VPS
+
+A headless VPS doesn't have a graphical desktop by default. If you want
+to ssh in *and* be able to run GUI apps (browser dev tools, an IDE,
+whatever) on the box itself, opt into the `A0-remote-desktop` module:
+
+```bash
+# Either way enables it:
+./bootstrap.sh --tier=full
+./bootstrap.sh --only=A0-remote-desktop   # standalone
+HERMES_RDP=1 ./bootstrap.sh                # any tier
+```
+
+What you get:
+- **XFCE** as the desktop (lightweight, ~150 MB)
+- **xrdp** as the protocol server, **bound to 127.0.0.1**
+
+You connect from your Mac in one of two ways:
+
+```bash
+# Option A — ssh tunnel
+ssh -L 3389:localhost:3389 you@vps
+# then open Windows App / Microsoft Remote Desktop → connect to localhost:3389
+
+# Option B — Tailscale
+tailscale serve --tcp=3389 tcp://localhost:3389  # one-time
+# then connect to your VPS's tailscale name on port 3389
+```
+
+**Microsoft Remote Desktop** (free, App Store; renamed "Windows App" in
+late 2024) is the recommended Mac client. The `M5-mac-client` module
+installs it automatically when `--role=client` or `--role=both`.
+
+To expose xrdp publicly anyway (not recommended), set
+`HERMES_RDP_PUBLIC=1`. You'll want `ufw` + `fail2ban` configured first.
 
 ---
 

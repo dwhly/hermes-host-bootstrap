@@ -41,8 +41,19 @@ AGENT
   + faster-whisper (Hermes local STT)
   + playwright system deps + bundled chromium
 
-GHOSTTY (client machines only)
+GHOSTTY (client/both role only)
   + Ghostty terminal emulator
     macOS: via brew --cask
     desktop Linux: via snap or flatpak
-    headless server: SKIPPED with a friendly notice
+    headless server: SKIPPED automatically by role gate
+
+REMOTE DESKTOP (server/both role, --tier=full only)
+  + xrdp + XFCE — opt-in remote desktop on the VPS
+    Bound to 127.0.0.1 by default; tunnel via ssh or Tailscale
+    Set HERMES_RDP_PUBLIC=1 to bind 0.0.0.0 (not recommended)
+    Can also be invoked alone: --only=A0-remote-desktop
+
+MAC-CLIENT (macOS + client/both role only)
+  + Microsoft Remote Desktop (Windows App)
+  + Tailscale GUI cask
+  + Ghostty config dotfile at ~/.config/ghostty/config

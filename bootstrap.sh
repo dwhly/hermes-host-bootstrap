@@ -15,6 +15,10 @@
 #
 # Flags:
 #   --tier=<minimal|recommended|full>   default: recommended
+#   --role=<server|client|both>         default: auto-detect
+#                                       server = headless VPS (no GUI client apps)
+#                                       client = your Mac (no xrdp/desktop)
+#                                       both   = desktop Linux daily-driver
 #   --skip=KEY1,KEY2,...                skip specific keywords (e.g. docker, zsh)
 #   --only=MOD1,MOD2,...                run only the named modules (e.g. 90-agents)
 #   --dry-run                           print the plan, don't execute
@@ -39,12 +43,15 @@ TIER="recommended"
 SKIP_KEYS=()
 ONLY_MODS=()
 DRY_RUN=0
+ROLE_CLI=""
 
 # ── Parse args ──────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tier=*) TIER="${1#*=}"; shift ;;
     --tier)   TIER="$2"; shift 2 ;;
+    --role=*) ROLE_CLI="${1#*=}"; shift ;;
+    --role)   ROLE_CLI="$2"; shift 2 ;;
     --skip=*) IFS=',' read -r -a SKIP_KEYS <<< "${1#*=}"; shift ;;
     --skip)   IFS=',' read -r -a SKIP_KEYS <<< "$2"; shift 2 ;;
     --only=*) IFS=',' read -r -a ONLY_MODS <<< "${1#*=}"; shift ;;
@@ -54,7 +61,7 @@ while [[ $# -gt 0 ]]; do
       cd "$REPO_ROOT" && git pull --ff-only && exec "$0" --tier="$TIER"
       ;;
     -h|--help)
-      sed -n '2,25p' "$0"
+      sed -n '2,30p' "$0"
       exit 0
       ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -66,6 +73,14 @@ case "$TIER" in
   *) echo "invalid --tier: $TIER (use minimal|recommended|full)" >&2; exit 2 ;;
 esac
 
+# Export ROLE before sourcing common.sh so it picks up the CLI override
+if [[ -n "$ROLE_CLI" ]]; then
+  case "$ROLE_CLI" in
+    server|client|both) export ROLE="$ROLE_CLI" ;;
+    *) echo "invalid --role: $ROLE_CLI (use server|client|both)" >&2; exit 2 ;;
+  esac
+fi
+
 export TIER SKIP_KEYS
 
 # ── Source common helpers ──
@@ -76,6 +91,7 @@ source "$REPO_ROOT/lib/common.sh"
 echo ""
 echo "${_C_BOLD}hermes-host-bootstrap${_C_RESET}"
 echo "  tier:    $TIER"
+echo "  role:    $ROLE$([[ -z "$ROLE_CLI" ]] && echo " (auto-detected)" || echo " (--role)")"
 echo "  os:      $OS ($ARCH)"
 echo "  headless: $([[ $IS_HEADLESS -eq 1 ]] && echo yes || echo no)"
 echo "  user:    ${USER}"
@@ -114,8 +130,12 @@ run_module() {
   }
 }
 
-# Discover modules in lib/, ordered by numeric prefix
-mapfile -t ALL_MODS < <(find "$REPO_ROOT/lib" -maxdepth 1 -name '[0-9][0-9]-*.sh' -print | sort | xargs -n1 basename | sed 's/\.sh$//')
+# Discover modules in lib/, ordered by prefix. Prefix can be:
+#   NN-name.sh    (numeric — runs in numeric order: 00, 10, 20, …)
+#   Xn-name.sh    (letter+digit — runs AFTER numerics, alphabetically:
+#                  A0-remote-desktop, M5-mac-client, …)
+# This lets us add optional/role-specific modules without renumbering.
+mapfile -t ALL_MODS < <(find "$REPO_ROOT/lib" -maxdepth 1 -name '[0-9A-Z][0-9A-Z]-*.sh' -print | sort | xargs -n1 basename | sed 's/\.sh$//')
 
 # Filter by --only if given
 if [[ ${#ONLY_MODS[@]} -gt 0 ]]; then

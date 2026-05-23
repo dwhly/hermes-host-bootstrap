@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# 95-ghostty: Ghostty terminal emulator.
+# 95-ghostty: Ghostty terminal emulator. Client/both role only.
 #
 # Ghostty is a GUI terminal app. It belongs on the CLIENT machine you ssh
-# FROM, not on a headless server. This module installs it on machines
-# that actually have a display, and logs a friendly skip on headless boxes.
+# FROM, not on a headless server. This module gates on $ROLE so it only
+# runs on machines that actually have (or will have) a display.
 
 set -euo pipefail
 # shellcheck disable=SC1091
@@ -16,9 +16,8 @@ if is_skipped ghostty; then
   return 0 2>/dev/null || exit 0
 fi
 
-# Skip on headless hosts — Ghostty needs a display
-if [[ "$IS_HEADLESS" -eq 1 && "$OS" != "macos" ]]; then
-  skip "headless host detected — Ghostty is a GUI app; install it on your client machine (Mac/desktop), not on the VPS"
+if ! role_includes client; then
+  skip "role=$ROLE — Ghostty is a GUI app; install it on your client machine (set --role=client or --role=both)"
   return 0 2>/dev/null || exit 0
 fi
 
@@ -36,11 +35,9 @@ if [[ "$OS" == "macos" ]]; then
   return 0 2>/dev/null || exit 0
 fi
 
-# Desktop Linux (rare for a Hermes host, but supported)
+# Desktop Linux
 case "$OS" in
   ubuntu|debian)
-    # Ghostty has no official apt repo yet (as of late 2025).
-    # Snap is the easiest route; flatpak as fallback.
     if have ghostty; then
       skip "Ghostty already installed"
     elif have snap; then
@@ -63,5 +60,16 @@ case "$OS" in
     warn "Ghostty: don't know how to install on OS=$OS; see https://ghostty.org/download"
     ;;
 esac
+
+# Drop a sensible default config (idempotent — only writes if missing)
+ghostty_cfg_dir="$HOME/.config/ghostty"
+ghostty_cfg="$ghostty_cfg_dir/config"
+if [[ -f "$REPO_ROOT/dotfiles/ghostty-config" && ! -f "$ghostty_cfg" ]]; then
+  mkdir -p "$ghostty_cfg_dir"
+  cp "$REPO_ROOT/dotfiles/ghostty-config" "$ghostty_cfg"
+  ok "installed ~/.config/ghostty/config"
+elif [[ -f "$ghostty_cfg" ]]; then
+  skip "$ghostty_cfg already exists — not overwritten"
+fi
 
 ok "Ghostty step complete"

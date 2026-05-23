@@ -36,6 +36,39 @@ if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" || -d /Applications ]]; the
   IS_HEADLESS=0
 fi
 
+# ── Role detection ──────────────────────────────────────────────────
+# Roles answer "what is this machine *for*?":
+#   server — a headless box you ssh INTO (a VPS). No GUI client apps.
+#   client — a personal machine you ssh FROM (your Mac). No server-side
+#            daemons like xrdp. Gets Ghostty, MS Remote Desktop, etc.
+#   both   — a desktop Linux you use AS your daily driver AND as a host.
+#            Gets both sides.
+# Auto-detected if --role wasn't passed; can be overridden explicitly.
+auto_detect_role() {
+  if [[ "$OS" == "macos" ]]; then
+    echo "client"
+    return
+  fi
+  # Linux: headless box = server; desktop Linux = both
+  if [[ "$IS_HEADLESS" -eq 1 ]]; then
+    echo "server"
+  else
+    echo "both"
+  fi
+}
+ROLE="${ROLE:-$(auto_detect_role)}"
+
+role_includes() {
+  # role_includes server  → true if ROLE is server or both
+  # role_includes client  → true if ROLE is client or both
+  local want="$1"
+  case "$ROLE" in
+    both) return 0 ;;
+    "$want") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # ── Idempotency primitives ──────────────────────────────────────────
 have() { command -v "$1" >/dev/null 2>&1; }
 
