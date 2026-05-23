@@ -22,7 +22,8 @@ fi
 # uv — Astral's Python package manager (Hermes' installer uses it)
 if tier_allows E && ! is_skipped uv && ! have uv; then
   info "installing uv (Astral)"
-  curl -LsSf https://astral.sh/uv/install.sh | sh
+  curl -LsSf https://astral.sh/uv/install.sh | sh || \
+    warn "uv install failed — see https://astral.sh/uv"
   # uv installs to ~/.local/bin
   export PATH="$HOME/.local/bin:$PATH"
   have uv && ok "uv installed: $(uv --version)" || warn "uv install may have failed"
@@ -32,7 +33,13 @@ fi
 if tier_allows E && ! is_skipped node; then
   if ! have fnm; then
     info "installing fnm (Fast Node Manager)"
-    curl -fsSL https://fnm.vercel.app/install | bash -s -- --skip-shell
+    # fnm install script needs unzip — we install that in 20-buildchain,
+    # but double-check here in case someone ran with --only=50-languages
+    if ! have unzip; then
+      warn "unzip is missing — fnm install will fail. Install with: sudo apt install unzip"
+    fi
+    curl -fsSL https://fnm.vercel.app/install | bash -s -- --skip-shell || \
+      warn "fnm install failed — see https://github.com/Schniz/fnm#installation"
   else
     skip "fnm already installed"
   fi
@@ -61,16 +68,23 @@ if tier_allows E && ! is_skipped node; then
   fi
 fi
 
-# pnpm — only if npm now present
-if tier_allows R && ! is_skipped pnpm && have npm && ! have pnpm; then
-  info "installing pnpm via npm"
-  npm install -g pnpm
+# pnpm — install via the now-available npm
+if tier_allows R && ! is_skipped pnpm && ! have pnpm; then
+  # fnm env was set up earlier in this module; npm should be on PATH now.
+  # If not, give the user a clear message instead of silently skipping.
+  if have npm; then
+    info "installing pnpm via npm"
+    npm install -g pnpm || warn "pnpm install failed"
+  else
+    warn "pnpm skipped: npm not on PATH (open a new shell and run 'npm install -g pnpm' manually)"
+  fi
 fi
 
 # ── Rust (rustup) ───────────────────────────────────────────────────
 if tier_allows R && ! is_skipped rust && ! have cargo; then
   info "installing Rust via rustup"
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path || \
+    warn "rustup install failed — see https://rustup.rs"
   # shellcheck disable=SC1091
   [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
 fi

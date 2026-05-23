@@ -51,10 +51,17 @@ if tier_allows R; then
     fi
   fi
 
-  # zoxide: official install script (no apt package on older releases)
+  # zoxide: official install script fails on `x86_64-unknown-linux-musl`
+  # on Ubuntu 24.04 (https://github.com/ajeetdsouza/zoxide/issues/...). Use
+  # apt where available; install-script only as fallback for older releases.
   if ! have zoxide && ! is_skipped zoxide; then
-    info "installing zoxide"
-    curl -sSfL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | bash
+    if apt-cache show zoxide >/dev/null 2>&1; then
+      apt_install zoxide
+    else
+      info "installing zoxide via official install script"
+      curl -sSfL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | bash || \
+        warn "zoxide install failed — install manually from https://github.com/ajeetdsouza/zoxide"
+    fi
   fi
 
   # git-delta: try apt, fallback to cargo
@@ -63,7 +70,7 @@ if tier_allows R; then
       apt_install git-delta
     elif have cargo; then
       info "installing git-delta via cargo"
-      cargo install git-delta
+      cargo install git-delta || warn "git-delta cargo install failed"
     else
       skip "git-delta skipped (no apt entry, no cargo)"
     fi

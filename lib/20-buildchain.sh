@@ -33,7 +33,10 @@ if tier_allows E; then
     libssl-dev libffi-dev \
     zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev liblzma-dev \
     ca-certificates curl wget git rsync \
-    less man-db cron logrotate
+    less man-db cron logrotate \
+    unzip zip
+  # ^ unzip needed by the fnm install script (50-languages.sh).
+  # zip is a freebie and gets asked for often enough.
 fi
 
 # Tier R
