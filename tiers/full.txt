@@ -1,0 +1,21 @@
+# Full tier — what `--tier=full` installs.
+# Includes everything from recommended, plus the small/easy nice-to-haves.
+
+CLI EXTRAS
+  + tldr (simplified man pages)
+  + tree
+  + httpie (friendly curl alternative)
+  + git-lfs (Git Large File Storage)
+  + iotop, iftop, glances (system monitoring)
+  + graphviz (diagram skills)
+
+SHELL EXTRAS
+  + micro (friendlier than vim for ad-hoc edits)
+
+MEDIA EXTRAS
+  + espeak-ng (needed by NeuTTS local TTS provider)
+
+# Note: these are the only [N]-tier items we install automatically.
+# Heavier/manual ones (auditd, rkhunter, netdata, chezmoi, yadm,
+# git-crypt, sops, wireguard, ngrok, Go, OpenCode) are intentionally
+# left out — install them on demand if you need them.

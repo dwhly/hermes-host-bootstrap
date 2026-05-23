@@ -1,0 +1,48 @@
+# Recommended tier — what `--tier=recommended` installs.
+# Includes everything from minimal, plus the items below.
+
+PREFLIGHT
+  + swap file (auto-created if RAM < 4GB and no swap)
+
+SECURITY
+  (same as minimal; behaviour identical)
+
+BUILD CHAIN
+  + cmake
+
+SHELL
+  + zsh + oh-my-zsh (unattended install)
+  + mosh (survives ssh disconnect / laptop suspend)
+  + ~/.inputrc (case-insensitive completion, history search on arrows)
+  + ~/.hermes-host-bootstrap.zshrc (history + path + aliases)
+
+CLI
+  + fzf, bat, eza, zoxide, yq, ncdu, btop, shellcheck
+  + git-delta
+
+LANGUAGES
+  + Rust (rustup)
+  + pnpm
+
+CONTAINERS
+  + Docker + docker compose
+    (user added to `docker` group — needs re-login)
+
+NETWORK
+  + Tailscale (installed; run `sudo tailscale up` manually)
+  + cloudflared (named tunnels — useful for `hermes webhook`)
+
+MEDIA / DOCS
+  + ffmpeg, imagemagick, poppler-utils, tesseract-ocr, pandoc
+
+AGENT
+  + Claude Code CLI (via npm)
+  + Codex CLI (via npm)
+  + faster-whisper (Hermes local STT)
+  + playwright system deps + bundled chromium
+
+GHOSTTY (client machines only)
+  + Ghostty terminal emulator
+    macOS: via brew --cask
+    desktop Linux: via snap or flatpak
+    headless server: SKIPPED with a friendly notice

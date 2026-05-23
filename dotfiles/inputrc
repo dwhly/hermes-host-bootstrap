@@ -1,0 +1,20 @@
+# ── hermes-host-bootstrap .inputrc ──
+# Readline tweaks. Sourced by bash + anything else that uses libreadline (psql, python REPL).
+
+# Case-insensitive tab completion
+set completion-ignore-case on
+
+# Show menu on first Tab instead of beep + second Tab
+set show-all-if-ambiguous on
+set show-all-if-unmodified on
+
+# Coloured completion listings
+set colored-stats on
+set colored-completion-prefix on
+
+# History search on arrow keys (type prefix, then ↑/↓ to walk matching history)
+"\e[A": history-search-backward
+"\e[B": history-search-forward
+
+# Disable bell
+set bell-style none

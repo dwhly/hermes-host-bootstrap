@@ -1,0 +1,37 @@
+# Minimal tier — what `--tier=minimal` installs.
+# These are the 25-item "minimum viable Hermes host" set.
+# Pure documentation file; the actual filtering happens in lib/common.sh::tier_allows.
+
+PREFLIGHT
+  apt update + upgrade
+  hostnamectl + timedatectl
+  enable-linger (so `hermes gateway` systemd-user service survives ssh logout)
+
+SECURITY
+  openssh-server
+  ufw (installed; not enabled by default — set HERMES_UFW_ENABLE=1)
+  fail2ban
+  unattended-upgrades
+
+BUILD CHAIN
+  build-essential, pkg-config
+  libssl-dev, libffi-dev, zlib1g-dev, libbz2-dev, libreadline-dev,
+    libsqlite3-dev, liblzma-dev
+  ca-certificates, curl, wget, git, rsync
+  less, man-db, cron, logrotate
+
+SHELL
+  tmux (+ ~/.tmux.conf)
+  neovim
+
+CLI
+  ripgrep, fd (symlinked from fd-find), jq, htop
+
+LANGUAGES
+  python3, python3-venv, python3-dev, python3-pip, pipx
+  uv (Astral)
+  fnm + Node.js LTS
+
+AGENT
+  gh (GitHub CLI)
+  hermes (Hermes Agent)

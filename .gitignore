@@ -1,0 +1,15 @@
+# Logs from local test runs
+*.log
+.hermes-host-bootstrap.log
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Local overrides
+.env
+.env.local
+local.sh
