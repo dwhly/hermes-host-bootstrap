@@ -101,10 +101,12 @@ fi
 # ── Write yaml ────────────────────────────────────────────────────────
 TARGET="$REGISTRY_DIR/${HOSTNAME_VAL}.yaml"
 NOW_ISO="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-# Preserve first-install date across re-runs.
+# Preserve first-install date across re-runs. The yaml stores
+# installed_at indented two spaces under `bootstrap:`, so the regex
+# matches optional leading whitespace.
 INSTALLED_AT="$NOW_ISO"
 if [[ -f "$TARGET" ]]; then
-  PREV="$(awk -F': ' '/^installed_at:/ {print $2; exit}' "$TARGET" 2>/dev/null || echo "")"
+  PREV="$(awk -F': ' '/^[[:space:]]*installed_at:/ {gsub(/^[[:space:]]+/, "", $2); print $2; exit}' "$TARGET" 2>/dev/null || echo "")"
   [[ -n "$PREV" ]] && INSTALLED_AT="$PREV"
 fi
 
