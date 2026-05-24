@@ -1,0 +1,41 @@
+# ~/.hermes-bootstrap.conf — personal overrides for hermes-host-bootstrap.
+#
+# Copy this file to ~/.hermes-bootstrap.conf (note the leading dot in the home
+# directory) and edit any of the variables below. Anything NOT set here falls
+# back to the repo's neutral defaults. This file is intentionally outside the
+# repo so the same bootstrap.sh can be used by multiple people without
+# stepping on each other's preferences.
+#
+# All variables are optional. Format is shell — this file gets `source`'d.
+
+# Identity for git commits made by bootstrap modules (e.g. when a module
+# auto-commits to a tracked config repo). Falls back to whatever `git config
+# --global` already has.
+# export HERMES_GIT_NAME="Your Name"
+# export HERMES_GIT_EMAIL="you@example.com"
+
+# Default tier if --tier is not passed on the command line. Repo default is
+# `recommended`.
+# export HERMES_DEFAULT_TIER=recommended
+
+# Default role if --role is not passed and auto-detect doesn't have an
+# opinion. Repo default is auto.
+# export HERMES_DEFAULT_ROLE=both
+
+# Timezone to set during preflight. Repo default is UTC.
+# export HERMES_TZ=America/Los_Angeles
+
+# Hostname to set during preflight (if you want bootstrap to rename the box).
+# Repo default is "leave hostname alone."
+# export HERMES_HOSTNAME=
+
+# Lockout-risk features — both default to OFF in the repo. Set to 1 here if
+# you ALWAYS want these enabled on machines you bootstrap. Make sure you have
+# working SSH key access before enabling on a remote box.
+# export HERMES_SSH_HARDEN=0
+# export HERMES_UFW_ENABLE=0
+
+# Optional: a private git repo to clone into ~/.hermes/ after bootstrap
+# finishes (the personal-config layer). Leave empty to skip. Companion to
+# the hermes-config-sync skill.
+# export HERMES_CONFIG_REPO=

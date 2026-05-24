@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# hermes-fleet — dashboard for all Hermes hosts you've bootstrapped.
+#
+# Reads ~/.hermes/hosts/*.yaml (written by 99-register-host.sh during
+# bootstrap) and prints a one-screen overview of the fleet. Optionally
+# probes each host live over SSH for current uptime / load.
+#
+# Usage:
+#   hermes-fleet                # static view from registry files
+#   hermes-fleet --live         # also ssh into each reachable host
+#   hermes-fleet --refresh      # re-snapshot THIS box's entry, then show
+#   hermes-fleet <hostname>     # focus on one host (full yaml)
+#   hermes-fleet --json         # raw JSON for scripting
+#   hermes-fleet -h | --help
+
+set -euo pipefail
+
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+REGISTRY_DIR="$HERMES_HOME/hosts"
+LIVE=0
+REFRESH=0
+JSON=0
+FOCUS=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --live)    LIVE=1; shift ;;
+    --refresh) REFRESH=1; shift ;;
+    --json)    JSON=1; shift ;;
+    -h|--help)
+      grep -E '^#( |$)' "$0" | sed 's/^# \?//' | head -20
+      exit 0 ;;
+    -*) echo "unknown flag: $1" >&2; exit 2 ;;
+    *)  FOCUS="$1"; shift ;;
+  esac
+done
+
+if [[ ! -d "$REGISTRY_DIR" ]]; then
+  echo "no hosts registry at $REGISTRY_DIR" >&2
+  echo "bootstrap a host with hermes-host-bootstrap to populate it." >&2
+  exit 1
+fi
+
+# Lightweight yaml reader — flat key extraction, indented one level.
+# Good enough for the host snapshot format; not a general yaml parser.
+get_field() {
+  local file="$1" key="$2"
+  awk -v key="$key" '
+    $0 ~ "^"key":" {
+      sub("^"key":[[:space:]]*", "")
+      gsub(/^"|"$/, "")
+      print
+      exit
+    }
+    $0 ~ "^[[:space:]]+"key":" {
+      sub("^[[:space:]]+"key":[[:space:]]*", "")
+      gsub(/^"|"$/, "")
+      print
+      exit
+    }
+  ' "$file"
+}
+
+# Refresh this box's entry — re-run the relevant module of bootstrap.
+if [[ "$REFRESH" -eq 1 ]]; then
+  REPO_ROOT_FALLBACK="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  if [[ -f "$REPO_ROOT_FALLBACK/bootstrap.sh" ]]; then
+    echo "▸ refreshing this host's snapshot…"
+    "$REPO_ROOT_FALLBACK/bootstrap.sh" --only=99-register-host \
+      --tier="${HERMES_DEFAULT_TIER:-recommended}" >/dev/null 2>&1 || \
+      echo "  (refresh failed — try running ./bootstrap.sh --only=99-register-host manually)"
+  else
+    echo "  (can't locate bootstrap.sh — run --only=99-register-host directly)"
+  fi
+fi
+
+# Focus mode: dump one host's full yaml.
+if [[ -n "$FOCUS" ]]; then
+  if [[ -f "$REGISTRY_DIR/$FOCUS.yaml" ]]; then
+    cat "$REGISTRY_DIR/$FOCUS.yaml"
+  else
+    echo "no registry entry for '$FOCUS'" >&2
+    echo "known hosts:" >&2
+    ls "$REGISTRY_DIR" | sed 's/\.yaml$//' | sed 's/^/  /' >&2
+    exit 1
+  fi
+  exit 0
+fi
+
+# JSON mode: emit array of objects.
+if [[ "$JSON" -eq 1 ]]; then
+  command -v python3 >/dev/null || { echo "python3 required for --json" >&2; exit 1; }
+  python3 - <<'PY' "$REGISTRY_DIR"
+import json, os, re, sys
+d = sys.argv[1]
+out = []
+for fn in sorted(os.listdir(d)):
+    if not fn.endswith(".yaml"): continue
+    rec = {}
+    section = None
+    for raw in open(os.path.join(d, fn)):
+        line = raw.rstrip()
+        if not line or line.lstrip().startswith("#"): continue
+        m = re.match(r"^(\w+):\s*$", line)
+        if m: section = m.group(1); rec[section] = {}; continue
+        m = re.match(r"^(\w+):\s*(.*)$", line)
+        if m: rec[m.group(1)] = m.group(2).strip().strip('"'); section = None; continue
+        m = re.match(r"^\s+(\w+):\s*(.*)$", line)
+        if m and section: rec[section][m.group(1)] = m.group(2).strip().strip('"')
+    out.append(rec)
+print(json.dumps(out, indent=2))
+PY
+  exit 0
+fi
+
+# Default: tabular dashboard.
+printf '\n  \033[1;36mHermes Fleet\033[0m  (%s hosts in registry)\n\n' \
+  "$(ls "$REGISTRY_DIR"/*.yaml 2>/dev/null | wc -l | tr -d ' ')"
+
+printf '  \033[1m%-18s %-10s %-8s %-22s %-10s %-12s %s\033[0m\n' \
+  HOST TIER ROLE OS HERMES DISK UPDATED
+
+for f in "$REGISTRY_DIR"/*.yaml; do
+  [[ -f "$f" ]] || continue
+  HOST=$(get_field "$f" hostname)
+  TIER=$(get_field "$f" tier)
+  ROLE=$(get_field "$f" role)
+  OS_PRETTY=$(get_field "$f" pretty)
+  HERMES_V=$(get_field "$f" hermes | head -c 12)
+  DISK=$(get_field "$f" disk_used_pct)
+  LAST_RUN=$(get_field "$f" last_run_at)
+
+  # Truncate the OS string so the columns don't blow out
+  OS_SHORT="$(echo "$OS_PRETTY" | cut -c1-22)"
+  # Just the date part of last_run_at
+  UPDATED_SHORT="${LAST_RUN%%T*}"
+
+  # Color disk usage if >80%
+  DISK_PCT_NUM="${DISK%\%}"
+  if [[ "$DISK_PCT_NUM" =~ ^[0-9]+$ ]] && (( DISK_PCT_NUM > 80 )); then
+    DISK_DISPLAY=$'\033[31m'"$DISK"$'\033[0m'
+  else
+    DISK_DISPLAY="$DISK"
+  fi
+
+  if [[ "$LIVE" -eq 1 ]] && [[ -n "$HOST" ]] && [[ "$HOST" != "$(hostname -s)" ]]; then
+    # Best-effort SSH probe (BatchMode = no prompts, short timeout)
+    LIVE_DATA="$(ssh -o BatchMode=yes -o ConnectTimeout=3 "$HOST" \
+      'uptime -p 2>/dev/null; df -h / | awk "NR==2{print \$5}"' 2>/dev/null || echo "")"
+    if [[ -n "$LIVE_DATA" ]]; then
+      LIVE_UP="$(echo "$LIVE_DATA" | head -1)"
+      LIVE_DISK="$(echo "$LIVE_DATA" | tail -1)"
+      printf '  %-18s %-10s %-8s %-22s %-12s %-12s %s\n' \
+        "$HOST" "$TIER" "$ROLE" "$OS_SHORT" "$HERMES_V" "$LIVE_DISK" "$LIVE_UP"
+      continue
+    else
+      HERMES_V=$'\033[33m'"$HERMES_V (offline)"$'\033[0m'
+    fi
+  fi
+
+  printf '  %-18s %-10s %-8s %-22s %-12s %-12b %s\n' \
+    "$HOST" "$TIER" "$ROLE" "$OS_SHORT" "$HERMES_V" "$DISK_DISPLAY" "$UPDATED_SHORT"
+done
+
+echo ""
+echo "  Detail for one host:  hermes-fleet <hostname>"
+echo "  Live SSH probe:       hermes-fleet --live"
+echo "  Refresh this box:     hermes-fleet --refresh"
+echo ""

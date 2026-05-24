@@ -243,6 +243,26 @@ To expose xrdp publicly anyway (not recommended), set
 
 ---
 
+## Personal config file (optional)
+
+The repo itself is opinionated about *what* a Hermes host looks like
+(packages, hardening, verification) but neutral about *who* you are.
+If you want to set personal defaults — your preferred tier, your git
+identity for commits the script makes, your timezone, your lockout-risk
+overrides — drop them in `~/.hermes-bootstrap.conf` and `bootstrap.sh`
+will source it on each run.
+
+```bash
+cp .hermes-bootstrap.conf.example ~/.hermes-bootstrap.conf
+$EDITOR ~/.hermes-bootstrap.conf
+```
+
+See `.hermes-bootstrap.conf.example` for the full set of variables.
+This keeps the repo cleanly forkable — a new user clones, drops their
+own `.hermes-bootstrap.conf`, and never has to touch the repo itself.
+
+---
+
 ## Shell sessions that survive Mac sleep (mosh + tmux)
 
 The default `ssh` session from a Mac dies the moment the laptop sleeps —
@@ -281,6 +301,51 @@ where you left off.
 Cloud-provider firewalls (DigitalOcean, Hetzner, etc.) usually need their
 own rule — open UDP **60000-61000** in the provider's web console too,
 not just `ufw`.
+
+---
+
+## Fleet registry & dashboard
+
+Every bootstrap run drops a yaml snapshot of the host at
+`~/.hermes/hosts/<hostname>.yaml` — OS, role, tier, IPs, tool versions,
+resource ceiling, install date. If `~/.hermes` is git-tracked via the
+companion `hermes-config-sync` repo, those snapshots roll forward to
+every other machine, giving you a portable inventory.
+
+The bundled `hermes-fleet` script (installed to `~/.local/bin/`) reads
+the registry and prints a one-screen dashboard:
+
+```
+$ hermes-fleet
+  Hermes Fleet  (3 hosts in registry)
+
+  HOST               TIER       ROLE     OS                    HERMES       DISK         UPDATED
+  do-prod            recommend  server   Ubuntu 24.04.1 LTS    0.18.2       34%          2026-05-24
+  hetzner-builder    full       server   Debian 12             0.18.1       72%          2026-05-19
+  dans-mini          recommend  both     macOS 15.2            0.18.2       58%          2026-05-22
+
+  Detail for one host:  hermes-fleet <hostname>
+  Live SSH probe:       hermes-fleet --live
+  Refresh this box:     hermes-fleet --refresh
+```
+
+Modes:
+- `hermes-fleet` — static dashboard from snapshot files
+- `hermes-fleet <hostname>` — dump the full yaml for one host
+- `hermes-fleet --live` — also SSH into each reachable host for current
+  uptime + live disk (uses `BatchMode=yes`, so it only works for hosts
+  with passwordless key auth from this box, e.g. via Tailscale)
+- `hermes-fleet --refresh` — rewrite this host's entry (re-runs the
+  `99-register-host` module)
+- `hermes-fleet --json` — machine-readable output for scripting
+
+To keep snapshots current between bootstrap runs (e.g. so disk and
+uptime are fresh on the dashboard), wire a cron job on each host:
+
+```bash
+# crontab -e
+0 * * * * cd ~/path/to/hermes-host-bootstrap && ./bootstrap.sh --only=99-register-host >/dev/null 2>&1 && ~/.hermes/sync.sh save "hourly host snapshot" >/dev/null 2>&1
+```
 
 ---
 

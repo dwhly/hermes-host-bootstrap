@@ -27,6 +27,18 @@
 
 set -euo pipefail
 
+# ── Personal config (optional) ──
+# Source ~/.hermes-bootstrap.conf if it exists. This is where personal/
+# machine-specific defaults live — git identity for commits, default tier,
+# preferred hostname, etc. — so the repo itself stays neutral and forkable.
+# See `.hermes-bootstrap.conf.example` in this repo for available vars.
+# Anyone using this repo can drop their own ~/.hermes-bootstrap.conf with
+# their own settings; the file is intentionally outside the repo.
+if [[ -f "$HOME/.hermes-bootstrap.conf" ]]; then
+  # shellcheck disable=SC1091
+  source "$HOME/.hermes-bootstrap.conf"
+fi
+
 # ── Locate the repo root (handles both `./bootstrap.sh` and `curl | bash`) ──
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
   REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,11 +51,13 @@ fi
 export REPO_ROOT
 
 # ── Defaults ─────────────────────────────────────────────────────────
-TIER="recommended"
+# Honor HERMES_DEFAULT_TIER / HERMES_DEFAULT_ROLE from ~/.hermes-bootstrap.conf
+# if set; otherwise use repo defaults.
+TIER="${HERMES_DEFAULT_TIER:-recommended}"
 SKIP_KEYS=()
 ONLY_MODS=()
 DRY_RUN=0
-ROLE_CLI=""
+ROLE_CLI="${HERMES_DEFAULT_ROLE:-}"
 
 # ── Parse args ──────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -186,6 +200,7 @@ verify "gh"         "gh --version"
 verify "hermes"     "hermes --version"
 verify "ffmpeg"     "ffmpeg -version"
 verify "tailscale"  "tailscale version"
+verify "hermes-fleet"   "hermes-fleet --help 2>&1 | head -1"
 
 echo ""
 ok "Bootstrap finished. Next steps:"
