@@ -23,6 +23,31 @@ if ! have brew; then
   return 0 2>/dev/null || exit 0
 fi
 
+# tmux on the Mac as well — handy for local sessions, and also so `mosh host -- tmux`
+# style invocations work from any shell. The server-side install is in 30-shell.sh;
+# this one is the client-side counterpart so the same recipe works in both directions.
+if tier_allows E && ! is_skipped tmux; then
+  if have tmux; then
+    skip "tmux already installed"
+  else
+    info "installing tmux"
+    brew install tmux || warn "tmux install failed"
+  fi
+fi
+
+# mosh on the Mac — the client side of the SSH-replacement combo. Pair with tmux on
+# the server (mosh handles transport resilience over UDP across Mac sleep / Wi-Fi
+# changes; tmux protects the running process state on the server). Use as:
+#     mosh <host> -- tmux new -A -s main
+if tier_allows R && ! is_skipped mosh; then
+  if have mosh; then
+    skip "mosh already installed"
+  else
+    info "installing mosh"
+    brew install mosh || warn "mosh install failed"
+  fi
+fi
+
 # Microsoft Remote Desktop — for connecting to the xrdp server we set up on Linux
 if ! is_skipped ms-remote-desktop; then
   if [[ -d "/Applications/Microsoft Remote Desktop.app" ]] || \
@@ -73,4 +98,7 @@ echo "    2. Launch Tailscale, sign in, and you'll see your VPS in the menu bar"
 echo "    3. To reach your VPS desktop:"
 echo "         ssh -L 3389:localhost:3389 you@vps    # tunnel"
 echo "         (then open Windows App / Remote Desktop, connect to localhost:3389)"
+echo "    4. For a shell that survives Mac sleep + tmux session that survives mosh:"
+echo "         mosh you@vps -- tmux new -A -s main"
+echo "         (mosh handles transport; tmux keeps your work alive even if mosh dies)"
 echo ""

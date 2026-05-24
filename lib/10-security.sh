@@ -41,9 +41,15 @@ if [[ "${HERMES_SSH_HARDEN:-0}" == "1" ]] && ! is_skipped ssh-harden; then
   fi
 fi
 
-# UFW — open ssh, deny rest. Won't enable unless HERMES_UFW_ENABLE=1.
+# UFW — open ssh + mosh UDP range, deny rest. Won't enable unless HERMES_UFW_ENABLE=1.
+# The mosh allow is added even when ufw is not yet enabled, so the rule is in place
+# the moment the user flips HERMES_UFW_ENABLE=1 on a later run.
 if have ufw && ! is_skipped ufw; then
   sudo ufw allow ssh >/dev/null
+  # Mosh uses UDP 60000-61000 (one port per concurrent session)
+  if ! is_skipped mosh-firewall; then
+    sudo ufw allow 60000:61000/udp >/dev/null
+  fi
   if [[ "${HERMES_UFW_ENABLE:-0}" == "1" ]]; then
     if sudo ufw status | grep -q "Status: active"; then
       skip "ufw already active"

@@ -172,6 +172,7 @@ verify() {
 
 verify "git"        "git --version"
 verify "tmux"       "tmux -V"
+verify "mosh"       "mosh-server --help 2>&1 | head -1"
 verify "neovim"     "nvim --version"
 verify "ripgrep"    "rg --version"
 verify "fzf"        "fzf --version"

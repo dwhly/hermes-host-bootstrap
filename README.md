@@ -94,7 +94,7 @@ lib/
 ├── 90-agents.sh          hermes, gh, Claude Code CLI, Codex CLI, faster-whisper
 ├── 95-ghostty.sh         Ghostty terminal — client/both role only
 ├── A0-remote-desktop.sh  xrdp + XFCE (opt-in: --tier=full or --only=A0-remote-desktop)
-└── M5-mac-client.sh      MS Remote Desktop + Tailscale GUI (macOS client only)
+└── M5-mac-client.sh      tmux + mosh + MS Remote Desktop + Tailscale GUI (macOS client only)
 ```
 
 Each module can also be run on its own:
@@ -127,6 +127,7 @@ Each module can also be run on its own:
 | `fail2ban`      | fail2ban |
 | `unattended`    | unattended-upgrades |
 | `tmux` / `tmux-conf` | tmux package / .tmux.conf install |
+| `mosh-firewall` | UFW rule for mosh UDP 60000-61000 (rule still added if ufw stays disabled) |
 | `zsh` / `oh-my-zsh`  | zsh / OMZ |
 | `inputrc`       | .inputrc install |
 | `mosh`, `neovim`, `micro` | per-tool |
@@ -239,6 +240,47 @@ installs it automatically when `--role=client` or `--role=both`.
 
 To expose xrdp publicly anyway (not recommended), set
 `HERMES_RDP_PUBLIC=1`. You'll want `ufw` + `fail2ban` configured first.
+
+---
+
+## Shell sessions that survive Mac sleep (mosh + tmux)
+
+The default `ssh` session from a Mac dies the moment the laptop sleeps —
+Wi-Fi drops, the TCP socket goes stale, and when you wake up you get
+`No route to host` / `Broken pipe` / `client_loop: send disconnect`. The
+fix is two tools, used together:
+
+- **mosh** replaces ssh for the transport. It uses UDP, so it survives
+  sleep, Wi-Fi changes, and IP roaming. Auth still goes through ssh (mosh
+  shells out to it under the hood), so your keys and `~/.ssh/config`
+  aliases still work.
+- **tmux** runs on the server and protects the running process state.
+  Even if mosh itself dies, your shell + whatever it was running keeps
+  going inside the tmux session; you reattach and you're back.
+
+Both are installed by this bootstrap:
+
+| Side | Where it's installed | Notes |
+|------|----------------------|-------|
+| Linux server | `lib/30-shell.sh` (tier R) | tmux + `~/.tmux.conf`, mosh package |
+| macOS client | `lib/M5-mac-client.sh` (role=client/both) | tmux + mosh via Homebrew |
+| Firewall | `lib/10-security.sh` | `ufw allow 60000:61000/udp` added even when ufw stays off |
+
+Daily usage from the Mac:
+
+```bash
+mosh you@vps -- tmux new -A -s main
+```
+
+`tmux new -A -s main` creates a session named `main` if missing, or
+attaches to it if it exists. Detach with `Ctrl-b d` (or `Ctrl-a d` if
+you're using the bundled `~/.tmux.conf`, which rebinds prefix to
+`Ctrl-a`). Re-run the same command tomorrow and you pick up exactly
+where you left off.
+
+Cloud-provider firewalls (DigitalOcean, Hetzner, etc.) usually need their
+own rule — open UDP **60000-61000** in the provider's web console too,
+not just `ufw`.
 
 ---
 
