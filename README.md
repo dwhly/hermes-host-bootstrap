@@ -308,9 +308,42 @@ not just `ufw`.
 
 Every bootstrap run drops a yaml snapshot of the host at
 `~/.hermes/hosts/<hostname>.yaml` — OS, role, tier, IPs, tool versions,
-resource ceiling, install date. If `~/.hermes` is git-tracked via the
-companion `hermes-config-sync` repo, those snapshots roll forward to
-every other machine, giving you a portable inventory.
+resource ceiling, install date, and a free-form **`note:`** describing
+what the box is for. If `~/.hermes` is git-tracked via the companion
+`hermes-config-sync` repo, those snapshots roll forward to every other
+machine, giving you a portable inventory.
+
+### Interactive host identity (first run)
+
+When `bootstrap.sh` runs in a real terminal (stdin is a TTY) and
+`HERMES_HOSTNAME` isn't already set, it asks two short questions
+before installing anything:
+
+```
+Hostname for this machine in the Hermes fleet.
+  current OS hostname: ubuntu-s-1vcpu-2gb-70gb-intel-sfo2
+  pick a short, unique name (e.g. hermes-do1, mac-mini, hetzner-builder)
+  empty = keep 'ubuntu-s-...', no rename
+> hermes-do1
+  → will rename to: hermes-do1
+
+One-line note — what is this machine for?
+  e.g. 'main production VPS for hermes', 'macbook M2 daily driver', 'hetzner build farm'
+  empty = skip (registry will have no note for this host)
+> main Hermes host, SFO, gateway + agent
+```
+
+Existing fleet hostnames are listed first so you don't pick a collision.
+Both answers are optional — empty input keeps the current value. Skip
+the prompts entirely with `HERMES_NONINTERACTIVE=1` or by pre-setting
+`HERMES_HOSTNAME` / `HERMES_HOST_NOTE` (in `~/.hermes-bootstrap.conf`
+or the environment).
+
+> **Tip:** if you rename the box at the OS level, also rename it in
+> your cloud provider's web console (DigitalOcean droplet name,
+> Hetzner server name, etc.) so the dashboards and billing line up.
+
+### Dashboard
 
 The bundled `hermes-fleet` script (installed to `~/.local/bin/`) reads
 the registry and prints a one-screen dashboard:
@@ -319,10 +352,10 @@ the registry and prints a one-screen dashboard:
 $ hermes-fleet
   Hermes Fleet  (3 hosts in registry)
 
-  HOST               TIER       ROLE     OS                    HERMES       DISK         UPDATED
-  do-prod            recommend  server   Ubuntu 24.04.1 LTS    0.18.2       34%          2026-05-24
-  hetzner-builder    full       server   Debian 12             0.18.1       72%          2026-05-19
-  dans-mini          recommend  both     macOS 15.2            0.18.2       58%          2026-05-22
+  HOST               TIER       ROLE     OS                    HERMES     DISK         NOTE
+  hermes-do1         recommended server  Ubuntu 24.04.4 LTS    0.14.0     18%          main Hermes host, SFO, gateway + agent
+  hetzner-builder    full       server   Debian 12             0.18.1     72%          background build farm + cache mirror
+  mac-mini           recommended both    macOS 15.2            0.18.2     58%          M2 daily driver
 
   Detail for one host:  hermes-fleet <hostname>
   Live SSH probe:       hermes-fleet --live

@@ -89,6 +89,15 @@ fi
 
 UPTIME_DAYS="$(awk '{print int($1/86400)}' /proc/uptime 2>/dev/null || echo 0)"
 
+# Note: preserve any existing note when re-running (don't blank it out
+# unless the bootstrap.sh interactive prompt or HERMES_HOST_NOTE env
+# explicitly set a new value).
+HOST_NOTE="${HERMES_HOST_NOTE:-}"
+TARGET_TMP_CHECK="$REGISTRY_DIR/${HOSTNAME_VAL}.yaml"
+if [[ -z "$HOST_NOTE" ]] && [[ -f "$TARGET_TMP_CHECK" ]]; then
+  HOST_NOTE="$(awk -F': ' '/^note:/ {sub(/^note:[[:space:]]*/, ""); gsub(/^"|"$/, ""); print; exit}' "$TARGET_TMP_CHECK" 2>/dev/null)"
+fi
+
 # ── Write yaml ────────────────────────────────────────────────────────
 TARGET="$REGISTRY_DIR/${HOSTNAME_VAL}.yaml"
 NOW_ISO="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
@@ -105,6 +114,7 @@ cat > "$TARGET" <<YAML
 # know what you're doing — the next bootstrap rewrites most fields.
 hostname: $HOSTNAME_VAL
 fqdn: $FQDN_VAL
+note: "${HOST_NOTE}"
 tailscale_name: "${TAILSCALE_NAME}"
 public_ip: "$PUBLIC_IP"
 local_ip: "${LOCAL_IPS:-unknown}"

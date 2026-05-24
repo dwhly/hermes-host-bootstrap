@@ -118,6 +118,75 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   warn "DRY-RUN: would execute the following modules, then exit"
 fi
 
+# ── Interactive host identity prompt ─────────────────────────────────
+# Ask the user for a friendly hostname + one-line "what is this box for"
+# note that will land in the host registry yaml. Only prompts when:
+#   - stdin is a tty (so `curl | bash` non-interactive runs are unaffected)
+#   - HERMES_HOSTNAME is not already set (env, conf file, or --dry-run path)
+#   - HERMES_NONINTERACTIVE != 1 (explicit opt-out)
+# The note is stored in ~/.hermes/hosts/<hostname>.yaml under `note:`.
+if [[ -t 0 ]] && [[ "${HERMES_NONINTERACTIVE:-0}" != "1" ]] && [[ "$DRY_RUN" -eq 0 ]]; then
+  current_host="$(hostname -s 2>/dev/null || hostname)"
+
+  # Hostname prompt — skip if already set via env / conf
+  if [[ -z "${HERMES_HOSTNAME:-}" ]]; then
+    # Show known fleet hostnames so the user doesn't pick a collision
+    fleet_dir="${HERMES_HOME:-$HOME/.hermes}/hosts"
+    if [[ -d "$fleet_dir" ]] && [[ -n "$(ls -A "$fleet_dir"/*.yaml 2>/dev/null)" ]]; then
+      echo "${_C_DIM}existing fleet hostnames:${_C_RESET}"
+      ls "$fleet_dir"/*.yaml 2>/dev/null | sed 's|.*/||; s|\.yaml$||; s|^|    - |'
+      echo ""
+    fi
+
+    echo "${_C_BOLD}Hostname${_C_RESET} for this machine in the Hermes fleet."
+    echo "  current OS hostname: ${_C_DIM}$current_host${_C_RESET}"
+    echo "  pick a short, unique name (e.g. hermes-do1, mac-mini, hetzner-builder)"
+    echo "  ${_C_DIM}empty = keep '$current_host', no rename${_C_RESET}"
+    printf "> "
+    read -r answer || answer=""
+    if [[ -n "$answer" ]]; then
+      # Basic sanity: alphanumerics, dashes, dots only. No spaces.
+      if [[ "$answer" =~ ^[a-zA-Z0-9.-]+$ ]]; then
+        export HERMES_HOSTNAME="$answer"
+        echo "  → will rename to: $HERMES_HOSTNAME"
+      else
+        warn "  '$answer' has invalid characters — keeping '$current_host'"
+      fi
+    fi
+    echo ""
+  fi
+
+  # Note prompt — always offer (even if hostname was preset). Skip iff a
+  # prior note already exists for this hostname and user doesn't want to
+  # overwrite.
+  effective_host="${HERMES_HOSTNAME:-$current_host}"
+  note_file="${HERMES_HOME:-$HOME/.hermes}/hosts/${effective_host}.yaml"
+  existing_note=""
+  if [[ -f "$note_file" ]]; then
+    existing_note="$(awk -F': ' '/^note:/ {sub(/^note:[[:space:]]*/, ""); gsub(/^"|"$/, ""); print; exit}' "$note_file" 2>/dev/null)"
+  fi
+
+  echo "${_C_BOLD}One-line note${_C_RESET} — what is this machine for?"
+  echo "  e.g. 'main production VPS for hermes', 'macbook M2 daily driver', 'hetzner build farm'"
+  if [[ -n "$existing_note" ]]; then
+    echo "  current note: ${_C_DIM}\"$existing_note\"${_C_RESET}"
+    echo "  ${_C_DIM}empty = keep existing note${_C_RESET}"
+  else
+    echo "  ${_C_DIM}empty = skip (registry will have no note for this host)${_C_RESET}"
+  fi
+  printf "> "
+  read -r note_input || note_input=""
+  if [[ -n "$note_input" ]]; then
+    # Strip surrounding quotes the user might have typed, and any `"` that
+    # would break the yaml.
+    note_input="${note_input//\"/}"
+    export HERMES_HOST_NOTE="$note_input"
+  elif [[ -n "$existing_note" ]]; then
+    export HERMES_HOST_NOTE="$existing_note"
+  fi
+  echo ""
+fi
+
 # ── Tee everything to a log ──
 LOGFILE="$HOME/.hermes-host-bootstrap.log"
 mkdir -p "$(dirname "$LOGFILE")"

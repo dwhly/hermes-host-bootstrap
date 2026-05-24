@@ -118,7 +118,7 @@ printf '\n  \033[1;36mHermes Fleet\033[0m  (%s hosts in registry)\n\n' \
   "$(ls "$REGISTRY_DIR"/*.yaml 2>/dev/null | wc -l | tr -d ' ')"
 
 printf '  \033[1m%-18s %-10s %-8s %-22s %-10s %-12s %s\033[0m\n' \
-  HOST TIER ROLE OS HERMES DISK UPDATED
+  HOST TIER ROLE OS HERMES DISK NOTE
 
 for f in "$REGISTRY_DIR"/*.yaml; do
   [[ -f "$f" ]] || continue
@@ -128,12 +128,12 @@ for f in "$REGISTRY_DIR"/*.yaml; do
   OS_PRETTY=$(get_field "$f" pretty)
   HERMES_V=$(get_field "$f" hermes | head -c 12)
   DISK=$(get_field "$f" disk_used_pct)
-  LAST_RUN=$(get_field "$f" last_run_at)
+  NOTE_VAL=$(get_field "$f" note)
 
   # Truncate the OS string so the columns don't blow out
   OS_SHORT="$(echo "$OS_PRETTY" | cut -c1-22)"
-  # Just the date part of last_run_at
-  UPDATED_SHORT="${LAST_RUN%%T*}"
+  # Truncate note so the line stays one screen wide
+  NOTE_SHORT="$(echo "${NOTE_VAL:-—}" | cut -c1-40)"
 
   # Color disk usage if >80%
   DISK_PCT_NUM="${DISK%\%}"
@@ -159,7 +159,7 @@ for f in "$REGISTRY_DIR"/*.yaml; do
   fi
 
   printf '  %-18s %-10s %-8s %-22s %-12s %-12b %s\n' \
-    "$HOST" "$TIER" "$ROLE" "$OS_SHORT" "$HERMES_V" "$DISK_DISPLAY" "$UPDATED_SHORT"
+    "$HOST" "$TIER" "$ROLE" "$OS_SHORT" "$HERMES_V" "$DISK_DISPLAY" "$NOTE_SHORT"
 done
 
 echo ""
