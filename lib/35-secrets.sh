@@ -93,9 +93,31 @@ if have op && [[ -f "$ENV_TEMPLATE" ]] && ! is_skipped op-resolve; then
   if op account list >/dev/null 2>&1; then
     info "resolving $ENV_TEMPLATE → $ENV_RESOLVED via op inject"
     if op inject -i "$ENV_TEMPLATE" -o "$ENV_RESOLVED.tmp" 2>/dev/null; then
+      # Merge: preserve any KEY=value lines in the existing .env that aren't
+      # in the resolved template. This lets a user have inline secrets in
+      # .env (e.g. tokens not yet migrated to 1Password) that survive
+      # repeated resolutions. The template wins for any key it defines.
+      if [[ -f "$ENV_RESOLVED" ]]; then
+        # Extract keys defined by the template
+        template_keys=$(grep -E '^[A-Z_][A-Z0-9_]*=' "$ENV_RESOLVED.tmp" | cut -d= -f1 | sort -u)
+        # Append lines from the existing .env whose key is NOT in the template
+        {
+          echo ""
+          echo "# ── inline values (preserved from existing .env; not in template) ──"
+          while IFS= read -r line; do
+            # Only consider KEY=VAL lines; skip comments and blanks
+            [[ "$line" =~ ^[A-Z_][A-Z0-9_]*= ]] || continue
+            key="${line%%=*}"
+            if ! echo "$template_keys" | grep -qx "$key"; then
+              echo "$line"
+            fi
+          done < "$ENV_RESOLVED"
+        } >> "$ENV_RESOLVED.tmp"
+      fi
       chmod 600 "$ENV_RESOLVED.tmp"
       mv "$ENV_RESOLVED.tmp" "$ENV_RESOLVED"
-      ok "resolved $(grep -c '^[^#]' "$ENV_RESOLVED" 2>/dev/null || echo 0) variables"
+      resolved_count=$(grep -cE '^[A-Z_][A-Z0-9_]*=' "$ENV_RESOLVED" 2>/dev/null || echo 0)
+      ok "resolved + merged: $resolved_count variables total in .env"
     else
       warn "op inject failed — check that referenced vault items exist and you're signed in"
       rm -f "$ENV_RESOLVED.tmp"
