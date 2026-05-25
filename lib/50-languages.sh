@@ -49,6 +49,13 @@ if tier_allows E && ! is_skipped node; then
   if [[ -x "$FNM_DIR/fnm" ]]; then
     export PATH="$FNM_DIR:$PATH"
     eval "$("$FNM_DIR/fnm" env --shell bash)" || true
+    # Symlink fnm into ~/.local/bin so it's on PATH for every shell without
+    # needing the FNM_DIR PATH amendment. ~/.local/bin is already on PATH via
+    # ~/.local/bin/env (Cargo/uv share this convention). Without this, the
+    # guarded eval below skips silently in shells that source .bashrc but not
+    # the zshrc-snippet that adds FNM_DIR to PATH, and you get no Node tools.
+    mkdir -p "$HOME/.local/bin"
+    ln -sf "$FNM_DIR/fnm" "$HOME/.local/bin/fnm"
   fi
 
   if have fnm; then
