@@ -167,6 +167,21 @@ if [[ -f "$REPO_ROOT/scripts/hermes-fleet" ]]; then
   ok "hermes-fleet → $TARGET_LINK"
 fi
 
+# ── Install hermes-reload on PATH ─────────────────────────────────────
+# Companion to hermes-fleet: scripts/reload.sh is the canonical way to
+# "pull latest bootstrap and re-apply on this host." Symlinked so the
+# user can `hermes-reload` from anywhere, and aliased to `r` in
+# dotfiles/aliases.sh for one-keystroke daily use.
+if [[ -f "$REPO_ROOT/scripts/reload.sh" ]]; then
+  mkdir -p "$HOME/.local/bin"
+  TARGET_LINK="$HOME/.local/bin/hermes-reload"
+  if [[ -L "$TARGET_LINK" || -f "$TARGET_LINK" ]]; then
+    rm -f "$TARGET_LINK"
+  fi
+  ln -s "$REPO_ROOT/scripts/reload.sh" "$TARGET_LINK"
+  ok "hermes-reload → $TARGET_LINK"
+fi
+
 # Helpful hint for the user: if ~/.hermes is git-tracked (the typical
 # hermes-config-sync setup), nudge them to commit the snapshot.
 if [[ -d "${HERMES_HOME:-$HOME/.hermes}/.git" ]]; then

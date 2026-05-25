@@ -10,6 +10,7 @@
 
 # ── BEGIN core ──
 alias h='history'
+alias r='hermes-reload'
 # ── END core ──
 
 # ── BEGIN hermes ──

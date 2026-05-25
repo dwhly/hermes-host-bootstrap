@@ -280,6 +280,7 @@ verify "hermes"     "hermes --version"
 verify "ffmpeg"     "ffmpeg -version"
 verify "tailscale"  "tailscale version"
 verify "hermes-fleet"   "hermes-fleet --help 2>&1 | head -1"
+verify "hermes-reload"  "test -L $HOME/.local/bin/hermes-reload && echo present"
 
 echo ""
 ok "Bootstrap finished. Next steps:"
