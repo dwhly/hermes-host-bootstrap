@@ -86,26 +86,50 @@ fi
 # If neither auth path is set up yet, we skip silently with a warn —
 # users on a fresh box need to set up auth manually before the first
 # template resolution can succeed.
-ENV_TEMPLATE="${HERMES_HOME:-$HOME/.hermes}/.env.template"
-ENV_RESOLVED="${HERMES_HOME:-$HOME/.hermes}/.env"
+#
+# Template files (resolved in order; later overrides earlier):
+#   1. ~/.hermes/.env.template            — shared base (every host)
+#   2. ~/.hermes/.env.template.<hostname> — per-host overlay (current host only)
+#
+# Plus a merge step that preserves inline KEY=VAL lines from the existing
+# .env that aren't mentioned in either template.
+ENV_HERMES="${HERMES_HOME:-$HOME/.hermes}"
+ENV_TEMPLATE="$ENV_HERMES/.env.template"
+ENV_RESOLVED="$ENV_HERMES/.env"
+ENV_TEMPLATE_HOST="$ENV_HERMES/.env.template.$(hostname -s 2>/dev/null || hostname)"
 
 if have op && [[ -f "$ENV_TEMPLATE" ]] && ! is_skipped op-resolve; then
   if op account list >/dev/null 2>&1; then
     info "resolving $ENV_TEMPLATE → $ENV_RESOLVED via op inject"
     if op inject -i "$ENV_TEMPLATE" -o "$ENV_RESOLVED.tmp" 2>/dev/null; then
+      # Per-host overlay: if a .env.template.<hostname> exists, resolve it and
+      # append. Lines in the overlay override (later-wins is the convention
+      # python-dotenv and most env loaders follow).
+      if [[ -f "$ENV_TEMPLATE_HOST" ]]; then
+        info "applying per-host overlay: $ENV_TEMPLATE_HOST"
+        if op inject -i "$ENV_TEMPLATE_HOST" -o "$ENV_RESOLVED.host.tmp" 2>/dev/null; then
+          {
+            echo ""
+            echo "# ── per-host overlay ($(basename "$ENV_TEMPLATE_HOST")) ──"
+            grep -E '^[A-Z_][A-Z0-9_]*=' "$ENV_RESOLVED.host.tmp"
+          } >> "$ENV_RESOLVED.tmp"
+          rm -f "$ENV_RESOLVED.host.tmp"
+        else
+          warn "op inject failed on $ENV_TEMPLATE_HOST — overlay skipped"
+          rm -f "$ENV_RESOLVED.host.tmp"
+        fi
+      fi
+
       # Merge: preserve any KEY=value lines in the existing .env that aren't
-      # in the resolved template. This lets a user have inline secrets in
-      # .env (e.g. tokens not yet migrated to 1Password) that survive
-      # repeated resolutions. The template wins for any key it defines.
+      # in the resolved template OR overlay. This lets a user have inline
+      # secrets in .env (e.g. tokens not yet migrated to 1Password) that
+      # survive repeated resolutions. The template wins for any key it defines.
       if [[ -f "$ENV_RESOLVED" ]]; then
-        # Extract keys defined by the template
         template_keys=$(grep -E '^[A-Z_][A-Z0-9_]*=' "$ENV_RESOLVED.tmp" | cut -d= -f1 | sort -u)
-        # Append lines from the existing .env whose key is NOT in the template
         {
           echo ""
           echo "# ── inline values (preserved from existing .env; not in template) ──"
           while IFS= read -r line; do
-            # Only consider KEY=VAL lines; skip comments and blanks
             [[ "$line" =~ ^[A-Z_][A-Z0-9_]*= ]] || continue
             key="${line%%=*}"
             if ! echo "$template_keys" | grep -qx "$key"; then
