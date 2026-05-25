@@ -24,7 +24,7 @@
 -- forms without checking the AppleScript reserved-word list:
 -- https://developer.apple.com/library/archive/documentation/AppleScript/Conceptual/AppleScriptLangGuide/reference/ASLR_keywords.html
 
-set targetHost to "root@hermes-do1"
+set targetHost to "root@h-do1"
 
 -- Per-pane configuration: {session-name, initial-command}.
 -- Order is TL, TR, BL, BR. `initial-command` may be empty for "just a shell".

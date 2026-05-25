@@ -331,10 +331,10 @@ before installing anything:
 ```
 Hostname for this machine in the Hermes fleet.
   current OS hostname: ubuntu-s-1vcpu-2gb-70gb-intel-sfo2
-  pick a short, unique name (e.g. hermes-do1, mac-mini, hetzner-builder)
+  pick a short, unique name (e.g. h-do1, h-mini, hetzner-builder)
   empty = keep 'ubuntu-s-...', no rename
-> hermes-do1
-  → will rename to: hermes-do1
+> h-do1
+  → will rename to: h-do1
 
 One-line note — what is this machine for?
   e.g. 'main production VPS for hermes', 'macbook M2 daily driver', 'hetzner build farm'

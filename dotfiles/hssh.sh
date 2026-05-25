@@ -9,7 +9,7 @@
 #   hssh                            → ssh into $HSSH_DEFAULT_HOST, attach "main"
 #
 # Configure the default host once in your shell rc, e.g.:
-#   export HSSH_DEFAULT_HOST="root@hermes-do1"
+#   export HSSH_DEFAULT_HOST="root@h-do1"
 #
 # Disconnect/reconnect-safe: `tmux new -As <name>` attaches if the session
 # already exists, otherwise creates it. Detach with the tmux prefix + d.

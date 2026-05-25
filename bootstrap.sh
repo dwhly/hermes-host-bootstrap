@@ -171,7 +171,7 @@ if [[ -t 0 ]] && [[ "${HERMES_NONINTERACTIVE:-0}" != "1" ]] && [[ "$DRY_RUN" -eq
 
     echo "${_C_BOLD}Hostname${_C_RESET} for this machine in the Hermes fleet."
     echo "  current OS hostname: ${_C_DIM}$current_host${_C_RESET}"
-    echo "  pick a short, unique name (e.g. hermes-do1, mac-mini, hetzner-builder)"
+    echo "  pick a short, unique name (e.g. h-do1, h-mini, hetzner-builder)"
     echo "  ${_C_DIM}empty = keep '$current_host', no rename${_C_RESET}"
     printf "> "
     read -r answer || answer=""
