@@ -13,7 +13,10 @@
 -- Layout (reading top-left to bottom-right):
 --   pane 1 (top-left)     code     →  hermes
 --   pane 2 (top-right)    scratch  →  hermes
---   pane 3 (bottom-left)  logs     →  hermes logs gateway -f
+--   pane 3 (bottom-left)  logs     →  hermes logs -f  (tails agent.log: API calls,
+--                                                     tool calls, conversation activity.
+--                                                     For just the gateway daemon's own
+--                                                     log: `hermes logs gateway -f`)
 --   pane 4 (bottom-right) ops      →  plain root shell
 --
 -- Note: variable names deliberately avoid AppleScript reserved words like
@@ -30,7 +33,7 @@ set targetHost to "root@hermes-do1"
 set paneSpecs to {¬
     {"code",    "hermes"},                  ¬
     {"scratch", "hermes"},                  ¬
-    {"logs",    "hermes logs gateway -f"},  ¬
+    {"logs",    "hermes logs -f"},          ¬
     {"ops",     ""}                         ¬
 }
 
