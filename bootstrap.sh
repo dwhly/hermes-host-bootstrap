@@ -62,6 +62,13 @@ ONLY_MODS=()
 DRY_RUN=0
 ROLE_CLI="${HERMES_DEFAULT_ROLE:-}"
 
+# Honor HERMES_SKIP from ~/.hermes-bootstrap.conf (or env): comma-separated
+# module/package names to skip. Equivalent to passing --skip=... on the command
+# line. CLI --skip= will still extend this list rather than override.
+if [[ -n "${HERMES_SKIP:-}" ]]; then
+  IFS=',' read -r -a SKIP_KEYS <<< "$HERMES_SKIP"
+fi
+
 # ── Parse args ──────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -69,8 +76,8 @@ while [[ $# -gt 0 ]]; do
     --tier)   TIER="$2"; shift 2 ;;
     --role=*) ROLE_CLI="${1#*=}"; shift ;;
     --role)   ROLE_CLI="$2"; shift 2 ;;
-    --skip=*) IFS=',' read -r -a SKIP_KEYS <<< "${1#*=}"; shift ;;
-    --skip)   IFS=',' read -r -a SKIP_KEYS <<< "$2"; shift 2 ;;
+    --skip=*) IFS=',' read -r -a EXTRA_SKIP <<< "${1#*=}"; SKIP_KEYS+=("${EXTRA_SKIP[@]}"); shift ;;
+    --skip)   IFS=',' read -r -a EXTRA_SKIP <<< "$2"; SKIP_KEYS+=("${EXTRA_SKIP[@]}"); shift 2 ;;
     --only=*) IFS=',' read -r -a ONLY_MODS <<< "${1#*=}"; shift ;;
     --only)   IFS=',' read -r -a ONLY_MODS <<< "$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;

@@ -66,6 +66,15 @@
 # export HERMES_SSH_HARDEN=0
 # export HERMES_UFW_ENABLE=0
 
+# Skip individual modules / packages. Hermes itself does NOT require Docker
+# (the terminal tool's "modal" container mode is opt-in via TERMINAL_MODAL_IMAGE
+# in ~/.hermes/.env; absent that, the terminal tool runs on the real shell).
+# Docker Desktop on macOS keeps ~1GB RAM resident even idle, which is too
+# expensive a default for "I want to manage this Mac with Hermes" use cases.
+# Uncomment to skip:
+# export HERMES_SKIP=docker
+# Multiple modules: comma-separated, e.g. HERMES_SKIP=docker,xrdp
+
 # Optional: a private git repo to clone into ~/.hermes/ after bootstrap
 # finishes (the personal-config layer). Leave empty to skip. Companion to
 # the hermes-config-sync skill.
