@@ -1,6 +1,10 @@
 # ── hermes-host-bootstrap Ghostty config ──
 # Lives at ~/.config/ghostty/config — Ghostty reloads on save (Cmd+Shift+,).
 # Docs: https://ghostty.org/docs/config
+#
+# IMPORTANT: Ghostty's config format does NOT allow inline comments. Every `#`
+# must be at the start of a line. Anything after `=` on a directive line is
+# parsed as part of the value, even if it looks like a comment.
 
 # ── Appearance ──────────────────────────────────────────────────────
 # Dark mode with explicit base palette. We don't use a theme directive
@@ -15,7 +19,8 @@ selection-foreground = #ffffff
 
 font-family = "JetBrainsMono Nerd Font"
 font-size = 12
-font-feature = -calt          # disable ligatures (subjective; flip to +calt if you like them)
+# Disable ligatures. Flip to +calt if you like them.
+font-feature = -calt
 
 # Padding & cursor
 window-padding-x = 12
@@ -44,11 +49,10 @@ quit-after-last-window-closed = true
 # Advertise TERM=xterm-256color instead of the default xterm-ghostty.
 # Every Unix server already has xterm-256color terminfo; xterm-ghostty
 # does not, which makes tmux refuse to start on remotes that haven't
-# manually installed Ghostty's terminfo entry. The trade-off is that
-# we lose Ghostty's most advanced terminal capabilities (undercurl
-# colors, extended color signaling — features tmux mostly can't pass
-# through anyway). We keep 24-bit truecolor, 256-color palette, mouse
-# handling, and every TUI keeps working.
+# manually installed Ghostty's terminfo entry. We lose Ghostty's most
+# advanced terminal capabilities (undercurl colors, extended color
+# signaling) but those mostly can't pass through tmux anyway. We keep
+# 24-bit truecolor, 256-color palette, mouse, and TUI compatibility.
 #
 # If you want full xterm-ghostty fidelity, comment this line out and
 # install Ghostty's terminfo on each remote:
@@ -58,7 +62,7 @@ quit-after-last-window-closed = true
 term = xterm-256color
 
 # ── macOS keybindings ───────────────────────────────────────────────
-# (Ghostty applies these globally; on Linux you'd swap super → ctrl+shift)
+# Ghostty applies these globally. On Linux you'd swap super → ctrl+shift.
 keybind = super+t=new_tab
 keybind = super+w=close_surface
 keybind = super+shift+w=close_window
