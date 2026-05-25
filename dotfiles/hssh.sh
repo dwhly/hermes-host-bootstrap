@@ -38,10 +38,13 @@ hssh() {
   # entry on the remote on first connect, fixing the common
   #   missing or unsuitable terminal: xterm-ghostty
   # error that tmux raises on remotes without the xterm-ghostty terminfo entry.
+  # The `--` separator is mandatory: ghostty parses its own flags before it
+  # and forwards everything after verbatim to ssh. Without `--`, `-t` is
+  # swallowed by ghostty itself with "invalid action" error.
   # Falls back to plain `ssh` everywhere else (Linux clients, servers hopping
   # between boxes, etc.). See https://ghostty.org/docs/features/ssh
   if command -v ghostty >/dev/null 2>&1; then
-    ghostty +ssh -t "$host" "tmux new -As '$session'"
+    ghostty +ssh "$host" -- -t "tmux new -As '$session'"
   else
     ssh -t "$host" "tmux new -As '$session'"
   fi

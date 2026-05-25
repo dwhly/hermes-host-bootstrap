@@ -25,9 +25,12 @@ set sessionNames to {"ops", "code", "logs", "scratch"}
 -- the first time you connect, then caches the install. Without this, tmux
 -- on the remote dies with "missing or unsuitable terminal: xterm-ghostty"
 -- because most distros don't ship the xterm-ghostty terminfo entry yet.
+-- The `--` separator is mandatory: ghostty parses its own flags before it
+-- and forwards everything after verbatim to ssh. Without `--`, `-t` is
+-- swallowed by ghostty itself with "invalid action" error -10006.
 -- See https://ghostty.org/docs/features/ssh
 on sshCmd(h, s)
-    return "ghostty +ssh " & h & " -t 'tmux new -As " & s & "' ; exit"
+    return "ghostty +ssh " & h & " -- -t 'tmux new -As " & s & "' ; exit"
 end sshCmd
 
 tell application "Ghostty"
