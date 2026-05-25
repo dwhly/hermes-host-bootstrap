@@ -133,6 +133,8 @@ Each module can also be run on its own:
 | `aliases` | shell aliases (h, hm, ...) — managed by the add-shell-alias skill |
 | `chsh-zsh` | make zsh the default login shell on Linux hosts (matches macOS default) |
 | `mac-hostname` | macOS only: rename HostName + LocalHostName to `$HERMES_MAC_HOSTNAME` (opt-in) |
+| `op` | install the 1Password CLI (for secrets resolution via `.env.template`) |
+| `op-resolve` | resolve `~/.hermes/.env.template` → `~/.hermes/.env` via `op inject` on each bootstrap run |
 | `ghostty-workspace` | macOS only: 2x2 Ghostty grid launcher (`hermes-workspace`) via AppleScript |
 | `mosh-firewall` | UFW rule for mosh UDP 60000-61000 (rule still added if ufw stays disabled) |
 | `zsh` / `oh-my-zsh`  | zsh / OMZ |

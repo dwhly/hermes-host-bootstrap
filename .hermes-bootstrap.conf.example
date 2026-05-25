@@ -45,6 +45,21 @@
 # unattended re-runs / CI / scripted provisioning.
 # export HERMES_NONINTERACTIVE=0
 
+# ── 1Password CLI / secrets management ─────────────────────────────────
+# The bootstrap installs the 1Password CLI (`op`) on all hosts. If a
+# ~/.hermes/.env.template exists (with op:// references), bootstrap resolves
+# it into ~/.hermes/.env on every run.
+#
+# Headless hosts (VPS, no Touch ID) need a Service Account token to
+# authenticate non-interactively. Get one from:
+#   1Password Web → Developer Tools → Service Accounts → New
+# Grant read access to the "Hermes" vault. The token starts with "ops_".
+# Set it here (this file is sourced before any module runs):
+# export OP_SERVICE_ACCOUNT_TOKEN="ops_eyJzaWduSW5BZGRy..."
+#
+# Macs with Touch ID can skip this — `op signin` once interactively gives a
+# long-lived biometric session and bootstrap inherits it automatically.
+
 # Lockout-risk features — both default to OFF in the repo. Set to 1 here if
 # you ALWAYS want these enabled on machines you bootstrap. Make sure you have
 # working SSH key access before enabling on a remote box.

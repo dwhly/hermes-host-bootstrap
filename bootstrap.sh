@@ -304,6 +304,7 @@ verify "tmux-autoattach" "test -f $HOME/.hermes-host-bootstrap.tmux-autoattach.s
 verify "hssh"       "test -f $HOME/.hermes-host-bootstrap.hssh.sh && echo present"
 verify "tmux-workspace-colors" "test -f $HOME/.hermes-host-bootstrap.tmux-workspace-colors.conf && echo present"
 verify "aliases"     "test -f $HOME/.hermes-host-bootstrap.aliases.sh && echo present"
+verify "op"          "op --version 2>&1 | head -1"
 verify "mosh"       "mosh-server --help 2>&1 | head -1"
 verify "neovim"     "nvim --version"
 verify "ripgrep"    "rg --version"
