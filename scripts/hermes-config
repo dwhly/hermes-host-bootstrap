@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# scripts/hermes-config — personal config-sync layer helper.
+#
+# Companion to `hermes-reload` (bootstrap repo). This one manages
+# the ~/.hermes/ git repo (config + memories + agent-authored skills).
+#
+# Symlinked to ~/.local/bin/hermes-config by lib/99-register-host.sh.
+# Aliased to `hmc` in dotfiles/aliases.sh.
+#
+# Usage:
+#   hermes-config              status (drifted files, what would pull)
+#   hermes-config status       same as bare invocation
+#   hermes-config pull         git pull --ff-only in ~/.hermes
+#   hermes-config save "msg"   commit local changes + push (incl. refresh-skills)
+#   hermes-config bootstrap    one-shot clone-if-missing for new hosts
+#   hermes-config refresh-secrets   re-run op inject without full bootstrap
+#   hermes-config --help       this message
+#
+# Most subcommands delegate to ~/.hermes/sync.sh (which carries the actual
+# logic — this file just provides a uniform CLI surface and adds the
+# `bootstrap` and `refresh-secrets` actions that sync.sh doesn't have).
+
+set -euo pipefail
+
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+SYNC_SH="$HERMES_HOME/sync.sh"
+
+# ── Source per-user defaults so HERMES_CONFIG_REPO is available ─────
+if [[ -f "$HOME/.hermes-bootstrap.conf" ]]; then
+  # shellcheck disable=SC1091
+  source "$HOME/.hermes-bootstrap.conf"
+fi
+
+cmd_help() {
+  sed -n '2,18p' "$0" | sed 's/^#\s\{0,1\}//'
+}
+
+cmd_bootstrap() {
+  # One-shot for new hosts: if ~/.hermes/.git doesn't exist, clone the
+  # personal config repo into it (safely backing up any pre-existing
+  # non-git ~/.hermes/ content first, then restoring runtime-only files).
+
+  if [[ -d "$HERMES_HOME/.git" ]]; then
+    echo "==> $HERMES_HOME is already a git repo — nothing to bootstrap"
+    cd "$HERMES_HOME"
+    echo "    remote: $(git remote get-url origin 2>/dev/null || echo '<none>')"
+    echo "    branch: $(git branch --show-current 2>/dev/null || echo '<none>')"
+    echo "    last commit: $(git log -1 --format='%h %s' 2>/dev/null || echo '<none>')"
+    return 0
+  fi
+
+  if [[ -z "${HERMES_CONFIG_REPO:-}" ]]; then
+    echo "ERROR: HERMES_CONFIG_REPO is not set in ~/.hermes-bootstrap.conf"  >&2
+    echo "  Set it to the URL of your personal hermes-config repo, e.g.:"   >&2
+    echo "    export HERMES_CONFIG_REPO=\"https://github.com/USER/hermes-config.git\"" >&2
+    return 1
+  fi
+
+  echo "==> No ~/.hermes/.git found. Cloning $HERMES_CONFIG_REPO → $HERMES_HOME"
+
+  # If ~/.hermes/ exists but isn't git, back it up first.
+  if [[ -d "$HERMES_HOME" ]]; then
+    local backup
+    backup="${HERMES_HOME}.pre-config-sync-$(date +%Y%m%d-%H%M%S).bak"
+    echo "==> Backing up existing $HERMES_HOME → $backup"
+    mv "$HERMES_HOME" "$backup"
+
+    # Clone fresh
+    git clone "$HERMES_CONFIG_REPO" "$HERMES_HOME"
+
+    # Selectively restore runtime-only files (gitignored by the config repo
+    # so they wouldn't have been in the clone anyway).
+    echo "==> Restoring runtime-only files from backup (state.db, auth.json, logs, ...)"
+    for item in auth.json state.db state.db-wal state.db-shm kanban.db kanban.db-wal kanban.db-shm \
+                logs sessions cache image_cache audio_cache pastes lsp \
+                .hermes_history channel_directory.json gateway_state.json; do
+      if [[ -e "$backup/$item" ]]; then
+        cp -r "$backup/$item" "$HERMES_HOME/$item"
+        echo "    restored: $item"
+      fi
+    done
+
+    echo "==> Backup retained at $backup (safe to delete after verifying)"
+  else
+    # Nothing to back up; clone direct.
+    git clone "$HERMES_CONFIG_REPO" "$HERMES_HOME"
+  fi
+
+  echo "==> Done. $HERMES_HOME is now a clone of $HERMES_CONFIG_REPO"
+}
+
+cmd_refresh_secrets() {
+  # Re-run just the 35-secrets module from the bootstrap.
+  # Useful after rotating a key in 1Password — picks up the new value
+  # without re-running the full bootstrap.
+  if ! command -v hermes-reload >/dev/null 2>&1; then
+    echo "ERROR: hermes-reload not on PATH — install the bootstrap first" >&2
+    return 1
+  fi
+  exec hermes-reload --only=35-secrets
+}
+
+# ── Dispatcher ──────────────────────────────────────────────────────
+sub="${1:-status}"
+shift 2>/dev/null || true
+
+case "$sub" in
+  -h|--help|help)
+    cmd_help
+    ;;
+  bootstrap)
+    cmd_bootstrap "$@"
+    ;;
+  refresh-secrets|refresh)
+    cmd_refresh_secrets "$@"
+    ;;
+  status|pull|save|refresh-skills|auto)
+    # Delegate to ~/.hermes/sync.sh for the canonical operations.
+    if [[ ! -x "$SYNC_SH" ]]; then
+      echo "ERROR: $SYNC_SH not found or not executable." >&2
+      echo "  Run 'hermes-config bootstrap' first to clone your config repo." >&2
+      exit 1
+    fi
+    exec "$SYNC_SH" "$sub" "$@"
+    ;;
+  *)
+    echo "unknown subcommand: $sub" >&2
+    echo "" >&2
+    cmd_help >&2
+    exit 2
+    ;;
+esac

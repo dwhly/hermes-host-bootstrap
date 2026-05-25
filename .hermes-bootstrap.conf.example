@@ -75,7 +75,8 @@
 # export HERMES_SKIP=docker
 # Multiple modules: comma-separated, e.g. HERMES_SKIP=docker,xrdp
 
-# Optional: a private git repo to clone into ~/.hermes/ after bootstrap
-# finishes (the personal-config layer). Leave empty to skip. Companion to
-# the hermes-config-sync skill.
-# export HERMES_CONFIG_REPO=
+# Optional: a private git repo to clone into ~/.hermes/ as the personal
+# config layer. Used by `hermes-config bootstrap` (aliased to `hmc bootstrap`)
+# to set up a new host's ~/.hermes/ in one shot. Companion to the
+# hermes-config-sync skill.
+# export HERMES_CONFIG_REPO="https://github.com/USER/hermes-config.git"

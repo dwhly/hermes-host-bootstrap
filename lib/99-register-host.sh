@@ -170,7 +170,7 @@ fi
 # ── Install hermes-reload on PATH ─────────────────────────────────────
 # Companion to hermes-fleet: scripts/reload.sh is the canonical way to
 # "pull latest bootstrap and re-apply on this host." Symlinked so the
-# user can `hermes-reload` from anywhere, and aliased to `r` in
+# user can `hermes-reload` from anywhere, and aliased to `hmr` in
 # dotfiles/aliases.sh for one-keystroke daily use.
 if [[ -f "$REPO_ROOT/scripts/reload.sh" ]]; then
   mkdir -p "$HOME/.local/bin"
@@ -180,6 +180,20 @@ if [[ -f "$REPO_ROOT/scripts/reload.sh" ]]; then
   fi
   ln -s "$REPO_ROOT/scripts/reload.sh" "$TARGET_LINK"
   ok "hermes-reload → $TARGET_LINK"
+fi
+
+# ── Install hermes-config on PATH ─────────────────────────────────────
+# Personal config layer helper. Manages the ~/.hermes/ git repo (config,
+# memories, agent-authored skills, .env.template). Companion to
+# hermes-reload (which handles the system layer). Aliased to `hmc`.
+if [[ -f "$REPO_ROOT/scripts/hermes-config" ]]; then
+  mkdir -p "$HOME/.local/bin"
+  TARGET_LINK="$HOME/.local/bin/hermes-config"
+  if [[ -L "$TARGET_LINK" || -f "$TARGET_LINK" ]]; then
+    rm -f "$TARGET_LINK"
+  fi
+  ln -s "$REPO_ROOT/scripts/hermes-config" "$TARGET_LINK"
+  ok "hermes-config → $TARGET_LINK"
 fi
 
 # Helpful hint for the user: if ~/.hermes is git-tracked (the typical

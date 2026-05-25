@@ -10,11 +10,18 @@
 
 # ── BEGIN core ──
 alias h='history'
-alias r='hermes-reload'
 # ── END core ──
 
 # ── BEGIN hermes ──
+# Convention: every hm-prefixed alias maps 1:1 to a real command of the
+# form `hermes-<verb>`. The long form is always available; the short alias
+# is for daily fingerprint efficiency. Add new ones via the
+# `add-shell-alias` skill (which also creates the underlying real command
+# when it's a new helper script).
 alias hm='hermes'
+alias hmr='hermes-reload'
+alias hmc='hermes-config'
+alias hmf='hermes-fleet'
 # ── END hermes ──
 
 # ── BEGIN git ──
