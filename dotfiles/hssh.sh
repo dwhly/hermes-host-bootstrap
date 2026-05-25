@@ -34,18 +34,11 @@ hssh() {
   # -t forces a remote TTY (required by tmux).
   # Single-quote the remote command so $session expands locally only.
   #
-  # Prefer `ghostty +ssh` when available: it auto-installs Ghostty's terminfo
-  # entry on the remote on first connect, fixing the common
-  #   missing or unsuitable terminal: xterm-ghostty
-  # error that tmux raises on remotes without the xterm-ghostty terminfo entry.
-  # The `--` separator is mandatory: ghostty parses its own flags before it
-  # and forwards everything after verbatim to ssh. Without `--`, `-t` is
-  # swallowed by ghostty itself with "invalid action" error.
-  # Falls back to plain `ssh` everywhere else (Linux clients, servers hopping
-  # between boxes, etc.). See https://ghostty.org/docs/features/ssh
-  if command -v ghostty >/dev/null 2>&1; then
-    ghostty +ssh "$host" -- -t "tmux new -As '$session'"
-  else
-    ssh -t "$host" "tmux new -As '$session'"
-  fi
+  # We tried `ghostty +ssh` (auto-installs xterm-ghostty terminfo on the
+  # remote) but it has bugs in Ghostty 1.3.1 that produce invalid-action
+  # errors and SIGTRAPs. Use plain ssh and rely on either:
+  #   (a) `term = xterm-256color` in ~/.config/ghostty/config, or
+  #   (b) one-time terminfo install on the remote.
+  # See https://ghostty.org/docs/help/terminfo
+  ssh -t "$host" "tmux new -As '$session'"
 }

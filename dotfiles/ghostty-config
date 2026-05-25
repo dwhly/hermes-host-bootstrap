@@ -31,6 +31,23 @@ window-inherit-working-directory = true
 # Quit only when last surface closes (instead of Cmd+Q killing instantly)
 quit-after-last-window-closed = true
 
+# ── Compatibility ───────────────────────────────────────────────────
+# Advertise TERM=xterm-256color instead of the default xterm-ghostty.
+# Every Unix server already has xterm-256color terminfo; xterm-ghostty
+# does not, which makes tmux refuse to start on remotes that haven't
+# manually installed Ghostty's terminfo entry. The trade-off is that
+# we lose Ghostty's most advanced terminal capabilities (undercurl
+# colors, extended color signaling — features tmux mostly can't pass
+# through anyway). We keep 24-bit truecolor, 256-color palette, mouse
+# handling, and every TUI keeps working.
+#
+# If you want full xterm-ghostty fidelity, comment this line out and
+# install Ghostty's terminfo on each remote:
+#   /opt/homebrew/opt/ncurses/bin/infocmp -x xterm-ghostty | ssh HOST -- tic -x -
+# (requires Homebrew ncurses since Apple's infocmp is too old).
+# See https://ghostty.org/docs/help/terminfo
+term = xterm-256color
+
 # ── macOS keybindings ───────────────────────────────────────────────
 # (Ghostty applies these globally; on Linux you'd swap super → ctrl+shift)
 keybind = super+t=new_tab

@@ -20,17 +20,17 @@ set sessionNames to {"ops", "code", "logs", "scratch"}
 
 -- Build the remote command for one pane. `new -As` attaches to an existing
 -- tmux session by that name, or creates a fresh one if it doesn't exist.
--- We use `ghostty +ssh` (a drop-in ssh wrapper Ghostty ships) instead of
--- raw ssh because it auto-installs Ghostty's terminfo entry on the remote
--- the first time you connect, then caches the install. Without this, tmux
--- on the remote dies with "missing or unsuitable terminal: xterm-ghostty"
--- because most distros don't ship the xterm-ghostty terminfo entry yet.
--- The `--` separator is mandatory: ghostty parses its own flags before it
--- and forwards everything after verbatim to ssh. Without `--`, `-t` is
--- swallowed by ghostty itself with "invalid action" error -10006.
--- See https://ghostty.org/docs/features/ssh
+--
+-- We use plain `ssh -t` rather than `ghostty +ssh`. `+ssh` is meant to be
+-- the right answer here — it auto-installs xterm-ghostty terminfo on the
+-- remote — but in Ghostty 1.3.1 it had bugs that produced 'invalid action'
+-- errors and SIGTRAPs when given short ssh flags. The reliable path is:
+--   (a) set `term = xterm-256color` in ~/.config/ghostty/config so Ghostty
+--       advertises a TERM that every server already understands, OR
+--   (b) manually install xterm-ghostty terminfo on the remote (one-time).
+-- Both are documented in https://ghostty.org/docs/help/terminfo
 on sshCmd(h, s)
-    return "ghostty +ssh " & h & " -- -t 'tmux new -As " & s & "' ; exit"
+    return "ssh -t " & h & " 'tmux new -As " & s & "' ; exit"
 end sshCmd
 
 tell application "Ghostty"
