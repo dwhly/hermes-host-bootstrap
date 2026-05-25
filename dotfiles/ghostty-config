@@ -12,7 +12,7 @@
 # and references to specific theme names (e.g. catppuccin-mocha) break
 # across versions. Setting the colors explicitly is stable.
 background = #000000
-foreground = #5d5d4e
+foreground = #f6f7d0
 cursor-color = #ffcc00
 selection-background = #444444
 selection-foreground = #ffffff
