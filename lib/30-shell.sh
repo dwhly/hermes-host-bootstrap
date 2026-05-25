@@ -64,4 +64,16 @@ if tier_allows R && ! is_skipped inputrc; then
   fi
 fi
 
+# tmux auto-attach on interactive SSH — drop snippet, source from rc files.
+# Works for both bash and zsh; SSH-only and interactive-only guarded inside.
+if have tmux && tier_allows R && ! is_skipped tmux-autoattach; then
+  cp "$REPO_ROOT/dotfiles/tmux-autoattach.sh" "$HOME/.hermes-host-bootstrap.tmux-autoattach.sh"
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    [[ -f "$rc" ]] || continue
+    ensure_line "# ── hermes-host-bootstrap tmux auto-attach ──" "$rc"
+    ensure_line "[ -f $HOME/.hermes-host-bootstrap.tmux-autoattach.sh ] && . $HOME/.hermes-host-bootstrap.tmux-autoattach.sh" "$rc"
+  done
+  ok "tmux auto-attach snippet installed (sourced from bashrc/zshrc)"
+fi
+
 ok "Shell setup complete"

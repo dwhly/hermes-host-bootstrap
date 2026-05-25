@@ -127,6 +127,7 @@ Each module can also be run on its own:
 | `fail2ban`      | fail2ban |
 | `unattended`    | unattended-upgrades |
 | `tmux` / `tmux-conf` | tmux package / .tmux.conf install |
+| `tmux-autoattach` | auto-attach to tmux session "main" on interactive SSH (snippet sourced from .bashrc/.zshrc) |
 | `mosh-firewall` | UFW rule for mosh UDP 60000-61000 (rule still added if ufw stays disabled) |
 | `zsh` / `oh-my-zsh`  | zsh / OMZ |
 | `inputrc`       | .inputrc install |
