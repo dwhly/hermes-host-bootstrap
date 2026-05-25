@@ -96,6 +96,7 @@ d = sys.argv[1]
 out = []
 for fn in sorted(os.listdir(d)):
     if not fn.endswith(".yaml"): continue
+    if fn.endswith(".live.yaml"): continue   # live heartbeat snapshots are per-host overlays, not separate hosts
     rec = {}
     section = None
     for raw in open(os.path.join(d, fn)):
@@ -114,14 +115,16 @@ PY
 fi
 
 # Default: tabular dashboard.
+# Exclude *.live.yaml files (heartbeat snapshots that overlay the main per-host yaml).
 printf '\n  \033[1;36mHermes Fleet\033[0m  (%s hosts in registry)\n\n' \
-  "$(ls "$REGISTRY_DIR"/*.yaml 2>/dev/null | wc -l | tr -d ' ')"
+  "$(ls "$REGISTRY_DIR"/*.yaml 2>/dev/null | grep -v '\.live\.yaml$' | wc -l | tr -d ' ')"
 
 printf '  \033[1m%-18s %-10s %-8s %-22s %-10s %-12s %s\033[0m\n' \
   HOST TIER ROLE OS HERMES DISK NOTE
 
 for f in "$REGISTRY_DIR"/*.yaml; do
   [[ -f "$f" ]] || continue
+  [[ "$f" == *.live.yaml ]] && continue   # skip per-host heartbeat overlays
   HOST=$(get_field "$f" hostname)
   TIER=$(get_field "$f" tier)
   ROLE=$(get_field "$f" role)
