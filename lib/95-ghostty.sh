@@ -32,6 +32,21 @@ if [[ "$OS" == "macos" ]]; then
   else
     warn "Homebrew missing — install via https://ghostty.org/download"
   fi
+
+  # The Ghostty cask doesn't symlink the CLI onto PATH. The CLI is
+  # /Applications/Ghostty.app/Contents/MacOS/ghostty and it ships useful
+  # subcommands like `ghostty +ssh` (auto-installs xterm-ghostty terminfo
+  # on remote hosts), `ghostty +list-fonts`, `ghostty +ssh-cache`, etc.
+  # Symlink it into a user-writable PATH dir so `ghostty +ssh` works from
+  # any shell. We prefer ~/.local/bin (no sudo, already on PATH via
+  # ~/.local/bin/env) but fall back to /usr/local/bin if writable.
+  ghostty_cli="/Applications/Ghostty.app/Contents/MacOS/ghostty"
+  if [[ -x "$ghostty_cli" ]] && ! is_skipped ghostty-cli-link; then
+    mkdir -p "$HOME/.local/bin"
+    ln -sf "$ghostty_cli" "$HOME/.local/bin/ghostty"
+    ok "Ghostty CLI symlinked to ~/.local/bin/ghostty"
+  fi
+
   return 0 2>/dev/null || exit 0
 fi
 
