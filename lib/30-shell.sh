@@ -76,4 +76,16 @@ if have tmux && tier_allows R && ! is_skipped tmux-autoattach; then
   ok "tmux auto-attach snippet installed (sourced from bashrc/zshrc)"
 fi
 
+# hssh — ssh + attach/create named tmux session in one shot.
+# Lives on every host so it works whether you're the client or hopping between boxes.
+if have tmux && tier_allows R && ! is_skipped hssh; then
+  cp "$REPO_ROOT/dotfiles/hssh.sh" "$HOME/.hermes-host-bootstrap.hssh.sh"
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    [[ -f "$rc" ]] || continue
+    ensure_line "# ── hermes-host-bootstrap hssh helper ──" "$rc"
+    ensure_line "[ -f $HOME/.hermes-host-bootstrap.hssh.sh ] && . $HOME/.hermes-host-bootstrap.hssh.sh" "$rc"
+  done
+  ok "hssh helper installed (sourced from bashrc/zshrc)"
+fi
+
 ok "Shell setup complete"

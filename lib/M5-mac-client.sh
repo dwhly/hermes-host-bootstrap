@@ -89,6 +89,33 @@ if tier_allows N && ! is_skipped raycast; then
   fi
 fi
 
+# Ghostty 4-pane workspace launcher (AppleScript).
+# Drops the .applescript file and a wrapper command, both idempotent. Requires
+# Ghostty 1.3.0+ for AppleScript support (current Homebrew cask is fine).
+if ! is_skipped ghostty-workspace; then
+  if [[ -d /Applications/Ghostty.app ]]; then
+    workspace_dir="$HOME/.hermes-host-bootstrap"
+    mkdir -p "$workspace_dir"
+    cp "$REPO_ROOT/scripts/ghostty-workspace.applescript" \
+       "$workspace_dir/ghostty-workspace.applescript"
+
+    # Wrapper command on PATH — `hermes-workspace` opens the 2x2 grid.
+    bin_dir="$HOME/.local/bin"
+    mkdir -p "$bin_dir"
+    cat > "$bin_dir/hermes-workspace" <<'WRAPPER'
+#!/bin/sh
+# hermes-workspace — open a 4-pane Ghostty grid SSH'd into named tmux sessions.
+# Edit ~/.hermes-host-bootstrap/ghostty-workspace.applescript to retarget host
+# or session names.
+exec osascript "$HOME/.hermes-host-bootstrap/ghostty-workspace.applescript" "$@"
+WRAPPER
+    chmod +x "$bin_dir/hermes-workspace"
+    ok "Ghostty workspace launcher installed (run: hermes-workspace)"
+  else
+    skip "Ghostty not installed yet — workspace launcher skipped"
+  fi
+fi
+
 ok "macOS client setup complete"
 
 echo ""

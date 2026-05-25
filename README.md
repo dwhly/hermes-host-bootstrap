@@ -128,6 +128,8 @@ Each module can also be run on its own:
 | `unattended`    | unattended-upgrades |
 | `tmux` / `tmux-conf` | tmux package / .tmux.conf install |
 | `tmux-autoattach` | auto-attach to tmux session "main" on interactive SSH (snippet sourced from .bashrc/.zshrc) |
+| `hssh` | `hssh <session>` shell function: ssh + attach/create named tmux session in one shot |
+| `ghostty-workspace` | macOS only: 2x2 Ghostty grid launcher (`hermes-workspace`) via AppleScript |
 | `mosh-firewall` | UFW rule for mosh UDP 60000-61000 (rule still added if ufw stays disabled) |
 | `zsh` / `oh-my-zsh`  | zsh / OMZ |
 | `inputrc`       | .inputrc install |
