@@ -89,6 +89,43 @@ if tier_allows N && ! is_skipped raycast; then
   fi
 fi
 
+# macOS hostname rename — opt-in via HERMES_MAC_HOSTNAME. Sets the three
+# Mac hostname facets:
+#   HostName       → CLI hostname (`hostname`, $HOSTNAME, shell prompt)
+#   LocalHostName  → Bonjour/mDNS name (used for `<name>.local`)
+#   ComputerName   → friendly name (AirDrop, Finder, Sharing pane)
+#
+# By design, ComputerName stays human-readable ("Dan's Mac Mini") so
+# AirDrop / Finder pickers don't show "h-mini" — only HostName + LocalHostName
+# become the CLI-friendly $HERMES_MAC_HOSTNAME. If you want to override the
+# ComputerName too, set HERMES_MAC_COMPUTER_NAME explicitly.
+#
+# Skip key: mac-hostname. Lockout-safe: only fires when the env var is set.
+if [[ -n "${HERMES_MAC_HOSTNAME:-}" ]] && ! is_skipped mac-hostname; then
+  new_host="$HERMES_MAC_HOSTNAME"
+  current_host="$(scutil --get HostName 2>/dev/null || hostname)"
+  if [[ "$current_host" == "$new_host" ]]; then
+    skip "Mac hostname already $new_host"
+  else
+    info "renaming Mac: $current_host → $new_host"
+    if sudo scutil --set HostName "$new_host" && \
+       sudo scutil --set LocalHostName "$new_host"; then
+      if [[ -n "${HERMES_MAC_COMPUTER_NAME:-}" ]]; then
+        sudo scutil --set ComputerName "$HERMES_MAC_COMPUTER_NAME" && \
+          ok "ComputerName: $HERMES_MAC_COMPUTER_NAME"
+      else
+        info "ComputerName left unchanged (set HERMES_MAC_COMPUTER_NAME to override AirDrop / Finder name too)"
+      fi
+      ok "Mac hostname: $current_host → $new_host (HostName + LocalHostName)"
+      ok "open a new terminal to see the new prompt"
+    else
+      warn "scutil rename failed — try manually:"
+      warn "  sudo scutil --set HostName \"$new_host\""
+      warn "  sudo scutil --set LocalHostName \"$new_host\""
+    fi
+  fi
+fi
+
 # Ghostty 4-pane workspace launcher (AppleScript).
 # Drops the .applescript file and a wrapper command, both idempotent. Requires
 # Ghostty 1.3.0+ for AppleScript support (current Homebrew cask is fine).

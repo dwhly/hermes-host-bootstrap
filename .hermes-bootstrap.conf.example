@@ -29,6 +29,13 @@
 # Repo default is "leave hostname alone."
 # export HERMES_HOSTNAME=
 
+# macOS hostname rename. Sets HostName + LocalHostName to this value via
+# scutil. Leaves ComputerName (the friendly AirDrop/Finder name) alone
+# unless HERMES_MAC_COMPUTER_NAME is also set. Only applied on macOS hosts.
+# Lockout-safe: only fires when this env var is explicitly set.
+# export HERMES_MAC_HOSTNAME=h-mini
+# export HERMES_MAC_COMPUTER_NAME="Dan's Mac Mini"
+
 # One-line note describing what this machine is for. Lands in
 # ~/.hermes/hosts/<hostname>.yaml under `note:` and shows in `hermes-fleet`.
 # If set here, the interactive prompt is skipped for the note.
