@@ -17,9 +17,18 @@
 hssh() {
   session="${1:-main}"
   host="${2:-${HSSH_DEFAULT_HOST:-}}"
+  # Guard against pasted shell comments leaking in as arguments. zsh does not
+  # treat `#` as a comment by default in interactive shells, so a pasted line
+  # like `hssh code  # connect to code` arrives as ($1=code, $2=#, $3=connect, ...).
+  # Drop a leading '#' so we fall through to HSSH_DEFAULT_HOST instead of trying
+  # to ssh to a host literally named '#'.
+  case "$host" in
+    '#'*) host="${HSSH_DEFAULT_HOST:-}" ;;
+  esac
   if [ -z "$host" ]; then
     echo "hssh: no host given and HSSH_DEFAULT_HOST is unset" >&2
     echo "usage: hssh <session> [user@host]   or   export HSSH_DEFAULT_HOST=user@host" >&2
+    echo "(zsh tip: 'setopt interactive_comments' to make trailing '# notes' work like bash)" >&2
     return 2
   fi
   # -t forces a remote TTY (required by tmux).
