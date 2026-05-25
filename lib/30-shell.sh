@@ -81,10 +81,13 @@ fi
 
 # tmux auto-attach on interactive SSH — drop snippet, source from rc files.
 # Works for both bash and zsh; SSH-only and interactive-only guarded inside.
+# We `touch` each rc file first so it's created if missing — otherwise a host
+# whose user only ever uses bash (or only zsh) wouldn't pick up the snippet
+# in the other shell if they ever switched. Better to always provision both.
 if have tmux && tier_allows R && ! is_skipped tmux-autoattach; then
   cp "$REPO_ROOT/dotfiles/tmux-autoattach.sh" "$HOME/.hermes-host-bootstrap.tmux-autoattach.sh"
   for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
-    [[ -f "$rc" ]] || continue
+    touch "$rc"
     ensure_line "# ── hermes-host-bootstrap tmux auto-attach ──" "$rc"
     ensure_line "[ -f $HOME/.hermes-host-bootstrap.tmux-autoattach.sh ] && . $HOME/.hermes-host-bootstrap.tmux-autoattach.sh" "$rc"
   done
@@ -96,7 +99,7 @@ fi
 if have tmux && tier_allows R && ! is_skipped hssh; then
   cp "$REPO_ROOT/dotfiles/hssh.sh" "$HOME/.hermes-host-bootstrap.hssh.sh"
   for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
-    [[ -f "$rc" ]] || continue
+    touch "$rc"
     ensure_line "# ── hermes-host-bootstrap hssh helper ──" "$rc"
     ensure_line "[ -f $HOME/.hermes-host-bootstrap.hssh.sh ] && . $HOME/.hermes-host-bootstrap.hssh.sh" "$rc"
   done
@@ -110,11 +113,29 @@ fi
 if tier_allows R && ! is_skipped aliases; then
   cp "$REPO_ROOT/dotfiles/aliases.sh" "$HOME/.hermes-host-bootstrap.aliases.sh"
   for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
-    [[ -f "$rc" ]] || continue
+    touch "$rc"
     ensure_line "# ── hermes-host-bootstrap shell aliases ──" "$rc"
     ensure_line "[ -f $HOME/.hermes-host-bootstrap.aliases.sh ] && . $HOME/.hermes-host-bootstrap.aliases.sh" "$rc"
   done
   ok "shell aliases installed (h, hm, ... — sourced from bashrc/zshrc)"
+fi
+
+# Make zsh the default login shell on Linux (matches macOS defaults since
+# 10.15 — gives Dan one mental model across his Mac and every Hermes host).
+# Only switches when the user is currently NOT on zsh and zsh is installed.
+# Skip key: chsh-zsh.
+if [[ "$OS" != "macos" ]] && have zsh && tier_allows R && ! is_skipped chsh-zsh; then
+  current_shell="$(getent passwd "$USER" 2>/dev/null | cut -d: -f7)"
+  zsh_path="$(command -v zsh)"
+  if [[ "$current_shell" != "$zsh_path" ]]; then
+    if chsh -s "$zsh_path" "$USER" 2>/dev/null; then
+      ok "default login shell switched to zsh ($zsh_path) — re-login to take effect"
+    else
+      warn "chsh -s $zsh_path failed (no sudo or PAM rules?) — run manually: chsh -s $zsh_path"
+    fi
+  else
+    skip "default login shell is already zsh"
+  fi
 fi
 
 ok "Shell setup complete"

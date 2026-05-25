@@ -49,3 +49,9 @@ command -v rg    >/dev/null 2>&1 && alias grep='rg'
 # Editor
 export EDITOR="${EDITOR:-nvim}"
 export VISUAL="$EDITOR"
+
+# Strip `# trailing comments` like bash does. Without this, a pasted
+# command like `ssh host  # connect` makes zsh treat `#` as a literal
+# argument, which can produce confusing errors (e.g. "Could not resolve
+# hostname #"). interactive_comments aligns zsh with bash here.
+setopt interactive_comments
