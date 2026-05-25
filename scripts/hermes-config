@@ -39,6 +39,11 @@ cmd_bootstrap() {
   # One-shot for new hosts: if ~/.hermes/.git doesn't exist, clone the
   # personal config repo into it (safely backing up any pre-existing
   # non-git ~/.hermes/ content first, then restoring runtime-only files).
+  #
+  # Recovery-aware: if a previous run failed mid-clone (e.g. on the auth
+  # prompt) and left a .pre-config-sync-*.bak alongside an empty/missing
+  # ~/.hermes/, this re-run picks up where it left off using the most
+  # recent backup.
 
   if [[ -d "$HERMES_HOME/.git" ]]; then
     echo "==> $HERMES_HOME is already a git repo — nothing to bootstrap"
@@ -56,34 +61,48 @@ cmd_bootstrap() {
     return 1
   fi
 
+  # Find any existing backup from a previous failed run, so we don't lose
+  # runtime files even if this run's backup-step gets skipped.
+  local pre_existing_backup=""
+  # shellcheck disable=SC2012
+  pre_existing_backup="$(ls -td "${HERMES_HOME}".pre-config-sync-*.bak 2>/dev/null | head -1 || true)"
+
   echo "==> No ~/.hermes/.git found. Cloning $HERMES_CONFIG_REPO → $HERMES_HOME"
 
   # If ~/.hermes/ exists but isn't git, back it up first.
+  local backup=""
   if [[ -d "$HERMES_HOME" ]]; then
-    local backup
     backup="${HERMES_HOME}.pre-config-sync-$(date +%Y%m%d-%H%M%S).bak"
     echo "==> Backing up existing $HERMES_HOME → $backup"
     mv "$HERMES_HOME" "$backup"
+  fi
 
-    # Clone fresh
-    git clone "$HERMES_CONFIG_REPO" "$HERMES_HOME"
+  # Clone fresh. If this fails (auth prompt timeout, etc.) the backup stays
+  # in place for the next retry.
+  if ! git clone "$HERMES_CONFIG_REPO" "$HERMES_HOME"; then
+    echo "ERROR: git clone failed." >&2
+    if [[ -n "$backup" ]]; then
+      echo "  Your prior ~/.hermes is safely backed up at: $backup" >&2
+    fi
+    echo "  Fix auth (try: gh auth login && gh auth setup-git), then re-run hermes-config bootstrap." >&2
+    return 1
+  fi
 
-    # Selectively restore runtime-only files (gitignored by the config repo
-    # so they wouldn't have been in the clone anyway).
-    echo "==> Restoring runtime-only files from backup (state.db, auth.json, logs, ...)"
-    for item in auth.json state.db state.db-wal state.db-shm kanban.db kanban.db-wal kanban.db-shm \
+  # Restore runtime-only files. Source = this-run backup if we made one,
+  # otherwise the most recent pre-existing backup from an earlier failed run.
+  local restore_src="${backup:-$pre_existing_backup}"
+  if [[ -n "$restore_src" && -d "$restore_src" ]]; then
+    echo "==> Restoring runtime-only files from $restore_src"
+    for item in auth.json state.db state.db-wal state.db-shm \
+                kanban.db kanban.db-wal kanban.db-shm \
                 logs sessions cache image_cache audio_cache pastes lsp \
                 .hermes_history channel_directory.json gateway_state.json; do
-      if [[ -e "$backup/$item" ]]; then
-        cp -r "$backup/$item" "$HERMES_HOME/$item"
+      if [[ -e "$restore_src/$item" ]]; then
+        cp -r "$restore_src/$item" "$HERMES_HOME/$item"
         echo "    restored: $item"
       fi
     done
-
-    echo "==> Backup retained at $backup (safe to delete after verifying)"
-  else
-    # Nothing to back up; clone direct.
-    git clone "$HERMES_CONFIG_REPO" "$HERMES_HOME"
+    echo "==> Backup retained at $restore_src (safe to delete after verifying)"
   fi
 
   echo "==> Done. $HERMES_HOME is now a clone of $HERMES_CONFIG_REPO"
