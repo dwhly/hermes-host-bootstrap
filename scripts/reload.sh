@@ -111,14 +111,20 @@ fi
 
 # ── re-run bootstrap.sh with passthrough args ───────────────────────
 # Default to --tier=recommended if user didn't specify a tier.
+#
+# Note: empty bash arrays under `set -u` need careful expansion. Both
+# `${ARR[@]:-}` and `${ARR[*]:-}` add a spurious empty-string element to
+# the expansion when ARR is empty, which trips bootstrap.sh's arg parser
+# with "unknown arg: ". The correct idiom is `${ARR[@]+"${ARR[@]}"}` — it
+# expands to the array if set, otherwise to nothing (zero elements).
 has_tier=0
-for arg in "${PASSTHROUGH[@]:-}"; do
+for arg in ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}; do
   case "$arg" in
     --tier=*) has_tier=1 ;;
   esac
 done
 if [[ "$has_tier" -eq 0 ]]; then
-  PASSTHROUGH=("--tier=recommended" "${PASSTHROUGH[@]:-}")
+  PASSTHROUGH=("--tier=recommended" ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"})
 fi
 
 # Default to --noninteractive unless --prompt was passed. This is the
@@ -128,5 +134,5 @@ if [[ "$ALLOW_PROMPTS" -eq 0 ]]; then
   PASSTHROUGH+=("--noninteractive")
 fi
 
-echo "==> $clone/bootstrap.sh ${PASSTHROUGH[*]:-}"
-exec "$clone/bootstrap.sh" "${PASSTHROUGH[@]:-}"
+echo "==> $clone/bootstrap.sh ${PASSTHROUGH[*]}"
+exec "$clone/bootstrap.sh" "${PASSTHROUGH[@]}"
