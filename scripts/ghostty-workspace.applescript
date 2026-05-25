@@ -20,8 +20,14 @@ set sessionNames to {"ops", "code", "logs", "scratch"}
 
 -- Build the remote command for one pane. `new -As` attaches to an existing
 -- tmux session by that name, or creates a fresh one if it doesn't exist.
+-- We use `ghostty +ssh` (a drop-in ssh wrapper Ghostty ships) instead of
+-- raw ssh because it auto-installs Ghostty's terminfo entry on the remote
+-- the first time you connect, then caches the install. Without this, tmux
+-- on the remote dies with "missing or unsuitable terminal: xterm-ghostty"
+-- because most distros don't ship the xterm-ghostty terminfo entry yet.
+-- See https://ghostty.org/docs/features/ssh
 on sshCmd(h, s)
-    return "ssh -t " & h & " 'tmux new -As " & s & "' ; exit"
+    return "ghostty +ssh " & h & " -t 'tmux new -As " & s & "' ; exit"
 end sshCmd
 
 tell application "Ghostty"

@@ -33,5 +33,16 @@ hssh() {
   fi
   # -t forces a remote TTY (required by tmux).
   # Single-quote the remote command so $session expands locally only.
-  ssh -t "$host" "tmux new -As '$session'"
+  #
+  # Prefer `ghostty +ssh` when available: it auto-installs Ghostty's terminfo
+  # entry on the remote on first connect, fixing the common
+  #   missing or unsuitable terminal: xterm-ghostty
+  # error that tmux raises on remotes without the xterm-ghostty terminfo entry.
+  # Falls back to plain `ssh` everywhere else (Linux clients, servers hopping
+  # between boxes, etc.). See https://ghostty.org/docs/features/ssh
+  if command -v ghostty >/dev/null 2>&1; then
+    ghostty +ssh -t "$host" "tmux new -As '$session'"
+  else
+    ssh -t "$host" "tmux new -As '$session'"
+  fi
 }
