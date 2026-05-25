@@ -60,10 +60,14 @@ if tier_allows E && ! is_skipped node; then
     else
       skip "Node LTS already installed via fnm"
     fi
-    # Add fnm init to shell rc files (idempotent)
+    # Add fnm init to shell rc files (idempotent, self-heals if fnm later vanishes).
+    # The guard around the eval means a shell still starts cleanly even if fnm
+    # is uninstalled, never installed (e.g. --only=30-shell run alone), or its
+    # binary moved. Without the guard you get 'command not found: fnm' on every
+    # new shell, which is harmless but noisy.
     for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
       [[ -f "$rc" ]] || continue
-      ensure_line 'eval "$(fnm env --use-on-cd)"' "$rc"
+      ensure_line 'command -v fnm >/dev/null 2>&1 && eval "$(fnm env --use-on-cd)"' "$rc"
     done
   fi
 fi
