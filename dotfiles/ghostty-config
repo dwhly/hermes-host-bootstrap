@@ -3,16 +3,16 @@
 # Docs: https://ghostty.org/docs/config
 
 # ── Appearance ──────────────────────────────────────────────────────
-# Theme is omitted on purpose — Ghostty 1.3.x reorganized its built-in
-# theme bundle and `catppuccin-mocha` (an old built-in) isn't always
-# resolvable, which raises a "Configuration Errors" dialog on launch.
-# Pick a theme yourself once you know what's installed:
-#   ghostty +list-themes 2>&1 | less
-# then set e.g.:
-#   theme = "Tokyo Night"
-# Ghostty's default (no theme directive) is perfectly readable.
-#
-# theme = "Tokyo Night"
+# Dark mode with explicit base palette. We don't use a theme directive
+# because Ghostty 1.3.x has been reorganizing its built-in theme bundle
+# and references to specific theme names (e.g. catppuccin-mocha) break
+# across versions. Setting the colors explicitly is stable.
+background = #000000
+foreground = #ffffff
+cursor-color = #ffcc00
+selection-background = #444444
+selection-foreground = #ffffff
+
 font-family = "JetBrainsMono Nerd Font"
 font-size = 14
 font-feature = -calt          # disable ligatures (subjective; flip to +calt if you like them)
@@ -20,7 +20,7 @@ font-feature = -calt          # disable ligatures (subjective; flip to +calt if 
 # Padding & cursor
 window-padding-x = 12
 window-padding-y = 12
-cursor-style = bar
+cursor-style = block
 cursor-style-blink = false
 
 # Tab bar

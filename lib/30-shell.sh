@@ -35,6 +35,21 @@ if have tmux && tier_allows E && ! is_skipped tmux-conf; then
   fi
 fi
 
+# tmux workspace colors — separate file sourced from ~/.tmux.conf, so we can
+# update the per-session statusline coloring without overwriting the user's
+# main tmux.conf. Drop the snippet file, then ensure_line a source-file line
+# into ~/.tmux.conf so it's picked up on every tmux start (and on prefix-r
+# reload). Skip key: tmux-workspace-colors.
+if have tmux && tier_allows R && ! is_skipped tmux-workspace-colors; then
+  cp "$REPO_ROOT/dotfiles/tmux-workspace-colors.conf" \
+     "$HOME/.hermes-host-bootstrap.tmux-workspace-colors.conf"
+  if [[ -f "$HOME/.tmux.conf" ]]; then
+    ensure_line "# ── hermes-host-bootstrap tmux workspace colors ──" "$HOME/.tmux.conf"
+    ensure_line "source-file ~/.hermes-host-bootstrap.tmux-workspace-colors.conf" "$HOME/.tmux.conf"
+  fi
+  ok "tmux workspace colors installed (per-session statusbar)"
+fi
+
 # oh-my-zsh — only if zsh present, OMZ missing, and user opts in (default: yes for R)
 if have zsh && tier_allows R && ! is_skipped oh-my-zsh; then
   if [[ ! -d "$HOME/.oh-my-zsh" ]]; then

@@ -127,6 +127,7 @@ Each module can also be run on its own:
 | `fail2ban`      | fail2ban |
 | `unattended`    | unattended-upgrades |
 | `tmux` / `tmux-conf` | tmux package / .tmux.conf install |
+| `tmux-workspace-colors` | per-session statusbar coloring for hermes-workspace panes (ops/code/logs/scratch) |
 | `tmux-autoattach` | auto-attach to tmux session "main" on interactive SSH (snippet sourced from .bashrc/.zshrc) |
 | `hssh` | `hssh <session>` shell function: ssh + attach/create named tmux session in one shot |
 | `ghostty-workspace` | macOS only: 2x2 Ghostty grid launcher (`hermes-workspace`) via AppleScript |
