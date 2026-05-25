@@ -103,4 +103,18 @@ if have tmux && tier_allows R && ! is_skipped hssh; then
   ok "hssh helper installed (sourced from bashrc/zshrc)"
 fi
 
+# Shell aliases — common shortcuts maintained by the add-shell-alias skill.
+# Lives in dotfiles/aliases.sh; gets sourced from .bashrc and .zshrc so it
+# works in both shells. The skill knows the format and edits this file
+# in-place when you ask for new aliases.
+if tier_allows R && ! is_skipped aliases; then
+  cp "$REPO_ROOT/dotfiles/aliases.sh" "$HOME/.hermes-host-bootstrap.aliases.sh"
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    [[ -f "$rc" ]] || continue
+    ensure_line "# ── hermes-host-bootstrap shell aliases ──" "$rc"
+    ensure_line "[ -f $HOME/.hermes-host-bootstrap.aliases.sh ] && . $HOME/.hermes-host-bootstrap.aliases.sh" "$rc"
+  done
+  ok "shell aliases installed (h, hm, ... — sourced from bashrc/zshrc)"
+fi
+
 ok "Shell setup complete"
