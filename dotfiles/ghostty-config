@@ -3,7 +3,16 @@
 # Docs: https://ghostty.org/docs/config
 
 # ── Appearance ──────────────────────────────────────────────────────
-theme = catppuccin-mocha
+# Theme is omitted on purpose — Ghostty 1.3.x reorganized its built-in
+# theme bundle and `catppuccin-mocha` (an old built-in) isn't always
+# resolvable, which raises a "Configuration Errors" dialog on launch.
+# Pick a theme yourself once you know what's installed:
+#   ghostty +list-themes 2>&1 | less
+# then set e.g.:
+#   theme = "Tokyo Night"
+# Ghostty's default (no theme directive) is perfectly readable.
+#
+# theme = "Tokyo Night"
 font-family = "JetBrainsMono Nerd Font"
 font-size = 14
 font-feature = -calt          # disable ligatures (subjective; flip to +calt if you like them)
