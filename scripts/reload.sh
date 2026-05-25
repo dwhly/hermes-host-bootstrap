@@ -6,13 +6,20 @@
 # for one-keystroke daily use.
 #
 # Usage:
-#   hermes-reload                     # default: git pull + ./bootstrap.sh --tier=recommended
+#   hermes-reload                     # default: git pull + ./bootstrap.sh --tier=recommended --noninteractive
 #   hermes-reload --only=30-shell     # forward args to bootstrap.sh
 #   hermes-reload --dry-run           # preview without applying
 #   hermes-reload --no-pull           # skip git pull (useful in offline / testing flows)
+#   hermes-reload --prompt            # allow prompts (e.g. when you DO want to rename or re-tag)
+#   hermes-reload --prompt --rename   # force hostname re-prompt
+#   hermes-reload --prompt --retag    # force note re-prompt
 #
 # Tier and role default to whatever's in ~/.hermes-bootstrap.conf if it
 # exists, otherwise --tier=recommended for the user to override.
+#
+# `hermes-reload` defaults to --noninteractive because the common case is
+# "re-apply latest config, don't ask me to re-identify the box every time."
+# Pass --prompt to override (e.g. paired with --rename or --retag).
 
 set -euo pipefail
 
@@ -69,14 +76,18 @@ clone_fresh() {
 
 # ── parse our own flags before forwarding to bootstrap.sh ───────────
 DO_PULL=1
+ALLOW_PROMPTS=0
 PASSTHROUGH=()
 for arg in "$@"; do
   case "$arg" in
     --no-pull)
       DO_PULL=0
       ;;
+    --prompt)
+      ALLOW_PROMPTS=1
+      ;;
     --help|-h)
-      sed -n '2,20p' "$0" | sed 's/^#\s\{0,1\}//'
+      sed -n '2,24p' "$0" | sed 's/^#\s\{0,1\}//'
       exit 0
       ;;
     *)
@@ -108,6 +119,13 @@ for arg in "${PASSTHROUGH[@]:-}"; do
 done
 if [[ "$has_tier" -eq 0 ]]; then
   PASSTHROUGH=("--tier=recommended" "${PASSTHROUGH[@]:-}")
+fi
+
+# Default to --noninteractive unless --prompt was passed. This is the
+# whole point of `hermes-reload` vs running bootstrap.sh directly:
+# silent re-apply for daily use.
+if [[ "$ALLOW_PROMPTS" -eq 0 ]]; then
+  PASSTHROUGH+=("--noninteractive")
 fi
 
 echo "==> $clone/bootstrap.sh ${PASSTHROUGH[*]:-}"

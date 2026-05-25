@@ -22,6 +22,9 @@
 #   --skip=KEY1,KEY2,...                skip specific keywords (e.g. docker, zsh)
 #   --only=MOD1,MOD2,...                run only the named modules (e.g. 90-agents)
 #   --dry-run                           print the plan, don't execute
+#   --rename                            force the hostname prompt even if box is already in fleet registry
+#   --retag                             force the note prompt even if a note already exists
+#   --noninteractive                    skip ALL prompts (equivalent to HERMES_NONINTERACTIVE=1)
 #   --self-update                       git pull && re-exec (if cloned)
 #   -h | --help                         show help
 
@@ -71,6 +74,10 @@ while [[ $# -gt 0 ]]; do
     --only=*) IFS=',' read -r -a ONLY_MODS <<< "${1#*=}"; shift ;;
     --only)   IFS=',' read -r -a ONLY_MODS <<< "$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --rename) export HERMES_FORCE_RENAME=1; shift ;;
+    --retag)  export HERMES_FORCE_RETAG=1; shift ;;
+    --noninteractive|--non-interactive)
+      export HERMES_NONINTERACTIVE=1; shift ;;
     --self-update)
       cd "$REPO_ROOT" && git pull --ff-only && exec "$0" --tier="$TIER"
       ;;
@@ -120,18 +127,42 @@ fi
 
 # ── Interactive host identity prompt ─────────────────────────────────
 # Ask the user for a friendly hostname + one-line "what is this box for"
-# note that will land in the host registry yaml. Only prompts when:
-#   - stdin is a tty (so `curl | bash` non-interactive runs are unaffected)
-#   - HERMES_HOSTNAME is not already set (env, conf file, or --dry-run path)
-#   - HERMES_NONINTERACTIVE != 1 (explicit opt-out)
-# The note is stored in ~/.hermes/hosts/<hostname>.yaml under `note:`.
+# note that will land in the host registry yaml.
+#
+# Suppressed when:
+#   - stdin is not a tty (curl|bash, ssh-with-command)
+#   - HERMES_NONINTERACTIVE=1 (set by hermes-reload for daily reruns)
+#   - DRY_RUN is on
+#
+# Each prompt has its own skip-when-known logic:
+#   - Hostname prompt: skipped if HERMES_HOSTNAME is set in env/conf, OR
+#     the current OS hostname matches a host already registered in
+#     ~/.hermes/hosts/. The 'I already know this box' case prints one
+#     quiet line so it's discoverable; pass --rename to force the prompt.
+#   - Note prompt: skipped if HERMES_HOST_NOTE is set, OR the registry
+#     yaml for this host already has a non-empty note. Pass --retag to
+#     force the prompt and overwrite.
+#
+# The note ultimately lands in ~/.hermes/hosts/<hostname>.yaml under `note:`.
 if [[ -t 0 ]] && [[ "${HERMES_NONINTERACTIVE:-0}" != "1" ]] && [[ "$DRY_RUN" -eq 0 ]]; then
   current_host="$(hostname -s 2>/dev/null || hostname)"
+  fleet_dir="${HERMES_HOME:-$HOME/.hermes}/hosts"
 
-  # Hostname prompt — skip if already set via env / conf
-  if [[ -z "${HERMES_HOSTNAME:-}" ]]; then
+  # Hostname prompt — skip if already set via env / conf, OR if the
+  # current OS hostname is already registered (we recognize this box).
+  registered_yaml=""
+  if [[ -f "$fleet_dir/${current_host}.yaml" ]]; then
+    registered_yaml="$fleet_dir/${current_host}.yaml"
+  fi
+
+  if [[ -n "${HERMES_HOSTNAME:-}" ]]; then
+    : # already set, no prompt
+  elif [[ -n "$registered_yaml" ]] && [[ "${HERMES_FORCE_RENAME:-0}" != "1" ]]; then
+    # Box already in fleet registry. Skip silently except for one quiet line.
+    echo "${_C_DIM}known host: $current_host (re-register via --rename)${_C_RESET}"
+    export HERMES_HOSTNAME="$current_host"
+  else
     # Show known fleet hostnames so the user doesn't pick a collision
-    fleet_dir="${HERMES_HOME:-$HOME/.hermes}/hosts"
     if [[ -d "$fleet_dir" ]] && [[ -n "$(ls -A "$fleet_dir"/*.yaml 2>/dev/null)" ]]; then
       echo "${_C_DIM}existing fleet hostnames:${_C_RESET}"
       ls "$fleet_dir"/*.yaml 2>/dev/null | sed 's|.*/||; s|\.yaml$||; s|^|    - |'
@@ -156,35 +187,43 @@ if [[ -t 0 ]] && [[ "${HERMES_NONINTERACTIVE:-0}" != "1" ]] && [[ "$DRY_RUN" -eq
     echo ""
   fi
 
-  # Note prompt — always offer (even if hostname was preset). Skip iff a
-  # prior note already exists for this hostname and user doesn't want to
-  # overwrite.
+  # Note prompt — skip if HERMES_HOST_NOTE is set, OR if the registry yaml
+  # for this hostname already has a non-empty note. Override with
+  # HERMES_FORCE_RETAG=1 (set via --retag).
   effective_host="${HERMES_HOSTNAME:-$current_host}"
-  note_file="${HERMES_HOME:-$HOME/.hermes}/hosts/${effective_host}.yaml"
+  note_file="$fleet_dir/${effective_host}.yaml"
   existing_note=""
   if [[ -f "$note_file" ]]; then
     existing_note="$(awk -F': ' '/^note:/ {sub(/^note:[[:space:]]*/, ""); gsub(/^"|"$/, ""); print; exit}' "$note_file" 2>/dev/null)"
   fi
 
-  echo "${_C_BOLD}One-line note${_C_RESET} — what is this machine for?"
-  echo "  e.g. 'main production VPS for hermes', 'macbook M2 daily driver', 'hetzner build farm'"
-  if [[ -n "$existing_note" ]]; then
-    echo "  current note: ${_C_DIM}\"$existing_note\"${_C_RESET}"
-    echo "  ${_C_DIM}empty = keep existing note${_C_RESET}"
-  else
-    echo "  ${_C_DIM}empty = skip (registry will have no note for this host)${_C_RESET}"
-  fi
-  printf "> "
-  read -r note_input || note_input=""
-  if [[ -n "$note_input" ]]; then
-    # Strip surrounding quotes the user might have typed, and any `"` that
-    # would break the yaml.
-    note_input="${note_input//\"/}"
-    export HERMES_HOST_NOTE="$note_input"
-  elif [[ -n "$existing_note" ]]; then
+  if [[ -n "${HERMES_HOST_NOTE:-}" ]]; then
+    : # already set via env/conf, no prompt
+  elif [[ -n "$existing_note" ]] && [[ "${HERMES_FORCE_RETAG:-0}" != "1" ]]; then
+    # Existing note found, silently inherit it. (Don't even print —
+    # the hostname line above is enough acknowledgment of "I know this box".)
     export HERMES_HOST_NOTE="$existing_note"
+  else
+    echo "${_C_BOLD}One-line note${_C_RESET} — what is this machine for?"
+    echo "  e.g. 'main production VPS for hermes', 'macbook M2 daily driver', 'hetzner build farm'"
+    if [[ -n "$existing_note" ]]; then
+      echo "  current note: ${_C_DIM}\"$existing_note\"${_C_RESET}"
+      echo "  ${_C_DIM}empty = keep existing note${_C_RESET}"
+    else
+      echo "  ${_C_DIM}empty = skip (registry will have no note for this host)${_C_RESET}"
+    fi
+    printf "> "
+    read -r note_input || note_input=""
+    if [[ -n "$note_input" ]]; then
+      # Strip surrounding quotes the user might have typed, and any `"` that
+      # would break the yaml.
+      note_input="${note_input//\"/}"
+      export HERMES_HOST_NOTE="$note_input"
+    elif [[ -n "$existing_note" ]]; then
+      export HERMES_HOST_NOTE="$existing_note"
+    fi
+    echo ""
   fi
-  echo ""
 fi
 
 # ── Tee everything to a log ──
