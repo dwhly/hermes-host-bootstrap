@@ -218,7 +218,13 @@ run_module() {
 #   Xn-name.sh    (letter+digit — runs AFTER numerics, alphabetically:
 #                  A0-remote-desktop, M5-mac-client, …)
 # This lets us add optional/role-specific modules without renumbering.
-mapfile -t ALL_MODS < <(find "$REPO_ROOT/lib" -maxdepth 1 -name '[0-9A-Z][0-9A-Z]-*.sh' -print | sort | xargs -n1 basename | sed 's/\.sh$//')
+#
+# NOTE: avoid `mapfile` here — macOS ships bash 3.2 which lacks it.
+# This while-read loop is the portable equivalent.
+ALL_MODS=()
+while IFS= read -r _mod; do
+  ALL_MODS+=("$_mod")
+done < <(find "$REPO_ROOT/lib" -maxdepth 1 -name '[0-9A-Z][0-9A-Z]-*.sh' -print | sort | xargs -n1 basename | sed 's/\.sh$//')
 
 # Filter by --only if given
 if [[ ${#ONLY_MODS[@]} -gt 0 ]]; then
