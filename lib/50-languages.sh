@@ -48,7 +48,21 @@ if tier_allows E && ! is_skipped node; then
   FNM_DIR="${FNM_DIR:-$HOME/.local/share/fnm}"
   if [[ -x "$FNM_DIR/fnm" ]]; then
     export PATH="$FNM_DIR:$PATH"
-    eval "$("$FNM_DIR/fnm" env --shell bash)" || true
+    # `fnm env` needs FNM_MULTISHELL_PATH to point at a writable per-shell
+    # symlink dir; in a fresh bootstrap subshell that var isn't set yet and
+    # `fnm install --lts` fails with:
+    #   "We can't find the necessary environment variables to replace the
+    #    Node version."
+    # Setting it explicitly + exporting it before sourcing `fnm env` is the
+    # canonical fix. We use the per-PID path that fnm itself would generate.
+    export FNM_DIR
+    export FNM_MULTISHELL_PATH="${FNM_MULTISHELL_PATH:-$FNM_DIR/_multishells/$$}"
+    mkdir -p "$(dirname "$FNM_MULTISHELL_PATH")"
+    # Source fnm env — surface failures (don't swallow with || true) so a
+    # broken eval doesn't silently leave the install step without env vars.
+    if ! eval "$("$FNM_DIR/fnm" env --shell bash)"; then
+      warn "fnm env setup failed; Node install may fail"
+    fi
     # Symlink fnm into ~/.local/bin so it's on PATH for every shell without
     # needing the FNM_DIR PATH amendment. ~/.local/bin is already on PATH via
     # ~/.local/bin/env (Cargo/uv share this convention). Without this, the
@@ -61,9 +75,16 @@ if tier_allows E && ! is_skipped node; then
   if have fnm; then
     if ! fnm list 2>/dev/null | grep -q 'lts'; then
       info "installing Node.js LTS via fnm"
-      fnm install --lts
-      fnm default lts-latest
-      fnm use lts-latest
+      # `fnm install` only fetches; `fnm use` is what needs FNM_MULTISHELL_PATH.
+      # Split them so an install-only success is still progress.
+      if ! fnm install --lts; then
+        warn "fnm install --lts failed"
+      fi
+      fnm default lts-latest 2>/dev/null || true
+      if ! fnm use lts-latest 2>/dev/null; then
+        warn "fnm use lts-latest failed in this shell (env vars missing). \
+Open a new shell and run 'fnm use lts-latest' to verify Node is on PATH."
+      fi
     else
       skip "Node LTS already installed via fnm"
     fi
