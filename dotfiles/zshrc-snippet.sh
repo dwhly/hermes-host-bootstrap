@@ -40,11 +40,16 @@ fi
 [[ -f /usr/share/doc/fzf/examples/completion.zsh ]] && \
   source /usr/share/doc/fzf/examples/completion.zsh
 
-# Aliases — modern unix replacements
-command -v eza   >/dev/null 2>&1 && alias ls='eza --group-directories-first'
+# Aliases — modern unix tools. Convention: use NEW names rather than
+# shadowing system commands. Shadowing `grep` with `rg`, `cat` with `bat`,
+# or `ls` with `eza` breaks any script or muscle-memory pipeline that
+# depends on the system tool's exact behavior (e.g. `grep -E`'s regex
+# flavor differs from rg's). Bound enough times in practice that we
+# now keep the originals and let users opt into the modern variant.
 command -v eza   >/dev/null 2>&1 && alias ll='eza -lah --group-directories-first --git'
-command -v bat   >/dev/null 2>&1 && alias cat='bat --paging=never'
-command -v rg    >/dev/null 2>&1 && alias grep='rg'
+command -v eza   >/dev/null 2>&1 && alias lt='eza -lah --group-directories-first --git --tree --level=2'
+# Note: NOT aliasing `ls`, `cat`, or `grep` — see comment above.
+# To use the modern tool, invoke directly: rg, bat, eza.
 
 # Editor
 export EDITOR="${EDITOR:-nvim}"
