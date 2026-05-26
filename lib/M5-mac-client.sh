@@ -142,8 +142,15 @@ if ! is_skipped ghostty-workspace; then
     cat > "$bin_dir/hermes-workspace" <<'WRAPPER'
 #!/bin/sh
 # hermes-workspace — open a 4-pane Ghostty grid SSH'd into named tmux sessions.
-# Edit ~/.hermes-host-bootstrap/ghostty-workspace.applescript to retarget host
-# or session names.
+#
+# Usage:
+#   hermes-workspace                # default: root@h-do1
+#   hermes-workspace h-mini         # uses danz@h-mini (hostUserMap in the .scpt)
+#   hermes-workspace root@h-do1     # explicit user@host
+#   hmw …                           # same, via the alias
+#
+# Edit ~/.hermes-host-bootstrap/ghostty-workspace.applescript's hostUserMap
+# handler to add new fleet hosts with non-root usernames.
 exec osascript "$HOME/.hermes-host-bootstrap/ghostty-workspace.applescript" "$@"
 WRAPPER
     chmod +x "$bin_dir/hermes-workspace"

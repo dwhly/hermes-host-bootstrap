@@ -24,7 +24,32 @@
 -- forms without checking the AppleScript reserved-word list:
 -- https://developer.apple.com/library/archive/documentation/AppleScript/Conceptual/AppleScriptLangGuide/reference/ASLR_keywords.html
 
-set targetHost to "root@h-do1"
+-- Target host. Default is "root@h-do1" but can be overridden via the
+-- first command-line argument (e.g. via `osascript … h-mini` or
+-- `hermes-workspace h-mini`). Accepted forms:
+--   user@host    used verbatim
+--   host         user defaulted to root for h-do1, danz for h-mini,
+--                otherwise root. Adjust hostUserMap below for new fleet hosts.
+on hostUserMap(h)
+    if h is "h-mini" then return "danz"
+    return "root"
+end hostUserMap
+
+on resolveTarget(argList)
+    if (count of argList) > 0 then
+        set arg to item 1 of argList as string
+        if arg contains "@" then return arg
+        return (my hostUserMap(arg)) & "@" & arg
+    end if
+    return "root@h-do1"
+end resolveTarget
+
+on run argv
+    set targetHost to my resolveTarget(argv)
+    runWorkspace(targetHost)
+end run
+
+on runWorkspace(targetHost)
 
 -- Per-pane configuration: {session-name, initial-command}.
 -- Order is TL, TR, BL, BR. `initial-command` may be empty for "just a shell".
@@ -87,3 +112,4 @@ tell application "Ghostty"
     -- Land focus in the top-left pane by default (code → hermes).
     focus paneTL
 end tell
+end runWorkspace

@@ -23,6 +23,7 @@ alias hmr='hermes-reload'
 alias hmc='hermes-config'
 alias hmf='hermes-fleet'
 alias hmb='hermes-backlog'
+alias hmw='hermes-workspace'
 # ── END hermes ──
 
 # ── BEGIN git ──
