@@ -60,3 +60,17 @@ export VISUAL="$EDITOR"
 # argument, which can produce confusing errors (e.g. "Could not resolve
 # hostname #"). interactive_comments aligns zsh with bash here.
 setopt interactive_comments
+
+# Prompt — show user@host + current path so cwd is always visible.
+# Override whatever theme oh-my-zsh loaded (robbyrussell shows path only,
+# but we want host first so it's obvious WHICH machine you're on across
+# the fleet). Format: "user@host ~/path %" with the % red when last
+# command failed (zsh's %(?.green.red) ternary).
+#   %n = username
+#   %m = short hostname
+#   %~ = cwd with $HOME → ~ substitution
+#   %(?.OK.FAIL) = ternary on last exit code
+#   %F{color}…%f = foreground color
+# Tweak via local override after sourcing this snippet if you prefer
+# a two-line layout or different colors.
+PROMPT='%F{cyan}%n@%m%f %F{yellow}%~%f %(?.%F{green}.%F{red})%#%f '
