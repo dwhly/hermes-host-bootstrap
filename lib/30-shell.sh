@@ -106,6 +106,49 @@ if have tmux && tier_allows R && ! is_skipped hssh; then
   ok "hssh helper installed (sourced from bashrc/zshrc)"
 fi
 
+# Rewrite stale hostnames in user's HSSH_DEFAULT_HOST exports.
+# When a fleet host gets renamed (e.g. hermes-do1 → h-do1), any client machine
+# that hand-edited HSSH_DEFAULT_HOST="root@hermes-do1" into ~/.zshrc keeps the
+# stale name forever, even after `hmr` pulls new bootstrap defaults. This step
+# scans rc files for HSSH_DEFAULT_HOST exports referencing the canonical-rename
+# table below and rewrites them in-place (with a .bak left behind).
+#
+# The table is the source of truth for "we renamed X → Y in the fleet". Add a
+# new entry the next time a host is renamed; rerun `hmr --only=30-shell` on
+# every client and they all converge. Idempotent — does nothing if the new
+# name is already in place.
+#
+# Skip key: hostname-rewrite.
+if tier_allows R && ! is_skipped hostname-rewrite; then
+  # Format: "OLD=NEW" — bash array; add more as the fleet renames happen.
+  hostname_renames=(
+    "hermes-do1=h-do1"
+    "hermes-mini=h-mini"
+    "hermes-air=h-air"
+  )
+  rewrites=0
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    [[ -f "$rc" ]] || continue
+    for rename in "${hostname_renames[@]}"; do
+      old="${rename%%=*}"
+      new="${rename##*=}"
+      # Only touch lines that look like an HSSH_DEFAULT_HOST export
+      # mentioning the old name — narrow match to avoid clobbering
+      # unrelated occurrences (e.g. comments, ssh config blocks).
+      if grep -qE "^[[:space:]]*export[[:space:]]+HSSH_DEFAULT_HOST=.*${old}\b" "$rc" 2>/dev/null; then
+        sed -i.bak "/^[[:space:]]*export[[:space:]]\+HSSH_DEFAULT_HOST=/ s/\b${old}\b/${new}/g" "$rc"
+        info "rewrote HSSH_DEFAULT_HOST: $old → $new in $rc (backup: ${rc}.bak)"
+        rewrites=$((rewrites + 1))
+      fi
+    done
+  done
+  if (( rewrites > 0 )); then
+    ok "hostname rewrite: $rewrites HSSH_DEFAULT_HOST update(s) applied"
+  else
+    skip "hostname rewrite: no stale HSSH_DEFAULT_HOST values found"
+  fi
+fi
+
 # Shell aliases — common shortcuts maintained by the add-shell-alias skill.
 # Lives in dotfiles/aliases.sh; gets sourced from .bashrc and .zshrc so it
 # works in both shells. The skill knows the format and edits this file

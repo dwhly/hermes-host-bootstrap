@@ -130,6 +130,7 @@ Each module can also be run on its own:
 | `tmux-workspace-colors` | per-session statusbar coloring for hermes-workspace panes (ops/code/logs/scratch) |
 | `tmux-autoattach` | auto-attach to tmux session "main" on interactive SSH (snippet sourced from .bashrc/.zshrc) |
 | `hssh` | `hssh <session>` shell function: ssh + attach/create named tmux session in one shot |
+| `hostname-rewrite` | rewrite stale long hostnames in user's HSSH_DEFAULT_HOST exports after fleet renames (table lives in lib/30-shell.sh) |
 | `aliases` | shell aliases (h, hm, ...) — managed by the add-shell-alias skill |
 | `chsh-zsh` | make zsh the default login shell on Linux hosts (matches macOS default) |
 | `mac-hostname` | macOS only: rename HostName + LocalHostName to `$HERMES_MAC_HOSTNAME` (opt-in) |
