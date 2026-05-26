@@ -196,6 +196,20 @@ if [[ -f "$REPO_ROOT/scripts/hermes-config" ]]; then
   ok "hermes-config → $TARGET_LINK"
 fi
 
+# ── Install hermes-backlog on PATH ────────────────────────────────────
+# Quick "add this to the fleet backlog" CLI. Append, dedupe, mark-done,
+# auto-sync via hmc. Aliased to `hmb`. Companion to the daily-summary
+# system — items added here ride alongside auto-harvested TODOs.
+if [[ -f "$REPO_ROOT/scripts/hermes-backlog" ]]; then
+  mkdir -p "$HOME/.local/bin"
+  TARGET_LINK="$HOME/.local/bin/hermes-backlog"
+  if [[ -L "$TARGET_LINK" || -f "$TARGET_LINK" ]]; then
+    rm -f "$TARGET_LINK"
+  fi
+  ln -s "$REPO_ROOT/scripts/hermes-backlog" "$TARGET_LINK"
+  ok "hermes-backlog → $TARGET_LINK"
+fi
+
 # Helpful hint for the user: if ~/.hermes is git-tracked (the typical
 # hermes-config-sync setup), nudge them to commit the snapshot.
 if [[ -d "${HERMES_HOME:-$HOME/.hermes}/.git" ]]; then

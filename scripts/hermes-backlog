@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# scripts/hermes-backlog — append an item to the fleet backlog.
+#
+# Symlinked to ~/.local/bin/hermes-backlog by lib/99-register-host.sh.
+# Aliased to `hmb` in dotfiles/aliases.sh.
+#
+# Usage:
+#   hermes-backlog "TODO: rotate OpenRouter key"
+#   hermes-backlog "BUG: hermes setup wizard overflows on small terminals"
+#   hermes-backlog "FOLLOWUP: phase 2 of /amzn"
+#   hermes-backlog list                       # show open items (not marked done)
+#   hermes-backlog show                       # show full backlog
+#   hermes-backlog done <substring>           # mark item resolved
+#   hermes-backlog --help
+#
+# Behavior:
+# - Auto-tags with [hostname date] like the daily aggregator does
+# - Auto-prefixes with TODO: if no prefix given
+# - Dedupe: refuses to add if an item with the same body already exists
+# - Commits + pushes via hmc save (auto mode) so the entry reaches the fleet
+
+set -euo pipefail
+
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+BACKLOG="$HERMES_HOME/backlog.md"
+HOSTNAME_SHORT="$(hostname -s 2>/dev/null || hostname)"
+DATE="$(date -u +%Y-%m-%d)"
+
+[ -f "$HOME/.hermes-bootstrap.conf" ] && source "$HOME/.hermes-bootstrap.conf"
+
+cmd_help() {
+  sed -n '2,18p' "$0" | sed 's/^#\s\{0,1\}//'
+}
+
+ensure_backlog_exists() {
+  if [ ! -f "$BACKLOG" ]; then
+    cat > "$BACKLOG" <<EOF
+# Fleet backlog
+
+Open items aggregated from per-host daily summaries plus manual entries
+via \`hermes-backlog\` (\`hmb\`). Each item is tagged with [host date] of
+first sighting. Resolve by deleting the line or appending "✓ done" inline
+(see \`hermes-backlog done <substring>\`).
+
+EOF
+  fi
+}
+
+cmd_add() {
+  local raw="$1"
+  ensure_backlog_exists
+
+  # Normalize: if no prefix given, default to TODO.
+  local body="$raw"
+  if ! echo "$body" | grep -qE '^(TODO|BUG|FOLLOWUP):'; then
+    body="TODO: $body"
+  fi
+
+  # Dedupe: skip if a matching body already in the file.
+  if grep -Fq "$body" "$BACKLOG"; then
+    echo "already in backlog (skipping):" >&2
+    grep -F "$body" "$BACKLOG" | head -1
+    return 1
+  fi
+
+  local line="- [$HOSTNAME_SHORT $DATE] $body"
+  echo "$line" >> "$BACKLOG"
+  echo "added: $line"
+
+  # Push to the fleet repo. Non-fatal if it fails (e.g. network down).
+  if [ -x "$HERMES_HOME/sync.sh" ]; then
+    HERMES_SYNC_AUTO=1 "$HERMES_HOME/sync.sh" auto >/dev/null 2>&1 \
+      && echo "(pushed to hermes-config)" \
+      || echo "(push failed — entry saved locally, will sync on next hmc save)" >&2
+  fi
+}
+
+cmd_list() {
+  ensure_backlog_exists
+  # Show items NOT marked done (no ✓ done suffix)
+  grep -E '^- \[' "$BACKLOG" | grep -v ' ✓ done' || echo "(no open backlog items)"
+}
+
+cmd_show() {
+  ensure_backlog_exists
+  cat "$BACKLOG"
+}
+
+cmd_done() {
+  local substring="$1"
+  ensure_backlog_exists
+
+  # Find matching lines that aren't already done
+  local matches
+  matches="$(grep -nE '^- \[' "$BACKLOG" | grep -v ' ✓ done' | grep -F "$substring" || true)"
+
+  if [ -z "$matches" ]; then
+    echo "no open backlog items match: $substring" >&2
+    return 1
+  fi
+
+  local match_count
+  match_count="$(echo "$matches" | wc -l | tr -d ' ')"
+  if [ "$match_count" -gt 1 ]; then
+    echo "multiple matches — refusing. Be more specific:" >&2
+    echo "$matches" >&2
+    return 1
+  fi
+
+  local lineno
+  lineno="$(echo "$matches" | cut -d: -f1)"
+  # Append " ✓ done" to that line in-place. Use a portable sed approach.
+  sed -i.bak "${lineno}s|$| ✓ done|" "$BACKLOG"
+  rm -f "${BACKLOG}.bak"
+
+  echo "marked done:"
+  sed -n "${lineno}p" "$BACKLOG"
+
+  if [ -x "$HERMES_HOME/sync.sh" ]; then
+    HERMES_SYNC_AUTO=1 "$HERMES_HOME/sync.sh" auto >/dev/null 2>&1 \
+      && echo "(pushed)" \
+      || echo "(push failed)" >&2
+  fi
+}
+
+# ── Dispatcher ──────────────────────────────────────────────────────
+sub="${1:-}"
+
+case "$sub" in
+  ""|-h|--help|help)
+    cmd_help
+    ;;
+  list|ls|open)
+    cmd_list
+    ;;
+  show|cat)
+    cmd_show
+    ;;
+  done|resolve|close)
+    shift
+    if [ $# -eq 0 ]; then
+      echo "usage: hermes-backlog done <substring>" >&2
+      exit 2
+    fi
+    cmd_done "$*"
+    ;;
+  *)
+    # Treat anything else as the body of a new backlog entry.
+    cmd_add "$*"
+    ;;
+esac
