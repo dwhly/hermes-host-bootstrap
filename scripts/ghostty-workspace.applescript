@@ -44,24 +44,6 @@ on resolveTarget(argList)
     return "root@h-do1"
 end resolveTarget
 
-on run argv
-    set targetHost to my resolveTarget(argv)
-    runWorkspace(targetHost)
-end run
-
-on runWorkspace(targetHost)
-
--- Per-pane configuration: {session-name, initial-command}.
--- Order is TL, TR, BL, BR. `initial-command` may be empty for "just a shell".
--- The initial-command runs in window 0 of the session ONLY on first creation
--- (via `tmux new -As name <cmd>`); reattaching does not re-run it.
-set paneSpecs to {¬
-    {"code",    "hermes"},                  ¬
-    {"scratch", "hermes"},                  ¬
-    {"logs",    "hermes logs -f"},          ¬
-    {"ops",     ""}                         ¬
-}
-
 -- Build the ssh command for one pane.
 --   ssh -t <host> "tmux new -As <session> [<initial-cmd>]"
 -- `tmux new -As name` attaches an existing session or creates a fresh one.
@@ -84,6 +66,24 @@ end sshCmd
 on specToCmd(h, spec)
     return my sshCmd(h, item 1 of spec, item 2 of spec)
 end specToCmd
+
+on run argv
+    set targetHost to my resolveTarget(argv)
+    runWorkspace(targetHost)
+end run
+
+on runWorkspace(targetHost)
+
+-- Per-pane configuration: {session-name, initial-command}.
+-- Order is TL, TR, BL, BR. `initial-command` may be empty for "just a shell".
+-- The initial-command runs in window 0 of the session ONLY on first creation
+-- (via `tmux new -As name <cmd>`); reattaching does not re-run it.
+set paneSpecs to {¬
+    {"code",    "hermes"},                  ¬
+    {"scratch", "hermes"},                  ¬
+    {"logs",    "hermes logs -f"},          ¬
+    {"ops",     ""}                         ¬
+}
 
 tell application "Ghostty"
     activate
