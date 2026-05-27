@@ -167,11 +167,9 @@ if [[ -f "$REPO_ROOT/scripts/hermes-fleet" ]]; then
   ok "hermes-fleet → $TARGET_LINK"
 fi
 
-# ── Install hermes-reload on PATH ─────────────────────────────────────
-# Companion to hermes-fleet: scripts/reload.sh is the canonical way to
-# "pull latest bootstrap and re-apply on this host." Symlinked so the
-# user can `hermes-reload` from anywhere, and aliased to `hmr` in
-# dotfiles/aliases.sh for one-keystroke daily use.
+# ── Install companion scripts on PATH ─────────────────────────────────
+# Companion CLIs live in scripts/ so git pull updates them automatically.
+# Symlink them into ~/.local/bin for everyday use.
 if [[ -f "$REPO_ROOT/scripts/reload.sh" ]]; then
   mkdir -p "$HOME/.local/bin"
   TARGET_LINK="$HOME/.local/bin/hermes-reload"

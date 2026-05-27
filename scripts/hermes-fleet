@@ -81,7 +81,11 @@ if [[ -n "$FOCUS" ]]; then
   else
     echo "no registry entry for '$FOCUS'" >&2
     echo "known hosts:" >&2
-    ls "$REGISTRY_DIR" | sed 's/\.yaml$//' | sed 's/^/  /' >&2
+    for f in "$REGISTRY_DIR"/*.yaml; do
+      [[ -f "$f" ]] || continue
+      [[ "$f" == *.live.yaml ]] && continue
+      basename "$f" .yaml | sed 's/^/  /'
+    done >&2
     exit 1
   fi
   exit 0
@@ -116,8 +120,13 @@ fi
 
 # Default: tabular dashboard.
 # Exclude *.live.yaml files (heartbeat snapshots that overlay the main per-host yaml).
-printf '\n  \033[1;36mHermes Fleet\033[0m  (%s hosts in registry)\n\n' \
-  "$(ls "$REGISTRY_DIR"/*.yaml 2>/dev/null | grep -v '\.live\.yaml$' | wc -l | tr -d ' ')"
+HOST_COUNT=0
+for f in "$REGISTRY_DIR"/*.yaml; do
+  [[ -f "$f" ]] || continue
+  [[ "$f" == *.live.yaml ]] && continue
+  HOST_COUNT=$((HOST_COUNT + 1))
+done
+printf '\n  \033[1;36mHermes Fleet\033[0m  (%s hosts in registry)\n\n' "$HOST_COUNT"
 
 printf '  \033[1m%-18s %-10s %-8s %-22s %-10s %-12s %s\033[0m\n' \
   HOST TIER ROLE OS HERMES DISK NOTE

@@ -55,7 +55,7 @@
 #   1Password Web → Developer Tools → Service Accounts → New
 # Grant read access to the "Hermes" vault. The token starts with "ops_".
 # Set it here (this file is sourced before any module runs):
-# export OP_SERVICE_ACCOUNT_TOKEN="ops_eyJzaWduSW5BZGRy..."
+# export OP_SERVICE_ACCOUNT_TOKEN="ops_***..."
 #
 # Macs with Touch ID can skip this — `op signin` once interactively gives a
 # long-lived biometric session and bootstrap inherits it automatically.
@@ -75,8 +75,14 @@
 # export HERMES_SKIP=docker
 # Multiple modules: comma-separated, e.g. HERMES_SKIP=docker,xrdp
 
-# Optional: a private git repo to clone into ~/.hermes/ as the personal
-# config layer. Used by `hermes-config bootstrap` (aliased to `hmc bootstrap`)
-# to set up a new host's ~/.hermes/ in one shot. Companion to the
-# hermes-config-sync skill.
-# export HERMES_CONFIG_REPO="https://github.com/USER/hermes-config.git"
+# Optional: a private git repo to clone into ~/.hermes/ during bootstrap as
+# the personal config layer. Used by lib/92-hermes-config.sh and by the
+# `hermes-config bootstrap` helper (aliased to `hmc bootstrap`). If set,
+# bootstrap will clone/pull it, resolve .env.template via op, and run
+# `hermes config migrate/check`.
+# export HERMES_CONFIG_REPO=git@github.com:USER/hermes-config.git
+
+# If set to 1, bootstrap installs and/or starts the Hermes gateway after the
+# config + .env are in place. Leave off for client-only machines.
+# export HERMES_GATEWAY_INSTALL=0
+# export HERMES_GATEWAY_START=0

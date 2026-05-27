@@ -170,10 +170,17 @@ if [[ -t 0 ]] && [[ "${HERMES_NONINTERACTIVE:-0}" != "1" ]] && [[ "$DRY_RUN" -eq
     export HERMES_HOSTNAME="$current_host"
   else
     # Show known fleet hostnames so the user doesn't pick a collision
-    if [[ -d "$fleet_dir" ]] && [[ -n "$(ls -A "$fleet_dir"/*.yaml 2>/dev/null)" ]]; then
-      echo "${_C_DIM}existing fleet hostnames:${_C_RESET}"
-      ls "$fleet_dir"/*.yaml 2>/dev/null | sed 's|.*/||; s|\.yaml$||; s|^|    - |'
-      echo ""
+    if [[ -d "$fleet_dir" ]]; then
+      fleet_names=""
+      for f in "$fleet_dir"/*.yaml; do
+        [[ -f "$f" ]] || continue
+        fleet_names+="$(basename "$f" .yaml)"$'\n'
+      done
+      if [[ -n "$fleet_names" ]]; then
+        echo "${_C_DIM}existing fleet hostnames:${_C_RESET}"
+        printf '%s' "$fleet_names" | sed 's|^|    - |'
+        echo ""
+      fi
     fi
 
     echo "${_C_BOLD}Hostname${_C_RESET} for this machine in the Hermes fleet."
@@ -326,7 +333,7 @@ verify "gh"         "gh --version"
 verify "hermes"     "hermes --version"
 verify "ffmpeg"     "ffmpeg -version"
 verify "tailscale"  "tailscale version"
-verify "hermes-fleet"   "hermes-fleet --help 2>&1 | head -1"
+verify "hermes-fleet"   "test -x $HOME/.local/bin/hermes-fleet && $HOME/.local/bin/hermes-fleet --help 2>&1 | head -1"
 verify "hermes-reload"  "test -L $HOME/.local/bin/hermes-reload && echo present"
 verify "hermes-config"  "test -L $HOME/.local/bin/hermes-config && echo present"
 verify "hermes-backlog" "test -L $HOME/.local/bin/hermes-backlog && echo present"
@@ -334,9 +341,9 @@ verify "hermes-backlog" "test -L $HOME/.local/bin/hermes-backlog && echo present
 echo ""
 ok "Bootstrap finished. Next steps:"
 echo "   1. log out + back in so PATH + docker group + linger take effect"
-echo "   2. hermes setup          # configure model / provider"
-echo "   3. hermes doctor         # sanity-check the install"
-echo "   4. hermes gateway setup  # if you want Telegram / Discord / etc."
+echo "   2. if HERMES_CONFIG_REPO was unset: run hermes setup or set it and re-run --only=92-hermes-config"
+echo "   3. if .env.template was not resolved: authenticate op, then run hermes-config refresh-secrets"
+echo "   4. hermes doctor         # sanity-check the install"
 echo "   5. sudo tailscale up     # if you installed tailscale"
 echo ""
 log "bootstrap finished"

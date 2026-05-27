@@ -22,7 +22,7 @@ if tier_allows E && ! is_skipped gh; then
     sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
       | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
-    APT_REFRESHED=0  # force re-refresh after adding new source
+    export APT_REFRESHED=0  # force re-refresh after adding new source
     apt_refresh
     apt_install gh
   fi
