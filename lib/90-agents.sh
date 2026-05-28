@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 90-agents: Hermes Agent itself + gh CLI + Claude Code CLI + Codex CLI + faster-whisper.
+# 90-agents: Hermes Agent itself + gh CLI + Claude Code CLI + Codex CLI + faster-whisper + email CLI.
 
 set -euo pipefail
 # shellcheck disable=SC1091
@@ -66,6 +66,24 @@ if tier_allows R && ! is_skipped codex; then
     npm install -g @openai/codex
   else
     warn "skipping Codex — npm not present"
+  fi
+fi
+
+# ── Himalaya Email CLI ───────────────────────────────────────────────
+if tier_allows R && ! is_skipped himalaya; then
+  if have himalaya; then
+    skip "Himalaya already installed: $(himalaya --version 2>/dev/null || echo unknown)"
+  elif [[ "$OS" == "macos" ]]; then
+    if have brew; then
+      info "installing Himalaya Email CLI via Homebrew"
+      brew install himalaya
+    else
+      warn "skipping Himalaya — Homebrew not present"
+    fi
+  else
+    info "installing Himalaya Email CLI via upstream installer"
+    curl -fsSL https://raw.githubusercontent.com/pimalaya/himalaya/master/install.sh | PREFIX="$HOME/.local" sh
+    export PATH="$HOME/.local/bin:$PATH"
   fi
 fi
 

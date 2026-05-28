@@ -38,6 +38,7 @@ MEDIA / DOCS
 AGENT
   + Claude Code CLI (via npm)
   + Codex CLI (via npm)
+  + Himalaya Email CLI (IMAP/SMTP; used by Hermes email-assistant workflows)
   + faster-whisper (Hermes local STT)
   + playwright system deps + bundled chromium
 
