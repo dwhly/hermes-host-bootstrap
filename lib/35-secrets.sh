@@ -96,7 +96,17 @@ fi
 ENV_HERMES="${HERMES_HOME:-$HOME/.hermes}"
 ENV_TEMPLATE="$ENV_HERMES/.env.template"
 ENV_RESOLVED="$ENV_HERMES/.env"
-ENV_TEMPLATE_HOST="$ENV_HERMES/.env.template.$(hostname -s 2>/dev/null || hostname)"
+HOST_SHORT="$(hostname -s 2>/dev/null || hostname)"
+ENV_TEMPLATE_HOST="$ENV_HERMES/.env.template.$HOST_SHORT"
+# Allow bootstrap config to override the overlay name before the OS hostname is
+# renamed. This matters on fresh Macs: Tailscale/MagicDNS may already call the
+# box h-mini2 while macOS still reports "Dans-Mac-mini", so the correct
+# .env.template.h-mini2 would otherwise be skipped.
+if [[ -n "${HERMES_HOSTNAME:-}" && -f "$ENV_HERMES/.env.template.${HERMES_HOSTNAME}" ]]; then
+  ENV_TEMPLATE_HOST="$ENV_HERMES/.env.template.${HERMES_HOSTNAME}"
+elif [[ -n "${HERMES_MAC_HOSTNAME:-}" && -f "$ENV_HERMES/.env.template.${HERMES_MAC_HOSTNAME}" ]]; then
+  ENV_TEMPLATE_HOST="$ENV_HERMES/.env.template.${HERMES_MAC_HOSTNAME}"
+fi
 
 if have op && [[ -f "$ENV_TEMPLATE" ]] && ! is_skipped op-resolve; then
   if op account list >/dev/null 2>&1; then
