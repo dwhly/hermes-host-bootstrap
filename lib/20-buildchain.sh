@@ -14,12 +14,38 @@ if [[ "$OS" == "macos" ]]; then
   else
     skip "Xcode Command Line Tools already present"
   fi
+
   if ! have brew; then
     info "installing Homebrew"
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+    # Homebrew's installer switches to NONINTERACTIVE mode when stdin is not a
+    # TTY (common for `curl ... | bash` and SSH-driven bootstrap). On macOS
+    # that makes sudo fail with the misleading "Need sudo access" message even
+    # for admin users, because sudo cannot prompt for a password. If /dev/tty is
+    # available, explicitly hand the installer a TTY so it can ask. If no TTY is
+    # available, fail with a short actionable message instead of letting the
+    # installer spew confusing output and causing later modules to half-run.
+    if [[ -r /dev/tty ]]; then
+      INTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/tty
+    else
+      warn "Homebrew is required for the macOS client/host toolchain, but this session has no TTY for sudo."
+      warn "Run this once in Terminal.app on the Mac so sudo can prompt:"
+      warn "  cd /tmp && curl -fsSL https://raw.githubusercontent.com/dwhly/hermes-host-bootstrap/main/bootstrap.sh | bash -s -- --tier=$TIER --role=$ROLE"
+      return 1 2>/dev/null || exit 1
+    fi
   else
     skip "Homebrew already installed"
   fi
+
+  # Make Homebrew available to the current module chain even before the user's
+  # next login shell. Apple Silicon uses /opt/homebrew; Intel uses /usr/local.
+  if [[ -x /opt/homebrew/bin/brew ]]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+  elif [[ -x /usr/local/bin/brew ]]; then
+    eval "$(/usr/local/bin/brew shellenv)"
+  fi
+
+  ok "Build chain ready"
   return 0 2>/dev/null || exit 0
 fi
 

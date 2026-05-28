@@ -13,6 +13,7 @@
 #   hermes-reload --prompt            # allow prompts (e.g. when you DO want to rename or re-tag)
 #   hermes-reload --prompt --rename   # force hostname re-prompt
 #   hermes-reload --prompt --retag    # force note re-prompt
+#   hermes-reload --interactive-sudo   # macOS: re-exec through ssh -tt localhost so sudo/Homebrew can prompt
 #
 # Tier and role default to whatever's in ~/.hermes-bootstrap.conf if it
 # exists, otherwise --tier=recommended for the user to override.
@@ -77,6 +78,7 @@ clone_fresh() {
 # ── parse our own flags before forwarding to bootstrap.sh ───────────
 DO_PULL=1
 ALLOW_PROMPTS=0
+INTERACTIVE_SUDO=0
 PASSTHROUGH=()
 for arg in "$@"; do
   case "$arg" in
@@ -85,6 +87,9 @@ for arg in "$@"; do
       ;;
     --prompt)
       ALLOW_PROMPTS=1
+      ;;
+    --interactive-sudo)
+      INTERACTIVE_SUDO=1
       ;;
     --help|-h)
       sed -n '2,24p' "$0" | sed 's/^#\s\{0,1\}//'
@@ -135,4 +140,31 @@ if [[ "$ALLOW_PROMPTS" -eq 0 ]]; then
 fi
 
 echo "==> $clone/bootstrap.sh ${PASSTHROUGH[*]}"
+
+# macOS first bootstrap often needs sudo for Homebrew. When the current SSH
+# command has no TTY, sudo cannot prompt; re-enter through localhost with -tt
+# if requested so the password prompt is visible in the caller's terminal.
+if [[ "$INTERACTIVE_SUDO" -eq 1 ]]; then
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    echo "==> --interactive-sudo is only needed on macOS; running directly"
+  elif [[ -t 0 ]]; then
+    echo "==> TTY already present; running directly"
+  else
+    target="${USER:-$(id -un)}@localhost"
+    if ssh -o BatchMode=yes -o ConnectTimeout=2 "$target" true >/dev/null 2>&1; then
+      quoted_args=""
+      for arg in ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}; do
+        quoted_args+=" $(printf '%q' "$arg")"
+      done
+      echo "==> Re-execing via ssh -tt $target for sudo/Homebrew prompts"
+      exec ssh -tt "$target" "$(printf '%q' "$clone/bootstrap.sh")$quoted_args"
+    else
+      echo "==> --interactive-sudo requested, but key-based ssh to $target is not available." >&2
+      echo "==> Run this in Terminal.app on the Mac instead:" >&2
+      echo "    $clone/bootstrap.sh ${PASSTHROUGH[*]//--noninteractive/}" >&2
+      exit 1
+    fi
+  fi
+fi
+
 exec "$clone/bootstrap.sh" "${PASSTHROUGH[@]}"

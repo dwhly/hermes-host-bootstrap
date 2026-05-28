@@ -208,6 +208,17 @@ The script prints a checklist at the end. The short version:
 4. `hermes gateway setup` only if you did not preseed gateway/env config.
 5. `sudo tailscale up` — bring this node onto your tailnet.
 
+On a new Mac, the first Homebrew install needs a real sudo prompt. If you are
+running over SSH and see `Need sudo access on macOS`, rerun from Terminal.app
+on the Mac, or use:
+
+```bash
+hermes-reload --interactive-sudo --prompt --role=both
+```
+
+The `--interactive-sudo` mode re-enters through `ssh -tt localhost` when
+possible so sudo/Homebrew can prompt instead of half-running later modules.
+
 ---
 
 ## Tested on
