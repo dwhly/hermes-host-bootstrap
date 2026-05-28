@@ -7,10 +7,16 @@
 # resolves ~/.hermes/.env.template via 1Password, runs Hermes config migration,
 # and optionally installs/restarts the gateway.
 #
+# If HERMES_CONFIG_REPO is not set (or clone/auth fails), this module still
+# writes a minimal non-interactive OpenRouter config from HERMES_MODEL_* env
+# defaults so users do not have to enter the curses `hermes setup` provider
+# picker just to get past first boot.
+#
 # Skip keys:
 #   hermes-config       skip this whole module
 #   hermes-config-pull  skip pull when ~/.hermes is already git-tracked
 #   op-resolve          skip .env.template -> .env resolution
+#   hermes-model-config skip non-interactive model/provider config seeding
 #   hermes-migrate      skip hermes config migrate/check
 #   gateway             skip gateway install/restart actions
 
@@ -129,6 +135,7 @@ bootstrap_config_repo() {
 resolve_env_template() {
   env_template="$HERMES_HOME_DIR/.env.template"
   env_resolved="$HERMES_HOME_DIR/.env"
+  env_template_host="$HERMES_HOME_DIR/.env.template.$(hostname -s 2>/dev/null || hostname)"
 
   [[ -f "$env_template" ]] || return 0
 
@@ -151,6 +158,21 @@ resolve_env_template() {
 
   info "resolving $env_template → $env_resolved via op inject"
   if op inject -i "$env_template" -o "$env_resolved.tmp" 2>/dev/null; then
+    if [[ -f "$env_template_host" ]]; then
+      info "applying per-host overlay: $env_template_host"
+      if op inject -i "$env_template_host" -o "$env_resolved.host.tmp" 2>/dev/null; then
+        {
+          echo ""
+          echo "# ── per-host overlay ($(basename "$env_template_host")) ──"
+          grep -E '^[A-Z_][A-Z0-9_]*=' "$env_resolved.host.tmp" || true
+        } >> "$env_resolved.tmp"
+        rm -f "$env_resolved.host.tmp"
+      else
+        warn "op inject failed on $env_template_host — overlay skipped"
+        rm -f "$env_resolved.host.tmp"
+      fi
+    fi
+
     if [[ -f "$env_resolved" ]]; then
       template_keys="$(grep -E '^[A-Z_][A-Z0-9_]*=' "$env_resolved.tmp" | cut -d= -f1 | sort -u || true)"
       {
@@ -173,6 +195,57 @@ resolve_env_template() {
     warn "op inject failed — check vault/item refs in .env.template"
     rm -f "$env_resolved.tmp"
   fi
+}
+
+seed_model_config() {
+  if is_skipped hermes-model-config; then
+    skip "hermes-model-config — opted out via --skip"
+    return 0
+  fi
+
+  mkdir -p "$HERMES_HOME_DIR"
+
+  provider="${HERMES_MODEL_PROVIDER:-openrouter}"
+  model="${HERMES_MODEL_DEFAULT:-${HERMES_DEFAULT_MODEL:-openai/gpt-5.5}}"
+  base_url="${HERMES_MODEL_BASE_URL:-https://openrouter.ai/api/v1}"
+  api_mode="${HERMES_MODEL_API_MODE:-chat_completions}"
+
+  # Keep this deliberately small and non-interactive. The synced config repo
+  # can still override with richer routing, but a fresh host gets a valid
+  # provider/model immediately and never needs the curses setup picker.
+  python3 - "$HERMES_HOME_DIR/config.yaml" "$provider" "$model" "$base_url" "$api_mode" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+provider, model, base_url, api_mode = sys.argv[2:6]
+try:
+    import yaml
+except Exception as exc:
+    raise SystemExit(f"PyYAML required to seed Hermes config: {exc}")
+
+if path.exists():
+    data = yaml.safe_load(path.read_text()) or {}
+    if not isinstance(data, dict):
+        data = {}
+else:
+    data = {}
+
+model_cfg = data.get("model")
+if isinstance(model_cfg, str):
+    model_cfg = {"default": model_cfg}
+elif not isinstance(model_cfg, dict):
+    model_cfg = {}
+
+model_cfg["provider"] = provider
+model_cfg["default"] = model
+model_cfg["base_url"] = base_url
+model_cfg["api_mode"] = api_mode
+data["model"] = model_cfg
+
+path.write_text(yaml.safe_dump(data, sort_keys=False))
+PY
+  ok "Hermes model config seeded: $provider / $model"
 }
 
 migrate_and_check() {
@@ -221,6 +294,7 @@ setup_gateway_if_requested() {
 
 bootstrap_config_repo || true
 resolve_env_template
+seed_model_config
 migrate_and_check
 setup_gateway_if_requested
 

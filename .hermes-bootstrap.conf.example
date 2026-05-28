@@ -82,6 +82,14 @@
 # `hermes config migrate/check`.
 # export HERMES_CONFIG_REPO=git@github.com:USER/hermes-config.git
 
+# Non-interactive Hermes model/provider defaults. These seed config.yaml during
+# bootstrap so you do NOT need to enter the `hermes setup` provider picker.
+# The private hermes-config repo can still override with richer routing later.
+# export HERMES_MODEL_PROVIDER=openrouter
+# export HERMES_MODEL_DEFAULT=openai/gpt-5.5
+# export HERMES_MODEL_BASE_URL=https://openrouter.ai/api/v1
+# export HERMES_MODEL_API_MODE=chat_completions
+
 # If set to 1, bootstrap installs and/or starts the Hermes gateway after the
 # config + .env are in place. Leave off for client-only machines.
 # export HERMES_GATEWAY_INSTALL=0

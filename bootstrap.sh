@@ -341,7 +341,7 @@ verify "hermes-backlog" "test -L $HOME/.local/bin/hermes-backlog && echo present
 echo ""
 ok "Bootstrap finished. Next steps:"
 echo "   1. log out + back in so PATH + docker group + linger take effect"
-echo "   2. if HERMES_CONFIG_REPO was unset: run hermes setup or set it and re-run --only=92-hermes-config"
+echo "   2. Hermes model/provider is seeded by 92-hermes-config (default: OpenRouter)"
 echo "   3. if .env.template was not resolved: authenticate op, then run hermes-config refresh-secrets"
 echo "   4. hermes doctor         # sanity-check the install"
 echo "   5. sudo tailscale up     # if you installed tailscale"

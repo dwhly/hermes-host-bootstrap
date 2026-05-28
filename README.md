@@ -92,6 +92,7 @@ lib/
 ├── 70-network.sh         Tailscale, cloudflared
 ├── 80-media.sh           ffmpeg, imagemagick, poppler, tesseract, pandoc, espeak-ng
 ├── 90-agents.sh          hermes, gh, Claude Code CLI, Codex CLI, faster-whisper
+├── 92-hermes-config.sh   personal ~/.hermes clone/pull, op inject, model config seed
 ├── 95-ghostty.sh         Ghostty terminal — client/both role only
 ├── A0-remote-desktop.sh  xrdp + XFCE (opt-in: --tier=full or --only=A0-remote-desktop)
 └── M5-mac-client.sh      tmux + mosh + MS Remote Desktop + Tailscale GUI (macOS client only)
@@ -156,6 +157,10 @@ Each module can also be run on its own:
 | `HERMES_TZ=America/Los_Angeles` | set timezone (default: UTC) |
 | `HERMES_SSH_HARDEN=1` | actually apply ssh hardening (off by default to avoid lockout) |
 | `HERMES_UFW_ENABLE=1` | actually enable ufw (off by default to avoid lockout) |
+| `HERMES_CONFIG_REPO=git@github.com:USER/hermes-config.git` | clone/pull personal `~/.hermes` config during bootstrap |
+| `HERMES_MODEL_PROVIDER=openrouter` | non-interactively seed `model.provider` so `hermes setup` is unnecessary |
+| `HERMES_MODEL_DEFAULT=openai/gpt-5.5` | non-interactively seed `model.default` |
+| `HERMES_GATEWAY_INSTALL=1` / `HERMES_GATEWAY_START=1` | install/start gateway after config + secrets are in place |
 
 ---
 
@@ -198,9 +203,9 @@ The script prints a checklist at the end. The short version:
 
 1. **Log out and back in** — so `PATH`, the `docker` group, and `linger`
    actually take effect.
-2. `hermes setup` — configure your model + provider.
+2. If `HERMES_CONFIG_REPO` / `HERMES_MODEL_*` are set in `~/.hermes-bootstrap.conf`, Hermes model/provider config is already seeded; no `hermes setup` provider picker is needed.
 3. `hermes doctor` — sanity-check the install.
-4. `hermes gateway setup` — wire up Telegram / Discord / Slack / …
+4. `hermes gateway setup` only if you did not preseed gateway/env config.
 5. `sudo tailscale up` — bring this node onto your tailnet.
 
 ---
