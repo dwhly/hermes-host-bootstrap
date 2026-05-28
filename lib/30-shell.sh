@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 30-shell: tmux, zsh, oh-my-zsh, neovim, mosh, micro.
+# 30-shell: tmux, zsh, oh-my-zsh, neovim, mosh, micro, and shell rc wiring.
 
 set -euo pipefail
 # shellcheck disable=SC1091
@@ -7,14 +7,20 @@ source "$(dirname "$0")/common.sh"
 
 step "Shell & multiplexer"
 
-# Per-OS package install
+# Per-OS package install. Important: on macOS, missing Homebrew must NOT skip
+# the rest of this module. Dotfile/alias wiring below is pure file work and
+# should still happen after a partial first bootstrap (the exact h-mini2 failure
+# mode: Homebrew couldn't prompt for sudo, so hmr/hmc aliases never went live).
 if [[ "$OS" == "macos" ]]; then
-  have brew || { warn "Homebrew missing — run buildchain step first"; return 0 2>/dev/null || exit 0; }
-  tier_allows E && { is_skipped tmux   || brew install tmux; }
-  tier_allows E && { is_skipped neovim || brew install neovim; }
-  tier_allows R && { is_skipped mosh   || brew install mosh; }
-  tier_allows R && { is_skipped zsh    || true; }  # macOS already has zsh
-  tier_allows N && { is_skipped micro  || brew install micro; }
+  if have brew; then
+    tier_allows E && { is_skipped tmux   || brew install tmux; }
+    tier_allows E && { is_skipped neovim || brew install neovim; }
+    tier_allows R && { is_skipped mosh   || brew install mosh; }
+    tier_allows R && { is_skipped zsh    || true; }  # macOS already has zsh
+    tier_allows N && { is_skipped micro  || brew install micro; }
+  else
+    warn "Homebrew missing — package installs skipped, but shell rc/aliases will still be wired"
+  fi
 else
   require_sudo
   apt_refresh
@@ -150,17 +156,25 @@ if tier_allows R && ! is_skipped hostname-rewrite; then
 fi
 
 # Shell aliases — common shortcuts maintained by the add-shell-alias skill.
-# Lives in dotfiles/aliases.sh; gets sourced from .bashrc and .zshrc so it
-# works in both shells. The skill knows the format and edits this file
-# in-place when you ask for new aliases.
+# Lives in dotfiles/aliases.sh; gets sourced from .bashrc, .zshrc, and .profile
+# so it works for bash/zsh and minimal login shells. This must not depend on
+# Homebrew or tmux being installed.
 if tier_allows R && ! is_skipped aliases; then
   cp "$REPO_ROOT/dotfiles/aliases.sh" "$HOME/.hermes-host-bootstrap.aliases.sh"
-  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
     touch "$rc"
     ensure_line "# ── hermes-host-bootstrap shell aliases ──" "$rc"
     ensure_line "[ -f $HOME/.hermes-host-bootstrap.aliases.sh ] && . $HOME/.hermes-host-bootstrap.aliases.sh" "$rc"
   done
-  ok "shell aliases installed (h, hm, ... — sourced from bashrc/zshrc)"
+  # macOS zsh login shells read .zprofile before .zshrc. If .zprofile exists
+  # (or gets created by this line), source .zshrc so aliases show up in a new
+  # Terminal.app window, not only in non-login interactive shells.
+  if [[ "$OS" == "macos" ]]; then
+    touch "$HOME/.zprofile"
+    ensure_line "# ── hermes-host-bootstrap zprofile loads zshrc ──" "$HOME/.zprofile"
+    ensure_line "[ -f $HOME/.zshrc ] && . $HOME/.zshrc" "$HOME/.zprofile"
+  fi
+  ok "shell aliases installed (hmr, hmc, hmf, hmb — sourced from shell rc files)"
 fi
 
 # Make zsh the default login shell on Linux (matches macOS defaults since
