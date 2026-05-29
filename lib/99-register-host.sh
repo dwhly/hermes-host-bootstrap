@@ -62,6 +62,11 @@ TAILSCALE_NAME="$(tailscale status --self --json 2>/dev/null | \
                   python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("Self",{}).get("DNSName","").rstrip("."))' \
                   2>/dev/null || echo "")"
 
+# Default SSH login user for this box. hssh reads this from the synced
+# ~/.hermes/hosts/<hostname>.yaml registry so clients can type
+# `hssh h-do1` instead of remembering `root@h-do1`.
+DEFAULT_USER="${HERMES_HOST_DEFAULT_USER:-$(id -un 2>/dev/null || whoami 2>/dev/null || echo unknown)}"
+
 # Tool versions (each one tolerant of "not installed")
 get_ver() { eval "$1" 2>/dev/null | head -n 1 || echo "not installed"; }
 HERMES_VER="$(get_ver 'hermes --version')"
@@ -117,6 +122,7 @@ cat > "$TARGET" <<YAML
 hostname: $HOSTNAME_VAL
 fqdn: $FQDN_VAL
 note: "${HOST_NOTE}"
+default_user: "$DEFAULT_USER"
 tailscale_name: "${TAILSCALE_NAME}"
 public_ip: "$PUBLIC_IP"
 local_ip: "${LOCAL_IPS:-unknown}"

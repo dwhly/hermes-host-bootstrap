@@ -41,6 +41,12 @@
 # If set here, the interactive prompt is skipped for the note.
 # export HERMES_HOST_NOTE="main Hermes host, SFO, gateway + agent"
 
+# SSH login user other machines should use for this host. Lands in
+# ~/.hermes/hosts/<hostname>.yaml as `default_user:` and is used by hssh
+# when you type `hssh <hostname>` without user@.
+# Defaults to the user running bootstrap (`id -un`).
+# export HERMES_HOST_DEFAULT_USER="root"
+
 # Set to 1 to skip ALL interactive prompts (hostname + note). Useful for
 # unattended re-runs / CI / scripted provisioning.
 # export HERMES_NONINTERACTIVE=0

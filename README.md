@@ -130,7 +130,7 @@ Each module can also be run on its own:
 | `tmux` / `tmux-conf` | tmux package / .tmux.conf install |
 | `tmux-workspace-colors` | per-session statusbar coloring for hermes-workspace panes (ops/code/logs/scratch) |
 | `tmux-autoattach` | auto-attach to tmux session "main" on interactive SSH (snippet sourced from .bashrc/.zshrc) |
-| `hssh` | `hssh <session>` shell function: ssh + attach/create named tmux session in one shot |
+| `hssh` | `hssh [session] [host]` shell function: ssh + attach/create named tmux session; defaults to session `main` and reads `default_user:` from `~/.hermes/hosts/<host>.yaml` |
 | `hostname-rewrite` | rewrite stale long hostnames in user's HSSH_DEFAULT_HOST exports after fleet renames (table lives in lib/30-shell.sh) |
 | `aliases` | shell aliases (h, hm, ...) — managed by the add-shell-alias skill |
 | `chsh-zsh` | make zsh the default login shell on Linux hosts (matches macOS default) |
@@ -154,6 +154,7 @@ Each module can also be run on its own:
 | Var | Effect |
 |-----|--------|
 | `HERMES_HOSTNAME=mybox` | set the hostname during preflight |
+| `HERMES_HOST_DEFAULT_USER=root` | set `default_user:` in the host registry for hssh/user@host resolution |
 | `HERMES_TZ=America/Los_Angeles` | set timezone (default: UTC) |
 | `HERMES_SSH_HARDEN=1` | actually apply ssh hardening (off by default to avoid lockout) |
 | `HERMES_UFW_ENABLE=1` | actually enable ufw (off by default to avoid lockout) |
@@ -318,6 +319,13 @@ Daily usage from the Mac:
 mosh you@vps -- tmux new -A -s main
 ```
 
+or, via the bundled helper after the host registry has synced:
+
+```bash
+hssh h-do1        # session main on h-do1, using hosts/h-do1.yaml default_user
+hssh code h-do1   # session code on h-do1
+```
+
 `tmux new -A -s main` creates a session named `main` if missing, or
 attaches to it if it exists. Detach with `Ctrl-b d` (or `Ctrl-a d` if
 you're using the bundled `~/.tmux.conf`, which rebinds prefix to
@@ -334,10 +342,10 @@ not just `ufw`.
 
 Every bootstrap run drops a yaml snapshot of the host at
 `~/.hermes/hosts/<hostname>.yaml` — OS, role, tier, IPs, tool versions,
-resource ceiling, install date, and a free-form **`note:`** describing
-what the box is for. If `~/.hermes` is git-tracked via the companion
-`hermes-config-sync` repo, those snapshots roll forward to every other
-machine, giving you a portable inventory.
+resource ceiling, install date, a `default_user:` for SSH helpers, and a
+free-form **`note:`** describing what the box is for. If `~/.hermes` is
+git-tracked via the companion `hermes-config-sync` repo, those snapshots
+roll forward to every other machine, giving you a portable inventory.
 
 ### Interactive host identity (first run)
 
