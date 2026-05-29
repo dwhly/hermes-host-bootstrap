@@ -46,11 +46,10 @@ if [[ "$OS" == "macos" ]]; then
     ln -sf "$ghostty_cli" "$HOME/.local/bin/ghostty"
     ok "Ghostty CLI symlinked to ~/.local/bin/ghostty"
   fi
-
-  return 0 2>/dev/null || exit 0
 fi
 
 # Desktop Linux
+if [[ "$OS" != "macos" ]]; then
 case "$OS" in
   ubuntu|debian)
     if have ghostty; then
@@ -75,6 +74,7 @@ case "$OS" in
     warn "Ghostty: don't know how to install on OS=$OS; see https://ghostty.org/download"
     ;;
 esac
+fi
 
 # Drop a sensible default config (idempotent — only writes if missing)
 ghostty_cfg_dir="$HOME/.config/ghostty"
