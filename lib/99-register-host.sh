@@ -214,6 +214,18 @@ if [[ -f "$REPO_ROOT/scripts/hermes-backlog" ]]; then
   ok "hermes-backlog → $TARGET_LINK"
 fi
 
+# ── Install hermes-wiki on PATH ────────────────────────────────────────
+# Opens the local Hermes Automation Wiki in a browser. Aliased to `hmwiki`.
+if [[ -f "$REPO_ROOT/scripts/hermes-wiki" ]]; then
+  mkdir -p "$HOME/.local/bin"
+  TARGET_LINK="$HOME/.local/bin/hermes-wiki"
+  if [[ -L "$TARGET_LINK" || -f "$TARGET_LINK" ]]; then
+    rm -f "$TARGET_LINK"
+  fi
+  ln -s "$REPO_ROOT/scripts/hermes-wiki" "$TARGET_LINK"
+  ok "hermes-wiki → $TARGET_LINK"
+fi
+
 # Helpful hint for the user: if ~/.hermes is git-tracked (the typical
 # hermes-config-sync setup), nudge them to commit the snapshot.
 if [[ -d "${HERMES_HOME:-$HOME/.hermes}/.git" ]]; then

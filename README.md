@@ -93,6 +93,7 @@ lib/
 ├── 80-media.sh           ffmpeg, imagemagick, poppler, tesseract, pandoc, espeak-ng
 ├── 90-agents.sh          hermes, gh, Claude Code CLI, Codex CLI, faster-whisper
 ├── 92-hermes-config.sh   personal ~/.hermes clone/pull, op inject, model config seed
+├── 93-hermes-wiki.sh     local Hermes Automation Wiki clone/pull + HTML publish
 ├── 95-ghostty.sh         Ghostty terminal — client/both role only
 ├── A0-remote-desktop.sh  xrdp + XFCE (opt-in: --tier=full or --only=A0-remote-desktop)
 └── M5-mac-client.sh      tmux + mosh + MS Remote Desktop + Tailscale GUI (macOS client only)
@@ -137,6 +138,7 @@ Each module can also be run on its own:
 | `mac-hostname` | macOS only: rename HostName + LocalHostName to `$HERMES_MAC_HOSTNAME` (opt-in) |
 | `op` | install the 1Password CLI (for secrets resolution via `.env.template`) |
 | `op-resolve` | resolve `~/.hermes/.env.template` → `~/.hermes/.env` via `op inject` on each bootstrap run |
+| `hermes-wiki` / `hermes-wiki-pull` / `hermes-wiki-build` | local Hermes Automation Wiki clone/pull/build |
 | `ghostty-workspace` | macOS only: 2x2 Ghostty grid launcher (`hermes-workspace`) via AppleScript |
 | `mosh-firewall` | UFW rule for mosh UDP 60000-61000 (rule still added if ufw stays disabled) |
 | `zsh` / `oh-my-zsh`  | zsh / OMZ |
@@ -159,6 +161,8 @@ Each module can also be run on its own:
 | `HERMES_SSH_HARDEN=1` | actually apply ssh hardening (off by default to avoid lockout) |
 | `HERMES_UFW_ENABLE=1` | actually enable ufw (off by default to avoid lockout) |
 | `HERMES_CONFIG_REPO=git@github.com:USER/hermes-config.git` | clone/pull personal `~/.hermes` config during bootstrap |
+| `HERMES_WIKI_REPO=git@github.com:USER/hermes-automation-wiki.git` | clone/pull local wiki during bootstrap |
+| `HERMES_WIKI_DIR=~/code/hermes-automation-wiki` | override local wiki checkout path |
 | `HERMES_MODEL_PROVIDER=openrouter` | non-interactively seed `model.provider` so `hermes setup` is unnecessary |
 | `HERMES_MODEL_DEFAULT=openai/gpt-5.5` | non-interactively seed `model.default` |
 | `HERMES_GATEWAY_INSTALL=1` / `HERMES_GATEWAY_START=1` | install/start gateway after config + secrets are in place |

@@ -338,6 +338,7 @@ verify "hermes-fleet"   "test -x $HOME/.local/bin/hermes-fleet && $HOME/.local/b
 verify "hermes-reload"  "test -L $HOME/.local/bin/hermes-reload && echo present"
 verify "hermes-config"  "test -L $HOME/.local/bin/hermes-config && echo present"
 verify "hermes-backlog" "test -L $HOME/.local/bin/hermes-backlog && echo present"
+verify "hermes-wiki"    "test -L $HOME/.local/bin/hermes-wiki && echo present"
 
 echo ""
 ok "Bootstrap finished. Next steps:"

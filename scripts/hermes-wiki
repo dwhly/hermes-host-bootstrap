@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# hermes-wiki — open Dan's local Hermes Automation Wiki in a browser.
+#
+# Symlinked to ~/.local/bin/hermes-wiki by lib/99-register-host.sh.
+# Aliased to `hmwiki` in dotfiles/aliases.sh.
+#
+# Usage:
+#   hermes-wiki                 publish if needed, then open public/index.html
+#   hermes-wiki --pull          git pull before opening
+#   hermes-wiki --no-publish    do not run scripts/publish.py
+#   hermes-wiki --path          print the wiki directory
+#   hermes-wiki --help
+
+set -euo pipefail
+
+# Source per-user defaults so HERMES_WIKI_DIR / HERMES_WIKI_REPO are available.
+if [[ -f "$HOME/.hermes-bootstrap.conf" ]]; then
+  # shellcheck disable=SC1091
+  source "$HOME/.hermes-bootstrap.conf"
+fi
+
+PULL=0
+PUBLISH=1
+PRINT_PATH=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --pull) PULL=1 ;;
+    --no-publish) PUBLISH=0 ;;
+    --path) PRINT_PATH=1 ;;
+    -h|--help|help)
+      sed -n '2,12p' "$0" | sed 's/^#\s\{0,1\}//'
+      exit 0 ;;
+    *) echo "unknown arg: $arg" >&2; exit 2 ;;
+  esac
+done
+
+find_wiki_dir() {
+  local candidates=(
+    "${HERMES_WIKI_DIR:-}"
+    "$HOME/code/hermes-automation-wiki"
+    "$HOME/.hermes/hermes-automation-wiki"
+    "$HOME/hermes-automation-wiki"
+  )
+  local d
+  for d in "${candidates[@]}"; do
+    [[ -z "$d" ]] && continue
+    if [[ -f "$d/index.md" && -f "$d/SCHEMA.md" ]]; then
+      echo "$d"
+      return 0
+    fi
+  done
+  return 1
+}
+
+wiki_dir="$(find_wiki_dir)" || {
+  echo "ERROR: no local Hermes Automation Wiki found." >&2
+  echo "  Expected one of:" >&2
+  echo "    \$HERMES_WIKI_DIR" >&2
+  echo "    ~/code/hermes-automation-wiki" >&2
+  echo "    ~/.hermes/hermes-automation-wiki" >&2
+  echo "  Install with: hermes-reload --only=93-hermes-wiki" >&2
+  exit 1
+}
+
+if [[ "$PRINT_PATH" -eq 1 ]]; then
+  echo "$wiki_dir"
+  exit 0
+fi
+
+if [[ "$PULL" -eq 1 && -d "$wiki_dir/.git" ]]; then
+  echo "==> git pull: $wiki_dir"
+  git -C "$wiki_dir" pull --ff-only || {
+    echo "WARN: wiki git pull failed; opening existing local copy" >&2
+  }
+fi
+
+if [[ "$PUBLISH" -eq 1 ]]; then
+  if [[ -x "$wiki_dir/scripts/publish.py" ]]; then
+    echo "==> publishing wiki"
+    "$wiki_dir/scripts/publish.py" >/dev/null
+  elif [[ -f "$wiki_dir/scripts/publish.py" ]]; then
+    echo "==> publishing wiki"
+    python3 "$wiki_dir/scripts/publish.py" >/dev/null
+  fi
+fi
+
+html="$wiki_dir/public/index.html"
+if [[ ! -f "$html" ]]; then
+  echo "ERROR: $html not found." >&2
+  echo "  Try: cd $wiki_dir && ./scripts/publish.py" >&2
+  exit 1
+fi
+
+case "$(uname -s)" in
+  Darwin)
+    open "$html"
+    ;;
+  Linux)
+    if command -v xdg-open >/dev/null 2>&1; then
+      xdg-open "$html" >/dev/null 2>&1 &
+    elif command -v wslview >/dev/null 2>&1; then
+      wslview "$html"
+    else
+      echo "$html"
+      echo "No GUI opener found; paste this file path into a browser."
+    fi
+    ;;
+  *)
+    echo "$html"
+    ;;
+esac

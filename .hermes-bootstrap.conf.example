@@ -88,6 +88,11 @@
 # `hermes config migrate/check`.
 # export HERMES_CONFIG_REPO=git@github.com:USER/hermes-config.git
 
+# Optional: local Markdown-first Hermes Automation Wiki clone. Used by
+# lib/93-hermes-wiki.sh and opened by `hermes-wiki` / `hmwiki`.
+# export HERMES_WIKI_REPO=git@github.com:USER/hermes-automation-wiki.git
+# export HERMES_WIKI_DIR="$HOME/code/hermes-automation-wiki"
+
 # Non-interactive Hermes model/provider defaults. These seed config.yaml during
 # bootstrap so you do NOT need to enter the `hermes setup` provider picker.
 # The private hermes-config repo can still override with richer routing later.
