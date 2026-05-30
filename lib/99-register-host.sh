@@ -214,6 +214,21 @@ if [[ -f "$REPO_ROOT/scripts/hermes-backlog" ]]; then
   ok "hermes-backlog → $TARGET_LINK"
 fi
 
+
+# ── Install hermes-terminal-reset on PATH ──────────────────────────────
+# Repairs terminal state after curses/TUI crashes or Ctrl-C exits leave mouse,
+# bracketed paste, alt-screen, cursor, or scroll modes wedged. Aliased to
+# `hmreset` by dotfiles/aliases.sh.
+if [[ -f "$REPO_ROOT/scripts/hermes-terminal-reset" ]]; then
+  mkdir -p "$HOME/.local/bin"
+  TARGET_LINK="$HOME/.local/bin/hermes-terminal-reset"
+  if [[ -L "$TARGET_LINK" || -f "$TARGET_LINK" ]]; then
+    rm -f "$TARGET_LINK"
+  fi
+  ln -s "$REPO_ROOT/scripts/hermes-terminal-reset" "$TARGET_LINK"
+  ok "hermes-terminal-reset → $TARGET_LINK"
+fi
+
 # ── Install hermes-wiki on PATH ────────────────────────────────────────
 # Opens the local Hermes Automation Wiki in a browser. Aliased to `hmwiki`.
 if [[ -f "$REPO_ROOT/scripts/hermes-wiki" ]]; then

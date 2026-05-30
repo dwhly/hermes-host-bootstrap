@@ -136,7 +136,7 @@ Each module can also be run on its own:
 | `tmux-autoattach` | auto-attach to tmux session "main" on interactive SSH (snippet sourced from .bashrc/.zshrc) |
 | `hssh` | `hssh [session] [host]` shell function: ssh + attach/create named tmux session; defaults to session `main` and reads `default_user:` from `~/.hermes/hosts/<host>.yaml` |
 | `hostname-rewrite` | rewrite stale long hostnames in user's HSSH_DEFAULT_HOST exports after fleet renames (table lives in lib/30-shell.sh) |
-| `aliases` | shell aliases (h, hm, ...) — managed by the add-shell-alias skill |
+| `aliases` | shell aliases (h, hm, hmreset, ...) — managed by the add-shell-alias skill |
 | `chsh-zsh` | make zsh the default login shell on Linux hosts (matches macOS default) |
 | `mac-hostname` | macOS only: rename HostName + LocalHostName to `$HERMES_MAC_HOSTNAME` (opt-in) |
 | `op` | install the 1Password CLI (for secrets resolution via `.env.template`) |

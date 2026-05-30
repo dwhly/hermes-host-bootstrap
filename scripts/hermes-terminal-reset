@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Reset terminal modes that TUI/curses apps can leave behind after crashes or Ctrl-C.
+# Safe to run repeatedly. Works best in the affected terminal tab.
+set +e
+# DEC locator/selectable locator, passive/extended mouse modes, all common
+# mouse tracking modes, focus reporting, bracketed paste, alt screen,
+# kitty keyboard, modifyOtherKeys, attributes, cursor visible.
+printf '\033[0;10;0c\033[0\047z\033[0\047{\033[?2029l\033[?1016l\033[?1015l\033[?1006l\033[?1005l\033[?1003l\033[?1002l\033[?1001l\033[?1000l\033[?9l\033[?1004l\033[?2004l\033[?1049l\033[<u\033[>4m\033[0m\033[?25h'
+stty sane 2>/dev/null || true
+# Clear only when TERM is set; ssh non-tty commands often don't have it.
+if [ -n "${TERM:-}" ] && command -v clear >/dev/null 2>&1; then
+  clear
+fi

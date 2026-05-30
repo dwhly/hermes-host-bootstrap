@@ -243,6 +243,15 @@ model_cfg["base_url"] = base_url
 model_cfg["api_mode"] = api_mode
 data["model"] = model_cfg
 
+# Safer TUI default: avoid DECSET 1003 any-motion/hover mouse tracking.
+# The TUI still supports scroll/click with "wheel", and users can opt back
+# into full hover tracking via /mouse all.
+display_cfg = data.get("display")
+if not isinstance(display_cfg, dict):
+    display_cfg = {}
+display_cfg.setdefault("mouse_tracking", "wheel")
+data["display"] = display_cfg
+
 path.write_text(yaml.safe_dump(data, sort_keys=False))
 PY
   ok "Hermes model config seeded: $provider / $model"
