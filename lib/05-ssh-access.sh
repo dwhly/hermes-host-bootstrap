@@ -72,12 +72,15 @@ else
 fi
 
 if [[ "$OS" == "macos" ]] && [[ "${HERMES_MAC_REMOTE_LOGIN:-0}" == "1" ]] && ! is_skipped mac-remote-login; then
-  require_sudo
-  info "enabling macOS Remote Login for SSH"
-  sudo systemsetup -setremotelogin on >/dev/null 2>&1 || warn "systemsetup could not enable Remote Login"
-  # Ensure the current user is allowed when macOS has a restricted access group.
-  sudo dseditgroup -o edit -a "$USER" -t user com.apple.access_ssh >/dev/null 2>&1 || true
-  ok "macOS Remote Login requested for $USER"
+  if sudo -n true 2>/dev/null; then
+    info "enabling macOS Remote Login for SSH"
+    sudo systemsetup -setremotelogin on >/dev/null 2>&1 || warn "systemsetup could not enable Remote Login"
+    # Ensure the current user is allowed when macOS has a restricted access group.
+    sudo dseditgroup -o edit -a "$USER" -t user com.apple.access_ssh >/dev/null 2>&1 || true
+    ok "macOS Remote Login requested for $USER"
+  else
+    warn "macOS Remote Login requested but sudo needs a TTY/password; run locally or use hermes-reload --interactive-sudo"
+  fi
 elif [[ "$OS" == "macos" ]]; then
   skip "macOS Remote Login not changed (set HERMES_MAC_REMOTE_LOGIN=1 to opt in)"
 fi
