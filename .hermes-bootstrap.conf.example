@@ -66,6 +66,21 @@
 # Macs with Touch ID can skip this — `op signin` once interactively gives a
 # long-lived biometric session and bootstrap inherits it automatically.
 
+
+# ── SSH reachability / fleet automation keys ───────────────────────────
+# Add one or more public keys to ~/.ssh/authorized_keys. This is useful when
+# a relay host (for example h-do1) needs passwordless SSH into a new Mac after
+# you run bootstrap locally once. Values are public keys only — never private
+# keys. For multiple keys, use HERMES_AUTHORIZED_KEYS_FILE or a quoted
+# multi-line string.
+# export HERMES_AUTHORIZED_KEYS='ssh-ed25519 AAAA... relay@example'
+# export HERMES_AUTHORIZED_KEYS_FILE="$HOME/.config/hermes/authorized_keys"
+#
+# macOS only: opt in to enabling System Settings → General → Sharing →
+# Remote Login for the current user. Defaults off so bootstrap never opens
+# remote access unless explicitly requested.
+# export HERMES_MAC_REMOTE_LOGIN=0
+
 # Lockout-risk features — both default to OFF in the repo. Set to 1 here if
 # you ALWAYS want these enabled on machines you bootstrap. Make sure you have
 # working SSH key access before enabling on a remote box.

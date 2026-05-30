@@ -83,6 +83,7 @@ lib/
 ├── common.sh             shared helpers (logging, apt_install, ensure_line,
 │                         tier_allows, role_includes, …)
 ├── 00-preflight.sh       hostname, tz, apt upgrade, swap, enable-linger
+├── 05-ssh-access.sh      opt-in authorized_keys + macOS Remote Login helpers
 ├── 10-security.sh        openssh, ufw, fail2ban, unattended-upgrades, ssh hardening
 ├── 20-buildchain.sh      build-essential + libs (so pip/cargo wheels compile)
 ├── 30-shell.sh           tmux, zsh, oh-my-zsh, neovim, mosh, micro
@@ -124,6 +125,8 @@ Each module can also be run on its own:
 | `apt-upgrade`   | the initial `apt-get upgrade` |
 | `swap`          | swap file creation |
 | `linger`        | `loginctl enable-linger` |
+| `authorized-keys` | skip `~/.ssh/authorized_keys` management from `HERMES_AUTHORIZED_KEYS(_FILE)` |
+| `mac-remote-login` | macOS only: skip Remote Login enablement when `HERMES_MAC_REMOTE_LOGIN=1` |
 | `ssh-harden`    | sshd_config edits (off by default — only fires if `HERMES_SSH_HARDEN=1`) |
 | `ufw`           | ufw install + rules |
 | `fail2ban`      | fail2ban |
@@ -158,6 +161,9 @@ Each module can also be run on its own:
 | `HERMES_HOSTNAME=mybox` | set the hostname during preflight |
 | `HERMES_HOST_DEFAULT_USER=root` | set `default_user:` in the host registry for hssh/user@host resolution |
 | `HERMES_TZ=America/Los_Angeles` | set timezone (default: UTC) |
+| `HERMES_AUTHORIZED_KEYS` | newline-separated public SSH keys to ensure in `~/.ssh/authorized_keys` |
+| `HERMES_AUTHORIZED_KEYS_FILE` | file of public SSH keys to ensure in `~/.ssh/authorized_keys` |
+| `HERMES_MAC_REMOTE_LOGIN=1` | macOS only: enable Remote Login for SSH and allow the current user |
 | `HERMES_SSH_HARDEN=1` | actually apply ssh hardening (off by default to avoid lockout) |
 | `HERMES_UFW_ENABLE=1` | actually enable ufw (off by default to avoid lockout) |
 | `HERMES_CONFIG_REPO=git@github.com:USER/hermes-config.git` | clone/pull personal `~/.hermes` config during bootstrap |
