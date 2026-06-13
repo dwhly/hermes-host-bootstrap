@@ -111,13 +111,13 @@ fi
 if have op && [[ -f "$ENV_TEMPLATE" ]] && ! is_skipped op-resolve; then
   if op account list >/dev/null 2>&1; then
     info "resolving $ENV_TEMPLATE → $ENV_RESOLVED via op inject"
-    if op inject -i "$ENV_TEMPLATE" -o "$ENV_RESOLVED.tmp" 2>/dev/null; then
+    if op inject --force -i "$ENV_TEMPLATE" -o "$ENV_RESOLVED.tmp" 2>/dev/null; then
       # Per-host overlay: if a .env.template.<hostname> exists, resolve it and
       # append. Lines in the overlay override (later-wins is the convention
       # python-dotenv and most env loaders follow).
       if [[ -f "$ENV_TEMPLATE_HOST" ]]; then
         info "applying per-host overlay: $ENV_TEMPLATE_HOST"
-        if op inject -i "$ENV_TEMPLATE_HOST" -o "$ENV_RESOLVED.host.tmp" 2>/dev/null; then
+        if op inject --force -i "$ENV_TEMPLATE_HOST" -o "$ENV_RESOLVED.host.tmp" 2>/dev/null; then
           {
             echo ""
             echo "# ── per-host overlay ($(basename "$ENV_TEMPLATE_HOST")) ──"

@@ -157,10 +157,10 @@ resolve_env_template() {
   fi
 
   info "resolving $env_template → $env_resolved via op inject"
-  if op inject -i "$env_template" -o "$env_resolved.tmp" 2>/dev/null; then
+  if op inject --force -i "$env_template" -o "$env_resolved.tmp" 2>/dev/null; then
     if [[ -f "$env_template_host" ]]; then
       info "applying per-host overlay: $env_template_host"
-      if op inject -i "$env_template_host" -o "$env_resolved.host.tmp" 2>/dev/null; then
+      if op inject --force -i "$env_template_host" -o "$env_resolved.host.tmp" 2>/dev/null; then
         {
           echo ""
           echo "# ── per-host overlay ($(basename "$env_template_host")) ──"
