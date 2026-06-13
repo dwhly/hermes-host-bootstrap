@@ -163,6 +163,10 @@ if [[ "$CHECK_SSH" -eq 1 ]]; then
     [[ -n "$HOST" ]] || HOST="$(basename "$f" .yaml)"
     TARGET="$(resolve_host_target "$HOST" "$f")"
     TARGET_HOST="${TARGET#*@}"
+    if [[ "$HOST" == "$(hostname -s)" ]]; then
+      printf '  %-18s %-28s %-10s %s\n' "$HOST" "$TARGET" "self" "self"
+      continue
+    fi
     if nc -z -w 3 "$TARGET_HOST" 22 >/dev/null 2>&1; then
       TCP_OK="ok"
     else
