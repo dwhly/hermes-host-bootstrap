@@ -49,11 +49,20 @@ _hssh_resolve_host() {
   _hssh_home="${HERMES_HOME:-$HOME/.hermes}"
   _hssh_file="$_hssh_home/hosts/$_hssh_host.yaml"
   if [ -f "$_hssh_file" ]; then
-    _hssh_user="$(_hssh_field "$_hssh_file" default_user)"
+    _hssh_user="$(_hssh_field "$_hssh_file" ssh_user)"
+    [ -n "$_hssh_user" ] || _hssh_user="$(_hssh_field "$_hssh_file" default_user)"
+
+    _hssh_target="$(_hssh_field "$_hssh_file" ssh_host)"
+    [ -n "$_hssh_target" ] || _hssh_target="$(_hssh_field "$_hssh_file" tailscale_ip)"
+    [ -n "$_hssh_target" ] || _hssh_target="$(_hssh_field "$_hssh_file" tailscale_name)"
+    [ -n "$_hssh_target" ] || _hssh_target="$_hssh_host"
+
     if [ -n "$_hssh_user" ] && [ "$_hssh_user" != "unknown" ]; then
-      printf '%s@%s\n' "$_hssh_user" "$_hssh_host"
+      printf '%s@%s\n' "$_hssh_user" "$_hssh_target"
       return 0
     fi
+    printf '%s\n' "$_hssh_target"
+    return 0
   fi
 
   # No registry default: leave the host alone so ~/.ssh/config can still

@@ -144,14 +144,18 @@ if ! is_skipped ghostty-workspace; then
 # hermes-workspace — open a 4-pane Ghostty grid SSH'd into named tmux sessions.
 #
 # Usage:
-#   hermes-workspace                # default: root@h-do1
-#   hermes-workspace h-mini         # uses danz@h-mini (hostUserMap in the .scpt)
+#   hermes-workspace                # default: h-do1 resolved via ~/.hermes/hosts
+#   hermes-workspace h-mini         # resolves via ~/.hermes/hosts/h-mini.yaml
 #   hermes-workspace root@h-do1     # explicit user@host
 #   hmw …                           # same, via the alias
 #
-# Edit ~/.hermes-host-bootstrap/ghostty-workspace.applescript's hostUserMap
-# handler to add new fleet hosts with non-root usernames.
-exec osascript "$HOME/.hermes-host-bootstrap/ghostty-workspace.applescript" "$@"
+# Resolve fleet hostnames through ~/.hermes/hosts before AppleScript builds the
+# pane commands. This avoids depending on local MagicDNS/SSH config state.
+target="${1:-h-do1}"
+if command -v hermes-host-resolve >/dev/null 2>&1; then
+  target="$(hermes-host-resolve "$target")"
+fi
+exec osascript "$HOME/.hermes-host-bootstrap/ghostty-workspace.applescript" "$target"
 WRAPPER
     chmod +x "$bin_dir/hermes-workspace"
     ok "Ghostty workspace launcher installed (run: hermes-workspace)"

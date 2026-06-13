@@ -8,6 +8,7 @@
 # Usage:
 #   hermes-fleet                # static view from registry files
 #   hermes-fleet --live         # also ssh into each reachable host
+#   hermes-fleet --check-ssh    # verify registry SSH targets for every host
 #   hermes-fleet --refresh      # re-snapshot THIS box's entry, then show
 #   hermes-fleet <hostname>     # focus on one host (full yaml)
 #   hermes-fleet --json         # raw JSON for scripting
@@ -18,6 +19,7 @@ set -euo pipefail
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 REGISTRY_DIR="$HERMES_HOME/hosts"
 LIVE=0
+CHECK_SSH=0
 REFRESH=0
 JSON=0
 FOCUS=""
@@ -25,6 +27,7 @@ FOCUS=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --live)    LIVE=1; shift ;;
+    --check-ssh|doctor) CHECK_SSH=1; shift ;;
     --refresh) REFRESH=1; shift ;;
     --json)    JSON=1; shift ;;
     -h|--help)
@@ -128,6 +131,54 @@ for f in "$REGISTRY_DIR"/*.yaml; do
 done
 printf '\n  \033[1;36mHermes Fleet\033[0m  (%s hosts in registry)\n\n' "$HOST_COUNT"
 
+resolve_host_target() {
+  local name="$1" file="$2" user host
+  if [[ -x "$(dirname "${BASH_SOURCE[0]}")/hermes-host-resolve" ]]; then
+    "$(dirname "${BASH_SOURCE[0]}")/hermes-host-resolve" "$name"
+    return 0
+  fi
+  if command -v hermes-host-resolve >/dev/null 2>&1; then
+    hermes-host-resolve "$name"
+    return 0
+  fi
+  user="$(get_field "$file" ssh_user)"
+  [[ -n "$user" ]] || user="$(get_field "$file" default_user)"
+  host="$(get_field "$file" ssh_host)"
+  [[ -n "$host" ]] || host="$(get_field "$file" tailscale_ip)"
+  [[ -n "$host" ]] || host="$(get_field "$file" tailscale_name)"
+  [[ -n "$host" ]] || host="$name"
+  if [[ -n "$user" && "$user" != "unknown" ]]; then
+    printf '%s@%s\n' "$user" "$host"
+  else
+    printf '%s\n' "$host"
+  fi
+}
+
+if [[ "$CHECK_SSH" -eq 1 ]]; then
+  printf '  \033[1m%-18s %-28s %-10s %s\033[0m\n' HOST TARGET TCP SSH
+  for f in "$REGISTRY_DIR"/*.yaml; do
+    [[ -f "$f" ]] || continue
+    [[ "$f" == *.live.yaml ]] && continue
+    HOST=$(get_field "$f" hostname)
+    [[ -n "$HOST" ]] || HOST="$(basename "$f" .yaml)"
+    TARGET="$(resolve_host_target "$HOST" "$f")"
+    TARGET_HOST="${TARGET#*@}"
+    if nc -z -w 3 "$TARGET_HOST" 22 >/dev/null 2>&1; then
+      TCP_OK="ok"
+    else
+      TCP_OK=$'\033[33mtimeout\033[0m'
+    fi
+    if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$TARGET" 'hostname -s' >/dev/null 2>&1; then
+      SSH_OK="ok"
+    else
+      SSH_OK=$'\033[33mfail\033[0m'
+    fi
+    printf '  %-18s %-28s %-10b %b\n' "$HOST" "$TARGET" "$TCP_OK" "$SSH_OK"
+  done
+  echo ""
+  exit 0
+fi
+
 printf '  \033[1m%-18s %-10s %-8s %-22s %-10s %-12s %s\033[0m\n' \
   HOST TIER ROLE OS HERMES DISK NOTE
 
@@ -157,7 +208,8 @@ for f in "$REGISTRY_DIR"/*.yaml; do
 
   if [[ "$LIVE" -eq 1 ]] && [[ -n "$HOST" ]] && [[ "$HOST" != "$(hostname -s)" ]]; then
     # Best-effort SSH probe (BatchMode = no prompts, short timeout)
-    LIVE_DATA="$(ssh -o BatchMode=yes -o ConnectTimeout=3 "$HOST" \
+    SSH_TARGET="$(resolve_host_target "$HOST" "$f")"
+    LIVE_DATA="$(ssh -o BatchMode=yes -o ConnectTimeout=3 "$SSH_TARGET" \
       'uptime -p 2>/dev/null; df -h / | awk "NR==2{print \$5}"' 2>/dev/null || echo "")"
     if [[ -n "$LIVE_DATA" ]]; then
       LIVE_UP="$(echo "$LIVE_DATA" | head -1)"
@@ -177,5 +229,6 @@ done
 echo ""
 echo "  Detail for one host:  hermes-fleet <hostname>"
 echo "  Live SSH probe:       hermes-fleet --live"
+echo "  SSH route check:      hermes-fleet --check-ssh"
 echo "  Refresh this box:     hermes-fleet --refresh"
 echo ""

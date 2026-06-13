@@ -30,6 +30,35 @@ detect_os() {
 
 OS="$(detect_os)"
 ARCH="$(uname -m)"
+
+# macOS noninteractive shells (ssh host 'cmd', launchd, bootstrap reruns) often
+# start with /usr/bin:/bin:/usr/sbin:/sbin only, so Homebrew is invisible even
+# when it is installed. Put the canonical Homebrew prefixes on PATH before any
+# module calls `have brew` or invokes brew-installed tools.
+if [[ "$OS" == "macos" ]]; then
+  PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+  export PATH
+fi
+
+# Tailscale's GUI app on macOS ships a CLI binary inside the .app bundle but
+# does not always put it on PATH. Keep this lookup centralized so registry and
+# network modules don't mistake "CLI not on PATH" for "Tailscale unavailable".
+find_tailscale() {
+  if command -v tailscale >/dev/null 2>&1; then
+    command -v tailscale
+    return 0
+  fi
+  if [[ -x /Applications/Tailscale.app/Contents/MacOS/tailscale ]]; then
+    printf '%s\n' /Applications/Tailscale.app/Contents/MacOS/tailscale
+    return 0
+  fi
+  if [[ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]]; then
+    printf '%s\n' /Applications/Tailscale.app/Contents/MacOS/Tailscale
+    return 0
+  fi
+  return 1
+}
+
 IS_HEADLESS=1
 # crude headless check: no DISPLAY, no WAYLAND_DISPLAY, no /Applications
 if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" || -d /Applications ]]; then

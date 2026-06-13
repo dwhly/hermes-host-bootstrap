@@ -57,15 +57,40 @@ else
   LOCAL_IPS="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 fi
 
-# Tailscale name (if installed and authed)
-TAILSCALE_NAME="$(tailscale status --self --json 2>/dev/null | \
-                  python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("Self",{}).get("DNSName","").rstrip("."))' \
-                  2>/dev/null || echo "")"
+# Tailscale identity (if installed and authed). On macOS the CLI may live only
+# inside /Applications/Tailscale.app, so use common.sh's find_tailscale helper
+# instead of assuming `tailscale` is on PATH.
+TAILSCALE_BIN="$(find_tailscale 2>/dev/null || true)"
+TAILSCALE_NAME=""
+TAILSCALE_IP=""
+if [[ -n "$TAILSCALE_BIN" ]]; then
+  TAILSCALE_NAME="$($TAILSCALE_BIN status --self --json 2>/dev/null | \
+                    python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("Self",{}).get("DNSName","").rstrip("."))' \
+                    2>/dev/null || echo "")"
+  TAILSCALE_IP="$($TAILSCALE_BIN ip -4 2>/dev/null | head -n 1 || true)"
+fi
 
 # Default SSH login user for this box. hssh reads this from the synced
 # ~/.hermes/hosts/<hostname>.yaml registry so clients can type
 # `hssh h-do1` instead of remembering `root@h-do1`.
 DEFAULT_USER="${HERMES_HOST_DEFAULT_USER:-$(id -un 2>/dev/null || whoami 2>/dev/null || echo unknown)}"
+
+# Authoritative SSH target. Fleet tools prefer this over ambient local DNS so a
+# Mac/VPS pair keeps working even when MagicDNS is unavailable, stale, or not on
+# the client's resolver path. Prefer tailnet addressing, then public IP, then
+# the short hostname as a last resort.
+SSH_USER="${HERMES_HOST_SSH_USER:-$DEFAULT_USER}"
+if [[ -n "${HERMES_HOST_SSH_HOST:-}" ]]; then
+  SSH_HOST="$HERMES_HOST_SSH_HOST"
+elif [[ -n "$TAILSCALE_IP" ]]; then
+  SSH_HOST="$TAILSCALE_IP"
+elif [[ -n "$TAILSCALE_NAME" ]]; then
+  SSH_HOST="$TAILSCALE_NAME"
+elif [[ -n "$PUBLIC_IP" && "$PUBLIC_IP" != "unknown" ]]; then
+  SSH_HOST="$PUBLIC_IP"
+else
+  SSH_HOST="$HOSTNAME_VAL"
+fi
 
 # Tool versions (each one tolerant of "not installed")
 get_ver() { eval "$1" 2>/dev/null | head -n 1 || echo "not installed"; }
@@ -123,7 +148,10 @@ hostname: $HOSTNAME_VAL
 fqdn: $FQDN_VAL
 note: "${HOST_NOTE}"
 default_user: "$DEFAULT_USER"
+ssh_user: "$SSH_USER"
+ssh_host: "$SSH_HOST"
 tailscale_name: "${TAILSCALE_NAME}"
+tailscale_ip: "${TAILSCALE_IP:-}"
 public_ip: "$PUBLIC_IP"
 local_ip: "${LOCAL_IPS:-unknown}"
 
@@ -171,6 +199,19 @@ if [[ -f "$REPO_ROOT/scripts/hermes-fleet" ]]; then
   fi
   ln -s "$REPO_ROOT/scripts/hermes-fleet" "$TARGET_LINK"
   ok "hermes-fleet → $TARGET_LINK"
+fi
+
+# ── Install hermes-host-resolve on PATH ────────────────────────────────
+# Shared resolver used by hssh, hermes-workspace, and fleet checks. It turns a
+# registry hostname into the authoritative user@ssh_host target.
+if [[ -f "$REPO_ROOT/scripts/hermes-host-resolve" ]]; then
+  mkdir -p "$HOME/.local/bin"
+  TARGET_LINK="$HOME/.local/bin/hermes-host-resolve"
+  if [[ -L "$TARGET_LINK" || -f "$TARGET_LINK" ]]; then
+    rm -f "$TARGET_LINK"
+  fi
+  ln -s "$REPO_ROOT/scripts/hermes-host-resolve" "$TARGET_LINK"
+  ok "hermes-host-resolve → $TARGET_LINK"
 fi
 
 # ── Install companion scripts on PATH ─────────────────────────────────

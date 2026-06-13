@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# hermes-host-resolve — resolve a fleet host through ~/.hermes/hosts/*.yaml.
+#
+# Usage:
+#   hermes-host-resolve h-do1          # -> root@100.122.202.37
+#   hermes-host-resolve root@h-do1     # -> root@h-do1 (explicit user@host preserved)
+#   hermes-host-resolve --host h-do1   # -> 100.122.202.37
+#   hermes-host-resolve --user h-do1   # -> root
+#
+# Resolution preference for registry hosts:
+#   user: ssh_user -> default_user -> current user/ssh default
+#   host: ssh_host -> tailscale_ip -> tailscale_name -> original host
+
+set -euo pipefail
+
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+MODE="target"
+case "${1:-}" in
+  --host) MODE="host"; shift ;;
+  --user) MODE="user"; shift ;;
+  --help|-h)
+    sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+esac
+
+input="${1:-}"
+if [[ -z "$input" ]]; then
+  echo "usage: hermes-host-resolve [--host|--user] <host|user@host>" >&2
+  exit 2
+fi
+
+# Explicit user@host is intentionally preserved: the caller already expressed
+# the target exactly. This keeps ad-hoc hosts and SSH config aliases working.
+if [[ "$input" == *@* ]]; then
+  user="${input%@*}"
+  host="${input#*@}"
+  case "$MODE" in
+    user) printf '%s\n' "$user" ;;
+    host) printf '%s\n' "$host" ;;
+    *)    printf '%s\n' "$input" ;;
+  esac
+  exit 0
+fi
+
+field() {
+  local file="$1" key="$2"
+  [[ -f "$file" ]] || return 1
+  awk -v key="$key" '
+    $0 ~ "^[[:space:]]*"key":" {
+      sub("^[[:space:]]*"key":[[:space:]]*", "")
+      gsub(/^"|"$/, "")
+      print
+      exit
+    }
+  ' "$file"
+}
+
+file="$HERMES_HOME/hosts/$input.yaml"
+if [[ -f "$file" ]]; then
+  user="$(field "$file" ssh_user || true)"
+  [[ -n "$user" ]] || user="$(field "$file" default_user || true)"
+  [[ -n "$user" && "$user" != "unknown" ]] || user=""
+
+  host="$(field "$file" ssh_host || true)"
+  [[ -n "$host" ]] || host="$(field "$file" tailscale_ip || true)"
+  [[ -n "$host" ]] || host="$(field "$file" tailscale_name || true)"
+  [[ -n "$host" ]] || host="$input"
+else
+  user=""
+  host="$input"
+fi
+
+case "$MODE" in
+  user) printf '%s\n' "$user" ;;
+  host) printf '%s\n' "$host" ;;
+  *)
+    if [[ -n "$user" ]]; then
+      printf '%s@%s\n' "$user" "$host"
+    else
+      printf '%s\n' "$host"
+    fi
+    ;;
+esac
