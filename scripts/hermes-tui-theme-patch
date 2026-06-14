@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# hermes-tui-theme-patch — restore the legible diff colors in the Hermes Ink TUI
+# and rebuild the bundle.
+#
+# WHY THIS EXISTS
+# Upstream switched the TUI diff rendering to a GitHub-style "pale full-line
+# background + dark foreground text" scheme (theme.ts: diffAdded/diffRemoved as
+# pale rgb fills, diffAddedWord/diffRemovedWord as dark green/red). On a dark
+# terminal that pale fill glares and the dark text is hard to read. Dan's panes
+# run dark terminals, so we restore the older "bright foreground, no fill" look:
+#
+#   diffAdded   -> undefined (no background fill)
+#   diffRemoved -> undefined (no background fill)
+#   diffAddedWord   -> #a6e3a1  (Catppuccin green)
+#   diffRemovedWord -> #f38ba8  (Catppuccin red)
+#
+# Only the DARK_THEME palette is touched. LIGHT_THEME (dark-on-pale, fine on
+# white terminals) is intentionally left alone.
+#
+# This is an EDITABLE / in-place Hermes install, so `hermes update` overwrites
+# theme.ts. Re-run this script after every update (the bootstrap also runs it
+# via lib/91-hermes-tui-theme.sh on `hmr`). It is idempotent: if the patch is
+# already applied it just rebuilds (or no-ops if the bundle is current).
+#
+# Exit codes: 0 = patched/already-applied (and rebuilt), 1 = could not locate
+# the install or build failed.
+set -euo pipefail
+
+log()  { printf '  %s\n' "$*"; }
+warn() { printf '  ! %s\n' "$*" >&2; }
+
+# ── Resolve the Hermes project root (same logic as dotfiles/aliases.sh) ──
+resolve_root() {
+  if [ -n "${HERMES_TUI_DIR:-}" ] && [ -f "${HERMES_TUI_DIR%/}/../package.json" ]; then
+    dirname "${HERMES_TUI_DIR%/}"
+    return 0
+  fi
+  command -v hermes >/dev/null 2>&1 || return 1
+  local shim venv root
+  shim="$(command -v hermes)"
+  venv="$(grep -oE '"[^"]*venv/bin/hermes"' "$shim" 2>/dev/null | head -1 | tr -d '"')"
+  [ -z "$venv" ] && venv="$(readlink -f "$shim" 2>/dev/null)"
+  [ -n "$venv" ] || return 1
+  root="$(dirname "$(dirname "$(dirname "$venv")")")"
+  [ -d "$root/ui-tui" ] && { printf '%s\n' "$root"; return 0; }
+  return 1
+}
+
+ROOT="$(resolve_root)" || { warn "could not locate Hermes install (ui-tui dir). Skipping."; exit 1; }
+TUI="$ROOT/ui-tui"
+THEME="$TUI/src/theme.ts"
+[ -f "$THEME" ] || { warn "theme.ts not found at $THEME — Hermes layout changed; skipping."; exit 1; }
+
+log "Hermes root: $ROOT"
+
+# ── Idempotent patch of the DARK_THEME diff colors via Python (robust to ──
+# ── whitespace drift across versions; targets the first occurrence, which ──
+# ── is DARK_THEME — LIGHT_THEME's identical keys appear later and are left ──
+# ── untouched). ──
+PATCHED=0
+python3 - "$THEME" <<'PY'
+import re, sys
+p = sys.argv[1]
+src = open(p, encoding="utf-8").read()
+
+DESIRED = {
+    "diffAdded":       "undefined as unknown as string",
+    "diffRemoved":     "undefined as unknown as string",
+    "diffAddedWord":   "'#a6e3a1'",
+    "diffRemovedWord": "'#f38ba8'",
+}
+
+changed = False
+for key, val in DESIRED.items():
+    # Match the FULL value: a quoted string '...', an rgb(...)/rgba(...) call
+    # (which contains commas, so a naive [^,] stops too early), or a bare
+    # token like `undefined as unknown as string` — then the trailing comma
+    # anchored to end-of-line so we never swallow the following key. count=1
+    # targets the first block (DARK_THEME); LIGHT_THEME's identical keys come
+    # later and are deliberately left untouched (fine on light terminals).
+    pat = re.compile(
+        r"(\b" + re.escape(key) + r"\s*:\s*)"
+        r"('(?:[^'\\]|\\.)*'"
+        r"|rgba?\([^)]*\)"
+        r"|[^\n,][^\n]*?)"
+        r"(,\s*$)",
+        re.MULTILINE,
+    )
+    def repl(m, _val=val):
+        global changed
+        cur = m.group(2).strip()
+        if cur == _val:
+            return m.group(0)  # already desired
+        changed = True
+        return m.group(1) + _val + m.group(3)
+    # Replace only the FIRST match (DARK_THEME)
+    src, n = pat.subn(repl, src, count=1)
+
+if changed:
+    open(p, "w", encoding="utf-8").write(src)
+    print("PATCHED")
+else:
+    print("ALREADY")
+PY
+if grep -q "'#a6e3a1'" "$THEME" && grep -q "'#f38ba8'" "$THEME"; then
+  log "theme.ts diff colors: legible scheme present."
+else
+  warn "patch verification failed — bright fg colors not found in theme.ts"
+  exit 1
+fi
+
+# ── Rebuild the bundle. Handle the known esbuild host/binary version skew. ──
+need_node_path() {
+  # Node is often not on the non-interactive PATH (nvm/fnm/brew). Probe + prepend.
+  for d in \
+    "$HOME"/.nvm/versions/node/*/bin \
+    "$HOME"/.local/share/fnm/node-versions/*/installation/bin \
+    /opt/homebrew/bin /usr/local/bin; do
+    [ -d "$d" ] && [ -x "$d/npm" ] && { PATH="$d:$PATH"; return 0; }
+  done
+  return 0
+}
+need_node_path
+export PATH
+
+command -v npm >/dev/null 2>&1 || { warn "npm not on PATH — cannot rebuild TUI bundle"; exit 1; }
+
+build() { ( cd "$TUI" && npm run build ); }
+
+log "Rebuilding TUI bundle…"
+if ! build 2>/tmp/.hermes-tui-build.err; then
+  if grep -qiE 'Host version .* does not match binary version' /tmp/.hermes-tui-build.err; then
+    warn "esbuild host/binary skew detected — realigning esbuild and retrying"
+    ( cd "$TUI" && rm -rf node_modules/@esbuild node_modules/esbuild node_modules/.bin/esbuild && npm install ) >/dev/null 2>&1
+    build
+  else
+    cat /tmp/.hermes-tui-build.err >&2
+    warn "TUI build failed"
+    exit 1
+  fi
+fi
+
+# ── Verify the new colors actually shipped in the built bundle ──
+if grep -q 'a6e3a1' "$TUI/dist/entry.js" && grep -q 'f38ba8' "$TUI/dist/entry.js" \
+   && ! grep -q '220,255,220' "$TUI/dist/entry.js"; then
+  log "✓ bundle rebuilt with legible diff colors (a6e3a1 / f38ba8; old pale bg gone)."
+else
+  warn "bundle built but color verification failed — inspect dist/entry.js"
+  exit 1
+fi
+
+log "Done. Exit hermes in each pane and relaunch to pick up the new bundle."

@@ -282,6 +282,21 @@ if [[ -f "$REPO_ROOT/scripts/hermes-wiki" ]]; then
   ok "hermes-wiki → $TARGET_LINK"
 fi
 
+# ── Install hermes-tui-theme-patch on PATH ─────────────────────────────
+# Restores the legible (bright-fg, no pale fill) diff colors in the Hermes
+# Ink TUI and rebuilds the bundle. Re-run after every `hermes update` (which
+# overwrites theme.ts in this editable install); lib/91-hermes-tui-theme.sh
+# also runs it on `hmr`. Idempotent.
+if [[ -f "$REPO_ROOT/scripts/hermes-tui-theme-patch" ]]; then
+  mkdir -p "$HOME/.local/bin"
+  TARGET_LINK="$HOME/.local/bin/hermes-tui-theme-patch"
+  if [[ -L "$TARGET_LINK" || -f "$TARGET_LINK" ]]; then
+    rm -f "$TARGET_LINK"
+  fi
+  ln -s "$REPO_ROOT/scripts/hermes-tui-theme-patch" "$TARGET_LINK"
+  ok "hermes-tui-theme-patch → $TARGET_LINK"
+fi
+
 # ── Install hermes-pane on PATH ────────────────────────────────────────
 # Restart-proof per-pane Hermes launcher for the Ghostty workspace. Stamps
 # each pane with its own --source tag and resumes that pane's own most-recent
