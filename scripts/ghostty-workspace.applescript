@@ -1,6 +1,6 @@
 -- ghostty-workspace.applescript
--- Launch a 2x2 Ghostty grid where each pane SSHes into a named tmux session
--- on a remote host. Requires Ghostty 1.3.0+ (AppleScript support shipped then).
+-- Launch a 3-pane Ghostty layout where each pane SSHes into a named tmux
+-- session on a remote host. Requires Ghostty 1.3.0+ (AppleScript support shipped then).
 --
 -- Defaults assume Dan's primary host. Edit the panes list below to retarget,
 -- rename sessions, or change what each pane runs on first creation.
@@ -10,14 +10,14 @@
 --
 -- Or, save as an Automator/Shortcuts action and bind to a hotkey.
 --
--- Layout (reading top-left to bottom-right):
+-- Layout (reading top-left to bottom):
 --   pane 1 (top-left)     code     →  hermes
 --   pane 2 (top-right)    scratch  →  hermes
---   pane 3 (bottom-left)  logs     →  hermes logs -f  (tails agent.log: API calls,
---                                                     tool calls, conversation activity.
---                                                     For just the gateway daemon's own
---                                                     log: `hermes logs gateway -f`)
---   pane 4 (bottom-right) ops      →  plain root shell
+--   pane 3 (bottom, full) ops      →  plain root shell
+--
+-- The `logs` pane (was bottom-left, `hermes logs -f`) was removed 2026-06 —
+-- Dan never used it. To bring it back, re-add a {"logs","hermes logs -f"}
+-- entry to paneSpecs and a fourth split (see git history for the 2x2 form).
 --
 -- Note: variable names deliberately avoid AppleScript reserved words like
 -- `host`, `name`, `path`, `file`, `command`. Don't rename these to shorter
@@ -75,7 +75,7 @@ end run
 on runWorkspace(targetHost)
 
 -- Per-pane configuration: {session-name, initial-command}.
--- Order is TL, TR, BL, BR. `initial-command` may be empty for "just a shell".
+-- Order is TL, TR, bottom. `initial-command` may be empty for "just a shell".
 -- The initial-command runs in window 0 of the session ONLY on first creation
 -- (via `tmux new -As name <cmd>`); reattaching does not re-run it.
 --
@@ -92,7 +92,6 @@ on runWorkspace(targetHost)
 set paneSpecs to {¬
     {"code",    "hermes-pane code"},        ¬
     {"scratch", "hermes-pane scratch"},     ¬
-    {"logs",    "hermes logs -f"},          ¬
     {"ops",     ""}                         ¬
 }
 
@@ -110,15 +109,11 @@ tell application "Ghostty"
     set command of cfg2 to my specToCmd(targetHost, item 2 of paneSpecs)
     set paneTR to split paneTL direction right with configuration cfg2
 
-    -- Split top-left down → bottom-left pane.
+    -- Split top-left down → bottom pane (ops, full width: splitting the
+    -- top-left when there's no bottom-right keeps the bottom spanning).
     set cfg3 to new surface configuration
     set command of cfg3 to my specToCmd(targetHost, item 3 of paneSpecs)
-    set paneBL to split paneTL direction down with configuration cfg3
-
-    -- Split top-right down → bottom-right pane.
-    set cfg4 to new surface configuration
-    set command of cfg4 to my specToCmd(targetHost, item 4 of paneSpecs)
-    set paneBR to split paneTR direction down with configuration cfg4
+    set paneBottom to split paneTL direction down with configuration cfg3
 
     -- Land focus in the top-left pane by default (code → hermes).
     focus paneTL
