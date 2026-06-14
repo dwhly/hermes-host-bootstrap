@@ -303,42 +303,9 @@ done
 echo ""
 step "Verification"
 
-verify() {
-  local name="$1" cmd="$2"
-  if eval "$cmd" >/dev/null 2>&1; then
-    ok "$name"
-  else
-    warn "$name — not found or failed"
-  fi
-}
-
-verify "git"        "git --version"
-verify "tmux"       "tmux -V"
-verify "tmux-autoattach" "test -f $HOME/.hermes-host-bootstrap.tmux-autoattach.sh && echo present"
-verify "hssh"       "test -f $HOME/.hermes-host-bootstrap.hssh.sh && echo present"
-verify "tmux-workspace-colors" "test -f $HOME/.hermes-host-bootstrap.tmux-workspace-colors.conf && echo present"
-verify "aliases"     "test -f $HOME/.hermes-host-bootstrap.aliases.sh && echo present"
-verify "op"          "op --version 2>&1 | head -1"
-verify "mosh"       "mosh-server --help 2>&1 | head -1"
-verify "neovim"     "nvim --version"
-verify "ripgrep"    "rg --version"
-verify "fzf"        "fzf --version"
-verify "jq"         "jq --version"
-verify "python3"    "python3 --version"
-verify "uv"         "uv --version"
-verify "pipx"       "pipx --version"
-verify "node"       "node --version"
-verify "docker"     "docker --version"
-verify "gh"         "gh --version"
-verify "hermes"     "hermes --version"
-verify "himalaya"   "himalaya --version"
-verify "ffmpeg"     "ffmpeg -version"
-verify "tailscale"  "tailscale version"
-verify "hermes-fleet"   "test -x $HOME/.local/bin/hermes-fleet && $HOME/.local/bin/hermes-fleet --help 2>&1 | head -1"
-verify "hermes-reload"  "test -L $HOME/.local/bin/hermes-reload && echo present"
-verify "hermes-config"  "test -L $HOME/.local/bin/hermes-config && echo present"
-verify "hermes-backlog" "test -L $HOME/.local/bin/hermes-backlog && echo present"
-verify "hermes-wiki"    "test -L $HOME/.local/bin/hermes-wiki && echo present"
+# shellcheck disable=SC1091
+source "$REPO_ROOT/verify.sh"
+verify_human
 
 echo ""
 ok "Bootstrap finished. Next steps:"
