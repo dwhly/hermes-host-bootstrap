@@ -282,6 +282,22 @@ if [[ -f "$REPO_ROOT/scripts/hermes-wiki" ]]; then
   ok "hermes-wiki → $TARGET_LINK"
 fi
 
+# ── Install hermes-pane on PATH ────────────────────────────────────────
+# Restart-proof per-pane Hermes launcher for the Ghostty workspace. Stamps
+# each pane with its own --source tag and resumes that pane's own most-recent
+# session, so a `hermes update` (which forces a hermes restart) no longer
+# orphans the pane into a fresh empty session. Used by
+# scripts/ghostty-workspace.applescript as each pane's initial command.
+if [[ -f "$REPO_ROOT/scripts/hermes-pane" ]]; then
+  mkdir -p "$HOME/.local/bin"
+  TARGET_LINK="$HOME/.local/bin/hermes-pane"
+  if [[ -L "$TARGET_LINK" || -f "$TARGET_LINK" ]]; then
+    rm -f "$TARGET_LINK"
+  fi
+  ln -s "$REPO_ROOT/scripts/hermes-pane" "$TARGET_LINK"
+  ok "hermes-pane → $TARGET_LINK"
+fi
+
 # Helpful hint for the user: if ~/.hermes is git-tracked (the typical
 # hermes-config-sync setup), nudge them to commit the snapshot.
 if [[ -d "${HERMES_HOME:-$HOME/.hermes}/.git" ]]; then

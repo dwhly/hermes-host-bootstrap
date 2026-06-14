@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# scripts/hermes-pane — restart-proof Hermes launcher for a named workspace pane.
+#
+# Symlinked to ~/.local/bin/hermes-pane by lib/99-register-host.sh.
+# Used by the Ghostty workspace launcher (scripts/ghostty-workspace.applescript)
+# as each pane's initial command, e.g. `hermes-pane code`.
+#
+# THE PROBLEM IT SOLVES
+#   The workspace launcher historically ran bare `hermes` in each pane. That
+#   gives continuity only via tmux *persistence* (the session never died), NOT
+#   via session resume. So a `hermes update` — which requires exiting hermes to
+#   pick up the new binary — ends the tmux session and the next `hmw` starts a
+#   brand-new EMPTY session. Your transcript is still in ~/.hermes/state.db, but
+#   you'd have to hand-resume every pane with `hermes -r <id>`.
+#
+# WHY NOT JUST `hermes --continue`
+#   Two verified failure modes on a busy shared box (h-do1 runs the gateway +
+#   several concurrent CLI sessions + nightly cron sessions):
+#     1. Bare `hermes -c` resumes the GLOBAL most-recent session. With multiple
+#        panes (code, scratch) both doing `-c`, they race for the same session.
+#     2. `hermes -c <name>` resolves by TITLE, but a fresh session has no title
+#        until its first message — and there is no launch flag to pre-title one.
+#        So `-c code` exits 1 on first-ever launch and the pane falls to a bare
+#        shell with no hermes at all.
+#
+# THE FIX
+#   Stamp each pane with its own source tag (`--source pane:<label>`). The
+#   session store records the tag per session, so we can resolve THIS pane's
+#   own most-recent session unambiguously — no global race, and it simply
+#   resolves to "nothing yet" on first launch (→ fresh session, no error).
+#   `hermes update` never touches state.db, so resume-by-id is lossless.
+#
+# USAGE
+#   hermes-pane <label> [initial-cmd-if-fresh ...]
+#     <label>            pane name / source suffix (code, scratch, ...)
+#     initial-cmd        IGNORED for resume; reserved for future use. The
+#                        wrapper always launches an interactive hermes.
+#
+# BEHAVIOR
+#   - Resolves the most-recent session id for source `pane:<label>`.
+#   - If found  → hermes chat --source pane:<label> --resume <id>
+#   - If none   → hermes chat --source pane:<label>   (fresh, tagged)
+#   - When hermes exits, drops to an interactive shell (`exec $SHELL`) so the
+#     tmux session/pane survives instead of closing. Reopen the workspace
+#     (after `hermes update`, kill the code/scratch tmux sessions first so the
+#     wrapper re-runs) and each pane auto-resumes its own last session.
+
+set -uo pipefail
+
+LABEL="${1:-scratch}"
+SOURCE_TAG="pane:${LABEL}"
+
+# Locate hermes on PATH (portable across hosts — no hardcoded venv path).
+HERMES_BIN="$(command -v hermes || true)"
+if [[ -z "$HERMES_BIN" ]]; then
+  echo "hermes-pane: 'hermes' not found on PATH" >&2
+  exec "${SHELL:-/bin/bash}"
+fi
+
+# Find the hermes venv interpreter + project root so we can import the session
+# store. The `hermes` on PATH is usually a tiny launcher shim that execs the
+# real venv binary (e.g. /usr/local/bin/hermes -> .../hermes-agent/venv/bin/hermes,
+# or ~/.local/bin/hermes on the Macs). Parse the shim to locate the venv, then
+# derive the project root (where hermes_state.py lives). Falls back gracefully.
+resolve_hermes_internals() {
+  local shim real venv_hermes
+  shim="$HERMES_BIN"
+  # Follow a one-line `exec "<path>/venv/bin/hermes"` shim if present.
+  venv_hermes="$(grep -oE '"[^"]*venv/bin/hermes"' "$shim" 2>/dev/null | head -1 | tr -d '"')"
+  if [[ -z "$venv_hermes" ]]; then
+    # Not a shim (or unexpected form) — assume the bin itself lives in the venv.
+    real="$(readlink -f "$shim" 2>/dev/null || echo "$shim")"
+    venv_hermes="$real"
+  fi
+  HERMES_VENV_PY="$(dirname "$venv_hermes")/python3"
+  # project root = three levels up from venv/bin/hermes  (… /<root>/venv/bin/hermes)
+  HERMES_PROOT="$(dirname "$(dirname "$(dirname "$venv_hermes")")")"
+}
+
+# Resolve this pane's most-recent session id via the session store. We query
+# the DB directly (SessionDB.search_sessions is ordered most-recent-first);
+# the `sessions list` TABLE is NOT reliably recency-ordered, so don't parse it.
+resolve_last_session() {
+  [[ -x "${HERMES_VENV_PY:-}" && -f "${HERMES_PROOT:-}/hermes_state.py" ]] || return 0
+  ( cd "$HERMES_PROOT" && "$HERMES_VENV_PY" - "$SOURCE_TAG" <<'PY' 2>/dev/null
+import sys
+try:
+    from hermes_state import SessionDB
+except Exception:
+    sys.exit(0)
+src = sys.argv[1]
+try:
+    db = SessionDB()
+    rows = db.search_sessions(source=src, limit=1)
+    if rows:
+        print(rows[0]["id"])
+    try:
+        db.close()
+    except Exception:
+        pass
+except Exception:
+    sys.exit(0)
+PY
+  )
+}
+
+resolve_hermes_internals
+LAST_ID="$(resolve_last_session)"
+
+if [[ -n "${LAST_ID:-}" ]]; then
+  echo "hermes-pane[$LABEL]: resuming session $LAST_ID"
+  "$HERMES_BIN" chat --source "$SOURCE_TAG" --resume "$LAST_ID"
+else
+  echo "hermes-pane[$LABEL]: no prior session for source '$SOURCE_TAG' — starting fresh"
+  "$HERMES_BIN" chat --source "$SOURCE_TAG"
+fi
+
+# Hermes has exited. Keep the pane alive so the tmux session survives a
+# `hermes update` restart; reopening the workspace re-runs this wrapper.
+echo
+echo "hermes-pane[$LABEL]: hermes exited. Dropping to a shell (tmux session preserved)."
+echo "  Re-launch this pane's hermes with:  hermes-pane $LABEL"
+exec "${SHELL:-/bin/bash}"

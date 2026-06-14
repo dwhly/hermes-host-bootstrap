@@ -78,9 +78,20 @@ on runWorkspace(targetHost)
 -- Order is TL, TR, BL, BR. `initial-command` may be empty for "just a shell".
 -- The initial-command runs in window 0 of the session ONLY on first creation
 -- (via `tmux new -As name <cmd>`); reattaching does not re-run it.
+--
+-- code / scratch use `hermes-pane <label>` instead of bare `hermes`. That
+-- wrapper (scripts/hermes-pane, symlinked to ~/.local/bin by the bootstrap)
+-- makes the pane RESTART-PROOF: it stamps the session with `--source
+-- pane:<label>` and resumes that pane's own most-recent session, so a
+-- `hermes update` (which forces exiting hermes to pick up the new binary)
+-- no longer drops the pane into a fresh empty session. On hermes exit the
+-- wrapper falls to an interactive shell, so the tmux session survives. See
+-- the tmux-workspace-pattern skill's continuity section for the full rationale
+-- (bare `hermes --continue` is NOT safe here: it races across panes for the
+-- global most-recent session and errors on first launch).
 set paneSpecs to {¬
-    {"code",    "hermes"},                  ¬
-    {"scratch", "hermes"},                  ¬
+    {"code",    "hermes-pane code"},        ¬
+    {"scratch", "hermes-pane scratch"},     ¬
     {"logs",    "hermes logs -f"},          ¬
     {"ops",     ""}                         ¬
 }
