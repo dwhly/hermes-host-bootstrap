@@ -12,36 +12,68 @@ from hermes_converger import core
 KEY = b"test-plan-key"
 NODE = "h-do1"
 NOW = dt.datetime(2026, 6, 19, 0, 0, 0, tzinfo=dt.UTC)
+FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
 
-def make_plan(**overrides):
-    plan = {
-        "desired_id": "des_01",
-        "node_id": NODE,
-        "artifact": "hermes-node",
-        "apply_mode": "restart_required",
-        "target_ref": "abc1234",
-        "issued_at": (NOW - dt.timedelta(seconds=10)).isoformat().replace("+00:00", "Z"),
-        "affected_processes": ["chief-node.service"],
-        "restart_units": ["chief-node.service"],
-        "convergence_id": "cnv_01",
-    }
-    plan.update(overrides)
+def refresh_plan_auth(plan):
+    auth = plan["auth"][0]
     plan["plan_digest"] = core.sha256_digest(core.canonical_json(core.plan_digest_payload(plan)))
-    plan["signature"] = {
+    auth["plan_digest"] = plan["plan_digest"]
+    auth["signature"] = {
         "alg": "HMAC-SHA256",
         "key_id": f"node:{NODE}:plan-v1",
-        "value": core.sign_plan_fields(plan, KEY),
+        "value": core.sign_plan_fields(auth, KEY),
     }
     return plan
+
+
+def make_plan(**row_overrides):
+    issued_at = row_overrides.pop("issued_at", (NOW - dt.timedelta(seconds=10)).isoformat().replace("+00:00", "Z"))
+    plan = {
+        "node_id": NODE,
+        "issued_at": issued_at,
+        "desired": [
+            {
+                "desired_id": "des_01",
+                "node_id": NODE,
+                "artifact": "hermes-node",
+                "apply_mode": "restart_required",
+                "target_ref": "abc1234",
+                "target": {"ref": "abc1234", "kind": "git", "repo": "hermes-node", "source": "test"},
+                "allowed_executor_action": "converge",
+                "current_fold": {},
+            }
+        ],
+        "plan_digest": None,
+        "auth": [
+            {
+                "desired_id": "des_01",
+                "node_id": NODE,
+                "target_ref": "abc1234",
+                "plan_digest": None,
+                "issued_at": issued_at,
+                "signature": None,
+            }
+        ],
+        "signature": None,
+    }
+    row = plan["desired"][0]
+    row.update(row_overrides)
+    if "target_ref" in row_overrides:
+        row["target"] = {**row.get("target", {}), "ref": row["target_ref"]}
+    auth = plan["auth"][0]
+    auth["desired_id"] = row["desired_id"]
+    auth["node_id"] = row["node_id"]
+    auth["target_ref"] = row["target_ref"]
+    return refresh_plan_auth(plan)
 
 
 def lookup(key_id):
     return KEY if key_id == f"node:{NODE}:plan-v1" else None
 
 
-def verify(plan, watermarks=None):
-    return core.verify_plan(plan, node_id=NODE, key_lookup=lookup, watermarks=watermarks or {}, now=NOW)
+def verify(plan, watermarks=None, target_artifact=None):
+    return core.verify_plan(plan, node_id=NODE, key_lookup=lookup, watermarks=watermarks or {}, now=NOW, target_artifact=target_artifact)
 
 
 def valid_idle_snapshot(**overrides):
@@ -82,20 +114,19 @@ def fresh_idle_snapshot(**overrides):
 @pytest.mark.parametrize(
     "mutate,reason",
     [
-        (lambda p: p["signature"].update(value="AAAA"), "bad_signature"),
-        (lambda p: p.update(issued_at=(NOW - dt.timedelta(seconds=600)).isoformat().replace("+00:00", "Z")), "stale_plan"),
-        (lambda p: p.update(issued_at=(NOW + dt.timedelta(seconds=61)).isoformat().replace("+00:00", "Z")), "future_plan"),
-        (lambda p: p.update(target_ref="changed-after-digest"), "plan_digest_mismatch"),
-        (lambda p: p["signature"].update(key_id="node:h-do1:plan-v2"), "unknown_key_id"),
-        (lambda p: p.update(artifact="unknown"), "artifact_not_allowlisted:unknown"),
+        (lambda p: p["auth"][0]["signature"].update(value="AAAA"), "bad_signature"),
+        (lambda p: p["auth"][0].update(issued_at=(NOW - dt.timedelta(seconds=600)).isoformat().replace("+00:00", "Z")), "stale_plan"),
+        (lambda p: p["auth"][0].update(issued_at=(NOW + dt.timedelta(seconds=61)).isoformat().replace("+00:00", "Z")), "future_plan"),
+        (lambda p: p["desired"][0].update(target_ref="changed-after-digest"), "plan_digest_mismatch"),
+        (lambda p: p["auth"][0]["signature"].update(key_id="node:h-do1:plan-v2"), "unknown_key_id"),
+        (lambda p: p["desired"][0].update(artifact="unknown"), "artifact_not_allowlisted:unknown"),
     ],
 )
 def test_plan_verification_rejects_failure_modes(mutate, reason):
     plan = make_plan()
     mutate(plan)
     if reason not in {"bad_signature", "plan_digest_mismatch", "unknown_key_id"}:
-        plan["plan_digest"] = core.sha256_digest(core.canonical_json(core.plan_digest_payload(plan)))
-        plan["signature"]["value"] = core.sign_plan_fields(plan, KEY)
+        refresh_plan_auth(plan)
     with pytest.raises(core.VerificationError, match=reason):
         verify(plan)
 
@@ -118,14 +149,86 @@ def test_replay_below_watermark_rejected_unless_identical_current():
     identical_mark = {
         NODE: {
             "hermes-node": {
-                "desired_id": current["desired_id"],
-                "target_ref": current["target_ref"],
-                "issued_at": current["issued_at"],
-                "plan_digest": current["plan_digest"],
+                "desired_id": current["desired"][0]["desired_id"],
+                "target_ref": current["desired"][0]["target_ref"],
+                "issued_at": current["auth"][0]["issued_at"],
+                "plan_digest": current["auth"][0]["plan_digest"],
             }
         }
     }
-    assert verify(current, identical_mark).raw["target_ref"] == current["target_ref"]
+    assert verify(current, identical_mark).raw["target_ref"] == current["desired"][0]["target_ref"]
+
+
+def test_live_shape_verifies_and_selects_single_desired_row():
+    plan = make_plan()
+    verified = verify(plan)
+    assert verified.artifact == "hermes-node"
+    assert verified.raw["desired_id"] == "des_01"
+    assert verified.raw["target_ref"] == "abc1234"
+    assert verified.restart_units == ("chief-node.service",)
+    assert verified.affected_processes == ("chief-node.service",)
+
+
+def test_multi_desired_requires_target_artifact_and_selects_matching_row():
+    plan = make_plan()
+    harness = {
+        **plan["desired"][0],
+        "desired_id": "des_02",
+        "artifact": "harness",
+        "target_ref": "def5678",
+        "target": {"ref": "def5678", "kind": "git", "repo": "harness", "source": "test"},
+    }
+    plan["desired"].append(harness)
+    plan["auth"].append(
+        {
+            "desired_id": "des_02",
+            "node_id": NODE,
+            "target_ref": "def5678",
+            "plan_digest": None,
+            "issued_at": plan["auth"][0]["issued_at"],
+            "signature": None,
+        }
+    )
+    refresh_plan_auth(plan)
+    plan["auth"][1]["plan_digest"] = plan["plan_digest"]
+    plan["auth"][1]["signature"] = {
+        "alg": "HMAC-SHA256",
+        "key_id": f"node:{NODE}:plan-v1",
+        "value": core.sign_plan_fields(plan["auth"][1], KEY),
+    }
+
+    with pytest.raises(core.VerificationError, match="artifact_required_for_multi_desired_plan"):
+        verify(plan)
+
+    verified = verify(plan, target_artifact="harness")
+    assert verified.artifact == "harness"
+    assert verified.restart_units == ("chief-loop-watchdog.service",)
+
+
+def test_missing_or_mismatched_auth_entry_rejected_fail_closed():
+    plan = make_plan()
+    plan["auth"] = []
+    with pytest.raises(core.VerificationError, match="auth_missing_for_desired:des_01"):
+        verify(plan)
+
+    plan = make_plan()
+    plan["auth"][0]["target_ref"] = "def5678"
+    plan["auth"][0]["signature"]["value"] = core.sign_plan_fields(plan["auth"][0], KEY)
+    with pytest.raises(core.VerificationError, match="auth_target_ref_mismatch"):
+        verify(plan)
+
+
+def test_captured_live_fixture_shape_verifies_after_resigning_current_auth():
+    plan = json.loads((FIXTURES / "cv_plan3.json").read_text())
+    issued_at = (NOW - dt.timedelta(seconds=10)).isoformat().replace("+00:00", "Z")
+    plan["issued_at"] = issued_at
+    plan["auth"][0]["issued_at"] = issued_at
+    refresh_plan_auth(plan)
+
+    verified = verify(plan, target_artifact="hermes-node")
+    assert verified.artifact == "hermes-node"
+    assert verified.raw["desired_id"] == "des_6c6b2517eadb"
+    assert verified.raw["target_ref"] == "d4dddc1890eb9e5b68f71c59e35ce7eec03721a2"
 
 
 @pytest.mark.parametrize(
@@ -270,7 +373,7 @@ class DummyTransport:
         pass
 
 
-def test_reload_target_not_allowlisted_rejected_before_signal(tmp_path, monkeypatch):
+def test_plan_supplied_reload_targets_are_ignored_for_fixed_artifact_map(tmp_path, monkeypatch):
     plan = make_plan(
         artifact="config",
         apply_mode="live_patch",
@@ -283,11 +386,12 @@ def test_reload_target_not_allowlisted_rejected_before_signal(tmp_path, monkeypa
     calls = []
     monkeypatch.setattr(core.subprocess, "run", lambda cmd, *a, **kw: calls.append(cmd))
 
-    with pytest.raises(core.ConvergerError, match="reload_target_not_allowlisted:not-allowed.service"):
-        ops.record_reload_and_signal(verified)
+    ops.record_reload_and_signal(verified)
 
-    assert calls == []
-    assert not (tmp_path / "var/lib/chief/converger/reload-signal-times.json").exists()
+    assert calls == [["systemctl", "kill", "-s", "HUP", "chief-node.service"]]
+    data = json.loads((tmp_path / "var/lib/chief/converger/reload-signal-times.json").read_text())
+    assert set(data) == {"chief-node.service"}
+    assert set(data["chief-node.service"]) == {"config"}
 
 
 class BusyInsideOps:

@@ -26,6 +26,14 @@ ALLOWLIST = {"chief", "hermes-node", "harness", "config", "remits", "theme"}
 LIVE_PATCH = {"config", "remits", "theme"}
 RESTART_REQUIRED = {"chief", "hermes-node", "harness"}
 SUPERVISED_PROCESS_ALLOWLIST = {"chief-node.service", "chief-loop-watchdog.service", "chief-stack-core-1"}
+ARTIFACT_PROCESS_MAP = {
+    "chief": (("chief-stack-core-1",), ("chief-stack-core-1",)),
+    "hermes-node": (("chief-node.service",), ("chief-node.service",)),
+    "harness": (("chief-loop-watchdog.service",), ("chief-loop-watchdog.service",)),
+    "config": (tuple(), ("chief-node.service",)),
+    "remits": (tuple(), ("chief-node.service",)),
+    "theme": (tuple(), ("chief-node.service",)),
+}
 GIT_REF_RE = re.compile(r"^[0-9a-f]{7,40}$")
 DEFAULT_FRESHNESS_S = 600
 MAX_FUTURE_S = 60
@@ -77,6 +85,7 @@ def canonical_json(data: Any) -> bytes:
 
 def plan_digest_payload(plan: dict[str, Any]) -> dict[str, Any]:
     payload = dict(plan)
+    payload.pop("auth", None)
     payload.pop("signature", None)
     payload.pop("plan_digest", None)
     return payload
@@ -108,6 +117,49 @@ def sign_plan_fields(plan: dict[str, Any], key: bytes) -> str:
     return b64url_encode(hmac.new(key, msg, hashlib.sha256).digest())
 
 
+def select_desired_row(plan: dict[str, Any], target_artifact: str | None = None) -> dict[str, Any]:
+    desired = plan.get("desired")
+    if not isinstance(desired, list) or not desired:
+        raise VerificationError("desired_missing")
+    rows = [row for row in desired if isinstance(row, dict)]
+    if len(rows) != len(desired):
+        raise VerificationError("desired_malformed")
+    if target_artifact:
+        matches = [row for row in rows if str(row.get("artifact", "")) == target_artifact]
+        if not matches:
+            raise VerificationError(f"desired_artifact_not_found:{target_artifact}")
+        if len(matches) > 1:
+            raise VerificationError(f"desired_artifact_ambiguous:{target_artifact}")
+        return matches[0]
+    if len(rows) != 1:
+        raise VerificationError("artifact_required_for_multi_desired_plan")
+    return rows[0]
+
+
+def auth_for_desired(plan: dict[str, Any], desired_id: str) -> dict[str, Any]:
+    auth = plan.get("auth")
+    if not isinstance(auth, list):
+        raise VerificationError("auth_missing")
+    matches = [entry for entry in auth if isinstance(entry, dict) and str(entry.get("desired_id", "")) == desired_id]
+    if not matches:
+        raise VerificationError(f"auth_missing_for_desired:{desired_id}")
+    if len(matches) > 1:
+        raise VerificationError(f"auth_ambiguous_for_desired:{desired_id}")
+    return matches[0]
+
+
+def fixed_artifact_processes(artifact: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    try:
+        restart_units, affected = ARTIFACT_PROCESS_MAP[artifact]
+    except KeyError as exc:
+        raise VerificationError(f"artifact_not_allowlisted:{artifact}") from exc
+    for unit in restart_units:
+        validate_supervised_process(unit, action="restart_unit")
+    for process in affected:
+        validate_supervised_process(process, action="reload_target")
+    return restart_units, affected
+
+
 @dataclasses.dataclass(frozen=True)
 class VerifiedPlan:
     raw: dict[str, Any]
@@ -124,15 +176,21 @@ def verify_plan(
     key_lookup: Callable[[str], bytes | None],
     watermarks: dict[str, Any] | None = None,
     now: dt.datetime | None = None,
+    target_artifact: str | None = None,
 ) -> VerifiedPlan:
     now = now or utcnow()
-    artifact = str(plan.get("artifact", ""))
+    desired = select_desired_row(plan, target_artifact)
+    artifact = str(desired.get("artifact", ""))
     if artifact not in ALLOWLIST:
         raise VerificationError(f"artifact_not_allowlisted:{artifact}")
     if str(plan.get("node_id", "")) != node_id:
         raise VerificationError("node_id_mismatch")
+    if str(desired.get("node_id", "")) != node_id:
+        raise VerificationError("node_id_mismatch")
+    if str(desired.get("allowed_executor_action", "")) != "converge":
+        raise VerificationError("executor_action_mismatch")
 
-    apply_mode = str(plan.get("apply_mode", ""))
+    apply_mode = str(desired.get("apply_mode", ""))
     if artifact in LIVE_PATCH and apply_mode != "live_patch":
         raise VerificationError("apply_mode_mismatch")
     if artifact in RESTART_REQUIRED and apply_mode != "restart_required":
@@ -142,7 +200,16 @@ def verify_plan(
     if plan.get("plan_digest") != expected_digest:
         raise VerificationError("plan_digest_mismatch")
 
-    sig = plan.get("signature") or {}
+    desired_id = str(desired.get("desired_id", ""))
+    auth = auth_for_desired(plan, desired_id)
+    if str(auth.get("target_ref", "")) != str(desired.get("target_ref", "")):
+        raise VerificationError("auth_target_ref_mismatch")
+    if str(auth.get("node_id", "")) != node_id:
+        raise VerificationError("auth_node_id_mismatch")
+    if str(auth.get("plan_digest", "")) != expected_digest:
+        raise VerificationError("auth_plan_digest_mismatch")
+
+    sig = auth.get("signature") or {}
     if sig.get("alg") != "HMAC-SHA256":
         raise VerificationError("signature_alg_mismatch")
     key_id = str(sig.get("key_id", ""))
@@ -152,11 +219,23 @@ def verify_plan(
     expected_key_id = f"node:{node_id}:plan-v1"
     if key_id != expected_key_id:
         raise VerificationError("unknown_key_id")
-    expected_sig = sign_plan_fields(plan, key)
-    if not hmac.compare_digest(b64url_decode(str(sig.get("value", ""))), b64url_decode(expected_sig)):
+    auth_fields = {
+        "desired_id": desired_id,
+        "target_ref": str(auth.get("target_ref", "")),
+        "plan_digest": str(auth.get("plan_digest", "")),
+        "issued_at": str(auth.get("issued_at", "")),
+        "node_id": str(auth.get("node_id", "")),
+    }
+    expected_sig = sign_plan_fields(auth_fields, key)
+    try:
+        actual_sig = b64url_decode(str(sig.get("value", "")))
+        expected_sig_bytes = b64url_decode(expected_sig)
+    except Exception as exc:
+        raise VerificationError("bad_signature") from exc
+    if not hmac.compare_digest(actual_sig, expected_sig_bytes):
         raise VerificationError("bad_signature")
 
-    issued_at = parse_time(str(plan["issued_at"]))
+    issued_at = parse_time(str(auth["issued_at"]))
     age = (now - issued_at).total_seconds()
     future = (issued_at - now).total_seconds()
     if age >= DEFAULT_FRESHNESS_S:
@@ -168,16 +247,19 @@ def verify_plan(
     if mark:
         mark_time = parse_time(str(mark["issued_at"]))
         identical_current = (
-            plan.get("desired_id") == mark.get("desired_id")
-            and plan.get("target_ref") == mark.get("target_ref")
-            and plan.get("plan_digest") == mark.get("plan_digest")
+            desired_id == mark.get("desired_id")
+            and desired.get("target_ref") == mark.get("target_ref")
+            and auth.get("plan_digest") == mark.get("plan_digest")
         )
         if issued_at <= mark_time and not identical_current:
             raise VerificationError("replay_below_watermark")
 
-    restart_units = tuple(str(u) for u in plan.get("restart_units", []) if u)
-    affected = tuple(str(p) for p in plan.get("affected_processes", restart_units) if p)
-    return VerifiedPlan(plan, artifact, apply_mode, affected, restart_units)
+    restart_units, affected = fixed_artifact_processes(artifact)
+    raw = dict(desired)
+    raw["issued_at"] = str(auth["issued_at"])
+    raw["plan_digest"] = str(auth["plan_digest"])
+    raw["node_id"] = node_id
+    return VerifiedPlan(raw, artifact, apply_mode, affected, restart_units)
 
 
 def validate_supervised_process(target: str, *, action: str) -> None:
@@ -658,6 +740,7 @@ def converge(args: argparse.Namespace, reconcile_mode: bool = False) -> int:
         node_id=args.node_id,
         key_lookup=default_key_lookup(args.node_id, pathlib.Path(args.plan_key_path)),
         watermarks=state.load_watermarks(),
+        target_artifact=getattr(args, "target_artifact", None),
     )
     idle = evaluate_idle(idle_snapshot) if verified.apply_mode == "restart_required" else None
     if args.plan_only:
@@ -677,8 +760,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plan-only", "--dry-run", action="store_true")
     parser.add_argument("--plan-file")
     parser.add_argument("--idle-snapshot")
+    parser.add_argument("--artifact", dest="target_artifact")
     sub = parser.add_subparsers(dest="command")
-    sub.add_parser("converge")
+    conv = sub.add_parser("converge")
+    conv.add_argument("--artifact", dest="target_artifact", default=argparse.SUPPRESS)
     rec = sub.add_parser("reconcile")
     rec.add_argument("--trigger", choices=["boot", "daemon-start"], required=True)
     return parser
