@@ -65,9 +65,13 @@ ok "wrote read-only fleet git credentials to $CRED_FILE (0600)"
 
 # Configure git to use that credential file ONLY for github.com (dwhly).
 # Using a path-scoped credential helper keeps it from being offered elsewhere.
-git config --global "credential.https://github.com.helper" "store --file=$CRED_FILE"
-# Make sure we don't accidentally also have a conflicting helper earlier in the
-# chain that would shadow this (idempotent: only set, never blindly append).
+# Reset the per-URL helper list FIRST with an empty value, so our store helper
+# does not CHAIN behind a global helper (e.g. macOS osxkeychain, which emits a
+# harmless but noisy "failed to store: -25308" when it can't cache the creds).
+# An empty string clears inherited helpers for this URL; then we set ours.
+git config --global --unset-all "credential.https://github.com.helper" 2>/dev/null || true
+git config --global --add "credential.https://github.com.helper" ""
+git config --global --add "credential.https://github.com.helper" "store --file=$CRED_FILE"
 ok "configured git credential.https://github.com.helper -> store($CRED_FILE)"
 
 # Verify read access to one canonical repo without printing the token.
