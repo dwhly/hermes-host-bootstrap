@@ -53,14 +53,14 @@ register_one() {
     return 0
   fi
   local tgt; tgt="$(resolve_ssh "$host")" || return $?
-  if ! ssh -o ConnectTimeout=10 "$tgt" 'true' 2>/dev/null; then
+  if ! ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$tgt" 'true' 2>/dev/null; then
     err "$host" "unreachable over tailnet ($tgt) — skip; re-run when online"
     return 1
   fi
   log "$host" "pulling plan key from $tgt:~/.hermes/node-plan.key"
   mkdir -p "$KEY_DIR"; umask 077
   # Pull the user-readable copy; strip any trailing newline to match core's raw read.
-  if ssh -o ConnectTimeout=10 "$tgt" 'cat ~/.hermes/node-plan.key' 2>/dev/null \
+  if ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$tgt" 'cat ~/.hermes/node-plan.key' 2>/dev/null \
        | tr -d '\n' > "$KEY_DIR/$host.key" && [[ -s "$KEY_DIR/$host.key" ]]; then
     chmod 600 "$KEY_DIR/$host.key"
     log "$host" "✓ registered $KEY_DIR/$host.key ($(wc -c < "$KEY_DIR/$host.key") bytes)"
