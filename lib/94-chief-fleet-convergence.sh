@@ -57,6 +57,21 @@ PY
     sudo chown root:chief /etc/chief/node-plan.key
     sudo chmod 0640 /etc/chief/node-plan.key
   fi
+  # Drop a user-readable copy for the control hub to PULL during provisioning.
+  # The fleet key handshake is OPERATOR-PULL (control hub -> node over the tailnet
+  # SSH it already has), NOT node-push-into-core. This copy is the ONLY thing the
+  # puller reads; it carries the same bytes as /etc/chief/node-plan.key with no
+  # trailing newline. 0600, owned by the SSH/login user. register-node-key on the
+  # hub copies it into core's CHIEF_NODE_PLAN_SECRET_DIR as <node_id>.key.
+  local luser="${SUDO_USER:-$(id -un)}"
+  local lhome; lhome="$(eval echo "~${luser}")"
+  if [[ -n "$lhome" && -d "$lhome" ]]; then
+    sudo install -d -m 0700 -o "$luser" "$lhome/.hermes" 2>/dev/null || mkdir -p "$lhome/.hermes"
+    sudo cat /etc/chief/node-plan.key | sudo tee "$lhome/.hermes/node-plan.key" >/dev/null
+    sudo chown "$luser" "$lhome/.hermes/node-plan.key"
+    sudo chmod 0600 "$lhome/.hermes/node-plan.key"
+    ok "wrote operator-pull copy: $lhome/.hermes/node-plan.key (0600, $luser)"
+  fi
 }
 
 # Scoped, passwordless sudo for the two convergence executors so they can run
@@ -85,39 +100,14 @@ install_sudoers() {
   rm -f "$tmp"
 }
 
-# Deposit this node's plan key into core's key directory so core can verify the
-# signed plans this node will receive — WITHOUT a manual per-node env var. Core
-# is configured with CHIEF_NODE_PLAN_SECRET_DIR and reads <dir>/<node_id>.key.
-# We ship the key host-to-host over the node->core SSH channel (CHIEF_CORE_SSH,
-# default root@<core-ip>) so the secret never transits a human/clipboard.
-# Best-effort + loud on failure: convergence simply stays fail-closed (plan
-# endpoint 403) until the key is registered, so a miss is safe, not silent-bad.
-register_plan_key_with_core() {
-  local core_ssh="${CHIEF_CORE_SSH:-}"
-  if [[ -z "$core_ssh" ]]; then
-    # Derive from core_url host if not explicitly set.
-    local core_host; core_host="$(printf '%s' "$core_url" | sed -E 's#https?://##; s#[:/].*##')"
-    [[ -n "$core_host" ]] && core_ssh="root@${core_host}"
-  fi
-  local keydir="${CHIEF_CORE_KEY_DIR:-/run/chief/node-keys}"
-  if [[ -z "$core_ssh" ]]; then
-    warn "CHIEF_CORE_SSH not set and could not derive — skipping key registration"
-    warn "  Manually: copy /etc/chief/node-plan.key to core ${keydir}/${node_id}.key (root:root 0600)"
-    return 0
-  fi
-  info "registering plan key with core ($core_ssh:${keydir}/${node_id}.key)"
-  # Read the key locally (we have root here) and pipe over SSH; never printed.
-  if sudo cat /etc/chief/node-plan.key \
-       | ssh -o ConnectTimeout=10 -o BatchMode=yes "$core_ssh" \
-           "mkdir -p '${keydir}' && umask 077 && cat > '${keydir}/${node_id}.key' && chmod 600 '${keydir}/${node_id}.key' && echo registered" \
-       2>/dev/null | grep -q registered; then
-    ok "plan key registered with core for $node_id"
-  else
-    warn "could not register plan key with core via $core_ssh (host-key/auth?)."
-    warn "  Convergence will be fail-closed (plan 403) until you register it. Manually:"
-    warn "  sudo cat /etc/chief/node-plan.key | ssh $core_ssh \"umask 077; cat > ${keydir}/${node_id}.key\""
-  fi
-}
+# NOTE: key registration is OPERATOR-PULL, not node-push. The node only writes a
+# user-readable copy of its plan key (see provision_plan_key). The control hub
+# (h-do1, where core runs) pulls it over the tailnet SSH it already has and
+# deposits it into core's CHIEF_NODE_PLAN_SECRET_DIR — via `register-node-key
+# <host>` (folded into deploy-node.sh). This keeps a single trust direction
+# (hub -> node, already required for deploys), needs no node->core inbound trust,
+# and works identically on every OS. Until the hub pulls the key, convergence is
+# fail-closed (plan endpoint 403) — safe, not silent-bad.
 
 write_node_env() {
   tmp="$(mktemp)"
@@ -183,6 +173,6 @@ write_node_env
 install_supervisor_allowlist
 install_systemd_units
 install_launchd_plists
-register_plan_key_with_core
 
 ok "Chief fleet convergence installed"
+ok "Next (on the control hub): register-node-key ${node_id}   # pulls the key into core"
