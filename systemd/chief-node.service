@@ -1,0 +1,21 @@
+[Unit]
+Description=Chief node daemon
+Wants=network-online.target
+After=network-online.target chief-node-reconcile.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/chief/node.env
+WorkingDirectory=/root/code/chief/hermes-node
+ExecStart=/root/code/chief/hermes-node/.venv/bin/python -m hermes_node.daemon run --node-id ${CHIEF_NODE_ID} --core ${CHIEF_CORE_URL} --interval 60
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=75
+User=root
+Group=chief
+
+[Install]
+WantedBy=multi-user.target
+

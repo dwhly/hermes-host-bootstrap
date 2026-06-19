@@ -1,0 +1,16 @@
+[Unit]
+Description=Chief node boot reconcile
+Wants=network-online.target
+After=network-online.target docker.service
+Before=chief-node.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/chief/node.env
+ExecStart=/usr/local/bin/hermes-converger --node-id ${CHIEF_NODE_ID} --core ${CHIEF_CORE_URL} reconcile --trigger boot
+User=root
+Group=chief
+
+[Install]
+WantedBy=multi-user.target
+

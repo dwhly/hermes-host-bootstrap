@@ -1,0 +1,20 @@
+[Unit]
+Description=Chief node convergence executor
+Wants=network-online.target
+After=network-online.target docker.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/chief/node.env
+ExecStart=/usr/local/bin/hermes-converger --node-id ${CHIEF_NODE_ID} --core ${CHIEF_CORE_URL} converge
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=75
+User=root
+Group=chief
+
+[Install]
+WantedBy=multi-user.target
+

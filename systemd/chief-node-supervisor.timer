@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Chief node supervisor every 15 seconds
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=15s
+AccuracySec=1s
+Unit=chief-node-supervisor.service
+
+[Install]
+WantedBy=timers.target
+

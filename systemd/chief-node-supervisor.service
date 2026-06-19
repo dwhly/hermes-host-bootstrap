@@ -1,0 +1,20 @@
+[Unit]
+Description=Chief node supervisor
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/chief/node.env
+ExecStart=/usr/local/bin/chief-node-supervisor --node-id ${CHIEF_NODE_ID} --core ${CHIEF_CORE_URL}
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=75
+User=root
+Group=chief
+
+[Install]
+WantedBy=multi-user.target
+
