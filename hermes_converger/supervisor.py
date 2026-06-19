@@ -9,7 +9,7 @@ import time
 import urllib.request
 from typing import Any
 
-from .core import iso_now
+from .core import _resolve_tool, iso_now
 
 
 DEFAULT_ALLOWLIST = ["chief-node.service", "chief-loop-watchdog.service", "chief-stack-core-1"]
@@ -57,7 +57,7 @@ def systemd_status(unit: str) -> dict[str, Any]:
         "InactiveEnterTimestampMonotonic",
         "ActiveEnterTimestampMonotonic",
     ]
-    cmd = ["systemctl", "show", unit]
+    cmd = [_resolve_tool("systemctl"), "show", unit]
     for prop in props:
         cmd.extend(["--property", prop])
     out = subprocess.run(cmd, text=True, capture_output=True, check=False)
@@ -72,12 +72,12 @@ def systemd_status(unit: str) -> dict[str, Any]:
 
 
 def launchd_status(label: str) -> dict[str, Any]:
-    out = subprocess.run(["launchctl", "print", f"system/{label}"], text=True, capture_output=True, check=False)
+    out = subprocess.run([_resolve_tool("launchctl"), "print", f"system/{label}"], text=True, capture_output=True, check=False)
     return {"unit": label, "manager": "launchd", "exists": out.returncode == 0, "active": "state = running" in out.stdout, "restart_count": 0}
 
 
 def docker_status(container: str) -> dict[str, Any]:
-    out = subprocess.run(["docker", "inspect", container], text=True, capture_output=True, check=False)
+    out = subprocess.run([_resolve_tool("docker"), "inspect", container], text=True, capture_output=True, check=False)
     data: dict[str, Any] = {"unit": container, "manager": "docker", "exists": out.returncode == 0, "active": False, "restart_count": 0}
     if out.returncode != 0:
         return data
@@ -127,21 +127,21 @@ class RestartLimiter:
 
 def enter_crash_looping(unit: str, manager: str) -> None:
     if manager == "systemd":
-        subprocess.run(["systemctl", "mask", "--runtime", unit], check=False)
+        subprocess.run([_resolve_tool("systemctl"), "mask", "--runtime", unit], check=False)
     elif manager == "launchd":
-        subprocess.run(["launchctl", "disable", f"system/{unit}"], check=False)
-        subprocess.run(["launchctl", "bootout", f"system/{unit}"], check=False)
+        subprocess.run([_resolve_tool("launchctl"), "disable", f"system/{unit}"], check=False)
+        subprocess.run([_resolve_tool("launchctl"), "bootout", f"system/{unit}"], check=False)
     elif manager == "docker":
-        subprocess.run(["docker", "stop", unit], check=False)
+        subprocess.run([_resolve_tool("docker"), "stop", unit], check=False)
 
 
 def restart(unit: str, manager: str) -> None:
     if manager == "systemd":
-        subprocess.run(["systemctl", "restart", unit], check=False)
+        subprocess.run([_resolve_tool("systemctl"), "restart", unit], check=False)
     elif manager == "launchd":
-        subprocess.run(["launchctl", "kickstart", "-k", f"system/{unit}"], check=False)
+        subprocess.run([_resolve_tool("launchctl"), "kickstart", "-k", f"system/{unit}"], check=False)
     elif manager == "docker":
-        subprocess.run(["docker", "restart", unit], check=False)
+        subprocess.run([_resolve_tool("docker"), "restart", unit], check=False)
 
 
 def process_status(unit: str) -> dict[str, Any]:

@@ -79,6 +79,30 @@ def lookup(key_id):
     return KEY if key_id == f"node:{NODE}:plan-v1" else None
 
 
+def test_resolve_tool_uses_shutil_which(monkeypatch):
+    monkeypatch.setattr(core.shutil, "which", lambda name: f"/custom/bin/{name}")
+
+    assert core._resolve_tool("uv") == "/custom/bin/uv"
+
+
+def test_resolve_tool_uses_fixed_fallback_when_which_missing(monkeypatch):
+    expected = "/usr/local/bin/uv"
+    monkeypatch.setattr(core.shutil, "which", lambda name: None)
+    monkeypatch.setattr(core.os.path, "isfile", lambda path: path == expected)
+    monkeypatch.setattr(core.os, "access", lambda path, mode: path == expected and mode == core.os.X_OK)
+
+    assert core._resolve_tool("uv") == expected
+
+
+def test_resolve_tool_raises_clear_error_when_missing(monkeypatch):
+    monkeypatch.setattr(core.shutil, "which", lambda name: None)
+    monkeypatch.setattr(core.os.path, "isfile", lambda path: False)
+    monkeypatch.setattr(core.os, "access", lambda path, mode: False)
+
+    with pytest.raises(core.ConvergerError, match="tool_not_found:uv"):
+        core._resolve_tool("uv")
+
+
 def verify(plan, watermarks=None, target_artifact=None):
     return core.verify_plan(plan, node_id=NODE, key_lookup=lookup, watermarks=watermarks or {}, now=NOW, target_artifact=target_artifact)
 
@@ -391,6 +415,7 @@ def test_plan_supplied_reload_targets_are_ignored_for_fixed_artifact_map(tmp_pat
     verified = verify(plan)
     ops = core.HostOps(core.LocalState(tmp_path), DummyTransport())
     calls = []
+    monkeypatch.setattr(core, "_resolve_tool", lambda name: name)
     monkeypatch.setattr(core.subprocess, "run", lambda cmd, *a, **kw: calls.append(cmd))
 
     ops.record_reload_and_signal(verified)
@@ -449,6 +474,7 @@ def test_malformed_target_ref_rejected_before_git_checkout(tmp_path, monkeypatch
     ops = core.HostOps(core.LocalState(tmp_path), DummyTransport())
     monkeypatch.setattr(ops, "artifact_path", lambda artifact: str(tmp_path))
     calls = []
+    monkeypatch.setattr(core, "_resolve_tool", lambda name: name)
     monkeypatch.setattr(core.subprocess, "run", lambda cmd, *a, **kw: calls.append(cmd))
 
     with pytest.raises(core.ConvergerError, match="target_ref_not_git_sha:main;rm-rf"):

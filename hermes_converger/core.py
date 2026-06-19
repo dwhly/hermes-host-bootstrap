@@ -14,6 +14,7 @@ import pathlib
 import re
 import secrets
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -61,6 +62,14 @@ IDLE_LIMITS_S = {
     "subprocess": 10,
     "loop_lock": 10,
 }
+TOOL_FALLBACK_DIRS = (
+    "/root/.local/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/opt/homebrew/bin",
+    os.path.expanduser("~/.local/bin"),
+)
+TOOL_SUBPROCESS_PATH_PREFIX = ":".join((*TOOL_FALLBACK_DIRS, "/bin"))
 
 
 class ConvergerError(Exception):
@@ -76,6 +85,21 @@ class Deferred(ConvergerError):
         super().__init__(reason)
         self.reason = reason
         self.snapshot = snapshot or {}
+
+
+def _resolve_tool(name: str) -> str:
+    found = shutil.which(name)
+    if found:
+        return found
+    for directory in TOOL_FALLBACK_DIRS:
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise ConvergerError(f"tool_not_found:{name}")
+
+
+def _tool_subprocess_env() -> dict[str, str]:
+    return {**os.environ, "PATH": f"{TOOL_SUBPROCESS_PATH_PREFIX}:{os.environ.get('PATH', '')}"}
 
 
 def utcnow() -> dt.datetime:
@@ -696,11 +720,12 @@ class HostOps:
         self.journal_before("fetch", {"artifact": plan.artifact, "target_ref": plan.raw["target_ref"]})
         # Local destinations are fixed by artifact; actual source sync is intentionally typed.
         path = self.artifact_path(plan.artifact)
-        subprocess.run(["git", "fetch", "--all", "--prune"], cwd=path, check=True)
+        git = _resolve_tool("git")
+        subprocess.run([git, "fetch", "--all", "--prune"], cwd=path, check=True)
         if plan.artifact in RESTART_REQUIRED:
             target_ref = str(plan.raw["target_ref"])
             validate_git_ref(target_ref)
-            subprocess.run(["git", "checkout", "--detach", target_ref], cwd=path, check=True)
+            subprocess.run([git, "checkout", "--detach", target_ref], cwd=path, check=True)
 
     def artifact_path(self, artifact: str) -> str:
         mapping = {
@@ -717,8 +742,9 @@ class HostOps:
         self.journal_before("install", {"artifact": plan.artifact})
         if plan.artifact == "hermes-node":
             subprocess.run(
-                ["uv", "pip", "install", "--python", ".venv/bin/python", "-q", "-e", "../chief-spec/sdk/python", "-e", "."],
+                [_resolve_tool("uv"), "pip", "install", "--python", ".venv/bin/python", "-q", "-e", "../chief-spec/sdk/python", "-e", "."],
                 cwd="/root/code/chief/hermes-node",
+                env=_tool_subprocess_env(),
                 check=True,
             )
 
@@ -727,9 +753,9 @@ class HostOps:
             validate_supervised_process(unit, action="restart_unit")
             self.journal_before("restart", {"unit": unit})
             if unit.endswith(".service"):
-                subprocess.run(["systemctl", "restart", unit], check=True)
+                subprocess.run([_resolve_tool("systemctl"), "restart", unit], check=True)
             else:
-                subprocess.run(["docker", "restart", unit], check=True)
+                subprocess.run([_resolve_tool("docker"), "restart", unit], check=True)
 
     def record_reload_and_signal(self, plan: VerifiedPlan) -> str:
         for process in plan.affected_processes:
@@ -744,7 +770,7 @@ class HostOps:
         for process in plan.affected_processes:
             self.journal_before("signal_reload", {"process": process})
             if process.endswith(".service"):
-                subprocess.run(["systemctl", "kill", "-s", "HUP", process], check=True)
+                subprocess.run([_resolve_tool("systemctl"), "kill", "-s", "HUP", process], check=True)
         return reload_at
 
     def poll_runtime_ack(self, plan: VerifiedPlan, signal_at: str, timeout_s: int = 30) -> dict[str, Any] | None:
@@ -888,7 +914,7 @@ def attempt_rollback_once(plan: VerifiedPlan, ops: HostOps) -> bool:
     try:
         disk_ref = str(lkg["disk_ref"])
         validate_git_ref(disk_ref)
-        subprocess.run(["git", "checkout", disk_ref], cwd=ops.artifact_path(plan.artifact), check=True)
+        subprocess.run([_resolve_tool("git"), "checkout", disk_ref], cwd=ops.artifact_path(plan.artifact), check=True)
         ops.install_restart_required(plan)
         ops.restart_units(plan)
         proof = ops.poll_runtime_ack(dataclasses.replace(plan, raw={**plan.raw, "target_ref": lkg["running_ref"]}), iso_now())
