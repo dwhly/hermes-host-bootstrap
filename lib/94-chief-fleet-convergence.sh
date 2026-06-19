@@ -44,9 +44,11 @@ provision_plan_key() {
     info "generating /etc/chief/node-plan.key"
     umask 077
     key_tmp="$(mktemp)"
+    # NO trailing newline: the converger strips, but core's dir-read uses raw
+    # read_bytes(); generating newline-free makes both sides agree byte-for-byte.
     python3 - <<'PY' > "$key_tmp"
-import base64, secrets
-print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("="))
+import base64, secrets, sys
+sys.stdout.write(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("="))
 PY
     sudo install -m 0640 -o root -g chief "$key_tmp" /etc/chief/node-plan.key
     rm -f "$key_tmp"
@@ -54,6 +56,66 @@ PY
     skip "/etc/chief/node-plan.key already exists"
     sudo chown root:chief /etc/chief/node-plan.key
     sudo chmod 0640 /etc/chief/node-plan.key
+  fi
+}
+
+# Scoped, passwordless sudo for the two convergence executors so they can run
+# unattended (boot-reconcile, supervisor timer, cron-driven convergence) without
+# a TTY/password. This is the ONLY ongoing root the convergence system needs —
+# both binaries are HMAC-signed-plan-gated + allowlisted, so this is narrow, not
+# blanket sudo. Validated with visudo before install (a bad file can't lock out
+# sudo). Idempotent.
+install_sudoers() {
+  local user="${SUDO_USER:-$(id -un)}"
+  local f=/etc/sudoers.d/chief-converger
+  local tmp; tmp="$(mktemp)"
+  {
+    echo "# Chief fleet convergence: scoped NOPASSWD for the two root-write executors."
+    echo "# Managed by hermes-host-bootstrap lib/94-chief-fleet-convergence.sh — do not edit by hand."
+    echo "${user} ALL=(root) NOPASSWD: /usr/local/bin/hermes-converger"
+    echo "${user} ALL=(root) NOPASSWD: /usr/local/bin/chief-node-supervisor"
+  } > "$tmp"
+  if sudo visudo -c -f "$tmp" >/dev/null 2>&1; then
+    sudo install -m 0440 -o root -g wheel "$tmp" "$f" 2>/dev/null \
+      || sudo install -m 0440 "$tmp" "$f"
+    ok "installed scoped sudoers ($f) for $user -> hermes-converger + chief-node-supervisor"
+  else
+    warn "sudoers candidate failed visudo -c — NOT installing (convergence will need a password)"
+  fi
+  rm -f "$tmp"
+}
+
+# Deposit this node's plan key into core's key directory so core can verify the
+# signed plans this node will receive — WITHOUT a manual per-node env var. Core
+# is configured with CHIEF_NODE_PLAN_SECRET_DIR and reads <dir>/<node_id>.key.
+# We ship the key host-to-host over the node->core SSH channel (CHIEF_CORE_SSH,
+# default root@<core-ip>) so the secret never transits a human/clipboard.
+# Best-effort + loud on failure: convergence simply stays fail-closed (plan
+# endpoint 403) until the key is registered, so a miss is safe, not silent-bad.
+register_plan_key_with_core() {
+  local core_ssh="${CHIEF_CORE_SSH:-}"
+  if [[ -z "$core_ssh" ]]; then
+    # Derive from core_url host if not explicitly set.
+    local core_host; core_host="$(printf '%s' "$core_url" | sed -E 's#https?://##; s#[:/].*##')"
+    [[ -n "$core_host" ]] && core_ssh="root@${core_host}"
+  fi
+  local keydir="${CHIEF_CORE_KEY_DIR:-/run/chief/node-keys}"
+  if [[ -z "$core_ssh" ]]; then
+    warn "CHIEF_CORE_SSH not set and could not derive — skipping key registration"
+    warn "  Manually: copy /etc/chief/node-plan.key to core ${keydir}/${node_id}.key (root:root 0600)"
+    return 0
+  fi
+  info "registering plan key with core ($core_ssh:${keydir}/${node_id}.key)"
+  # Read the key locally (we have root here) and pipe over SSH; never printed.
+  if sudo cat /etc/chief/node-plan.key \
+       | ssh -o ConnectTimeout=10 -o BatchMode=yes "$core_ssh" \
+           "mkdir -p '${keydir}' && umask 077 && cat > '${keydir}/${node_id}.key' && chmod 600 '${keydir}/${node_id}.key' && echo registered" \
+       2>/dev/null | grep -q registered; then
+    ok "plan key registered with core for $node_id"
+  else
+    warn "could not register plan key with core via $core_ssh (host-key/auth?)."
+    warn "  Convergence will be fail-closed (plan 403) until you register it. Manually:"
+    warn "  sudo cat /etc/chief/node-plan.key | ssh $core_ssh \"umask 077; cat > ${keydir}/${node_id}.key\""
   fi
 }
 
@@ -116,9 +178,11 @@ sudo rm -rf /usr/local/lib/hermes-host-bootstrap/hermes_converger
 sudo cp -R "$REPO_ROOT/hermes_converger" /usr/local/lib/hermes-host-bootstrap/
 sudo chmod -R go-w /usr/local/lib/hermes-host-bootstrap/hermes_converger
 provision_plan_key
+install_sudoers
 write_node_env
 install_supervisor_allowlist
 install_systemd_units
 install_launchd_plists
+register_plan_key_with_core
 
 ok "Chief fleet convergence installed"
