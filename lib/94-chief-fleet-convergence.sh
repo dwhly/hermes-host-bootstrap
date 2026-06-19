@@ -5,6 +5,12 @@ set -euo pipefail
 # shellcheck disable=SC1091
 source "$(dirname "$0")/common.sh"
 
+# REPO_ROOT is exported by bootstrap.sh when run through the normal chain. When
+# this module is run STANDALONE (e.g. `sudo bash lib/94-chief-fleet-convergence.sh`
+# during a manual Mac convergence install), derive it from this script's own
+# location so the `$REPO_ROOT/...` install paths resolve.
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+
 step "Chief fleet convergence"
 
 if is_skipped chief-convergence; then
