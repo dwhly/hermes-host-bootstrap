@@ -21,6 +21,13 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable
 
+try:
+    from chief_spec import emit as chief_spec_emit
+    from chief_spec.validation import validate_event as chief_spec_validate_event
+except ImportError:  # pragma: no cover - exercised only on hosts without chief-spec installed.
+    chief_spec_emit = None
+    chief_spec_validate_event = None
+
 
 ALLOWLIST = {"chief", "hermes-node", "harness", "config", "remits", "theme"}
 LIVE_PATCH = {"config", "remits", "theme"}
@@ -38,6 +45,15 @@ GIT_REF_RE = re.compile(r"^[0-9a-f]{7,40}$")
 DEFAULT_FRESHNESS_S = 600
 MAX_FUTURE_S = 60
 LEASE_TTL_S = 300
+CONVERGER_VERSION = "0.1.0"
+CONVERGENCE_EVENT_TYPES = {
+    "started": "hermes.fleet.convergence.started",
+    "deferred": "hermes.fleet.convergence.deferred",
+    "fetched": "hermes.fleet.convergence.fetched",
+    "applied": "hermes.fleet.convergence.applied",
+    "failed": "hermes.fleet.convergence.failed",
+    "rolled_back": "hermes.fleet.convergence.rolled_back",
+}
 IDLE_LIMITS_S = {
     "directive": 30,
     "lease": 15,
@@ -79,6 +95,14 @@ def iso_now() -> str:
     return utcnow().replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def iso_from_timestamp(value: float) -> str:
+    return dt.datetime.fromtimestamp(value, dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def iso_after(seconds: int) -> str:
+    return (utcnow() + dt.timedelta(seconds=seconds)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
 def canonical_json(data: Any) -> bytes:
     return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
@@ -102,6 +126,17 @@ def b64url_decode(value: str) -> bytes:
 
 def b64url_encode(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def new_ulid() -> str:
+    # Crockford base32 ULID: 48-bit millisecond timestamp + 80 bits of randomness.
+    alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    value = (int(time.time() * 1000) << 80) | secrets.randbits(80)
+    chars = []
+    for _ in range(26):
+        chars.append(alphabet[value & 0x1F])
+        value >>= 5
+    return "".join(reversed(chars))
 
 
 def sign_plan_fields(plan: dict[str, Any], key: bytes) -> str:
@@ -429,6 +464,185 @@ class LocalState:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
+def ensure_convergence_id(plan: VerifiedPlan) -> str:
+    convergence_id = plan.raw.get("convergence_id")
+    if not convergence_id:
+        convergence_id = "cnv_" + secrets.token_hex(8)
+        plan.raw["convergence_id"] = convergence_id
+    return str(convergence_id)
+
+
+def _nonempty(value: Any, default: str = "unknown") -> str:
+    text = str(value) if value is not None else ""
+    return text if text else default
+
+
+def _apply_mode(value: Any) -> str:
+    text = str(value) if value is not None else ""
+    return text if text in {"live_patch", "restart_required", "manual_only"} else "manual_only"
+
+
+def _current_ref(plan: VerifiedPlan, field: str) -> str | None:
+    current_fold = plan.raw.get("current_fold")
+    if not isinstance(current_fold, dict):
+        return None
+    value = current_fold.get(field)
+    if not isinstance(value, dict):
+        return None
+    ref = value.get("ref")
+    return str(ref) if ref else None
+
+
+def _executor(node_id: str, convergence_id: str) -> dict[str, str]:
+    return {
+        "kind": "hermes-converger",
+        "version": CONVERGER_VERSION,
+        "instance": f"{node_id}/{convergence_id}/systemd",
+    }
+
+
+def _shared_convergence_data(plan: VerifiedPlan, observed_at: str) -> dict[str, Any]:
+    node_id = _nonempty(plan.raw.get("node_id"))
+    convergence_id = ensure_convergence_id(plan)
+    return {
+        "convergence_id": convergence_id,
+        "desired_id": _nonempty(plan.raw.get("desired_id")),
+        "node_id": node_id,
+        "artifact": _nonempty(plan.artifact),
+        "target_ref": _nonempty(plan.raw.get("target_ref")),
+        "apply_mode": _apply_mode(plan.apply_mode),
+        "executor": _executor(node_id, convergence_id),
+        "force": bool(plan.raw.get("force", False)),
+        "observed_at": observed_at,
+    }
+
+
+def convergence_event_data(event_name: str, plan: VerifiedPlan, extra: dict[str, Any], observed_at: str) -> dict[str, Any]:
+    data = _shared_convergence_data(plan, observed_at)
+    if event_name == "started":
+        data.update({"trigger": str(extra.get("trigger") or "operator"), "plan_digest": _nonempty(plan.raw.get("plan_digest"))})
+    elif event_name == "deferred":
+        data.update(
+            {
+                "reason": _nonempty(extra.get("reason")),
+                "idle_snapshot": extra.get("idle_snapshot") if isinstance(extra.get("idle_snapshot"), dict) else {},
+                "next_check_after": str(extra.get("next_check_after") or iso_after(60)),
+            }
+        )
+    elif event_name == "fetched":
+        data.update(
+            {
+                "previous_disk_ref": extra.get("previous_disk_ref", _current_ref(plan, "fetched")),
+                "fetched_ref": str(extra.get("fetched_ref") or plan.raw.get("target_ref")),
+                "fetch_method": str(extra.get("fetch_method") or "git_fetch_checkout"),
+                "ground_truth": extra.get("ground_truth") if isinstance(extra.get("ground_truth"), dict) else {},
+            }
+        )
+    elif event_name == "applied":
+        verification = extra.get("verification")
+        if not isinstance(verification, dict):
+            raise ConvergerError("applied_requires_verification")
+        data.update(
+            {
+                "previous_running_ref": extra.get("previous_running_ref", _current_ref(plan, "running")),
+                "running_ref": str(extra.get("running_ref") or verification.get("stamp_freshness_evidence", {}).get("loaded_ref") or plan.raw.get("target_ref")),
+                "health": str(extra.get("health") or "healthy"),
+                "verification": verification,
+            }
+        )
+    elif event_name == "failed":
+        data.update(
+            {
+                "stage": str(extra.get("stage") or "converge"),
+                "reason": _nonempty(extra.get("reason")),
+                "recoverable": bool(extra.get("recoverable", True)),
+                "health": str(extra.get("health") or "unknown"),
+                "logs_ref": str(extra.get("logs_ref") or f"journalctl://hermes-converger/{data['convergence_id']}"),
+            }
+        )
+    elif event_name == "rolled_back":
+        verification = extra.get("verification")
+        if not isinstance(verification, dict):
+            raise ConvergerError("rolled_back_requires_verification")
+        data.update(
+            {
+                "from_ref": str(extra.get("from_ref") or plan.raw.get("target_ref")),
+                "to_ref": str(extra.get("to_ref") or extra.get("rollback_ref") or verification.get("stamp_freshness_evidence", {}).get("loaded_ref")),
+                "reason": str(extra.get("reason") or "rollback_verified"),
+                "health_after": str(extra.get("health_after") or "healthy"),
+                "verification": verification,
+            }
+        )
+    else:
+        raise ConvergerError(f"unknown_convergence_event:{event_name}")
+    return data
+
+
+def _event_payload(event: Any) -> dict[str, Any]:
+    if hasattr(event, "model_dump"):
+        return {k: v for k, v in event.model_dump().items() if v is not None}
+    return {k: v for k, v in dict(event).items() if v is not None}
+
+
+def build_convergence_envelope(event_name: str, plan: VerifiedPlan, **extra: Any) -> dict[str, Any]:
+    try:
+        event_type = CONVERGENCE_EVENT_TYPES[event_name]
+    except KeyError as exc:
+        raise ConvergerError(f"unknown_convergence_event:{event_name}") from exc
+    observed_at = str(extra.get("observed_at") or iso_now())
+    data = convergence_event_data(event_name, plan, extra, observed_at)
+    node_id = data["node_id"]
+    convergence_id = data["convergence_id"]
+    source = f"hermes-converger://{node_id}"
+    entityid = f"ent_node_{node_id}"
+    actorid = f"act_node_{node_id}"
+    sourceref = f"converger://{node_id}/{convergence_id}/{event_name}"
+
+    # Prefer chief_spec.emit when it is importable; production installs may only carry
+    # hermes_converger, so the fallback builds the same CloudEvents envelope by hand.
+    if chief_spec_emit is not None:
+        return _event_payload(
+            chief_spec_emit(
+                type=event_type,
+                source=source,
+                contextid="ctx_fleet",
+                entityid=entityid,
+                actorid=actorid,
+                sourceref=sourceref,
+                data=data,
+                time=observed_at,
+                correlationid=convergence_id,
+            )
+        )
+    return {
+        "specversion": "1.0",
+        "id": new_ulid(),
+        "source": source,
+        "type": event_type,
+        "time": observed_at,
+        "datacontenttype": "application/json",
+        "contextid": "ctx_fleet",
+        "entityid": entityid,
+        "actorid": actorid,
+        "confidence": 1.0,
+        "sensitivity": "internal",
+        "sourceref": sourceref,
+        "schemaversion": 1,
+        "correlationid": convergence_id,
+        "data": data,
+    }
+
+
+def validate_envelope(envelope: dict[str, Any]) -> None:
+    if chief_spec_validate_event is not None:
+        chief_spec_validate_event(envelope)
+        return
+    required = {"specversion", "id", "source", "type", "time", "contextid", "entityid", "actorid", "confidence", "data"}
+    missing = sorted(required - set(envelope))
+    if missing:
+        raise ConvergerError(f"event_envelope_missing:{','.join(missing)}")
+
+
 class Transport:
     def __init__(self, core: str, node_id: str, token_path: pathlib.Path | None = None, timeout: float = 10):
         self.core = core.rstrip("/")
@@ -453,9 +667,10 @@ class Transport:
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def emit(self, event_type: str, payload: dict[str, Any]) -> None:
-        url = f"{self.core}/v1/fleet/events"
-        body = json.dumps({"type": event_type, **payload}).encode("utf-8")
+    def emit(self, envelope: dict[str, Any]) -> None:
+        validate_envelope(envelope)
+        url = f"{self.core}/v1/observations"
+        body = json.dumps(envelope).encode("utf-8")
         req = urllib.request.Request(url, data=body, headers=self._headers(), method="POST")
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             resp.read()
@@ -475,16 +690,7 @@ class HostOps:
     def emit(self, event_name: str, plan: VerifiedPlan, **extra: Any) -> None:
         if self.dry_run:
             raise AssertionError("plan-only attempted to emit")
-        payload = {
-            "node_id": plan.raw["node_id"],
-            "artifact": plan.artifact,
-            "desired_id": plan.raw["desired_id"],
-            "target_ref": plan.raw["target_ref"],
-            "convergence_id": plan.raw.get("convergence_id"),
-            "at": iso_now(),
-            **extra,
-        }
-        self.transport.emit(f"hermes.fleet.convergence.{event_name}", payload)
+        self.transport.emit(build_convergence_envelope(event_name, plan, **extra))
 
     def fetch(self, plan: VerifiedPlan) -> None:
         self.journal_before("fetch", {"artifact": plan.artifact, "target_ref": plan.raw["target_ref"]})
@@ -563,6 +769,7 @@ def read_runtime_proof(artifact: str, target_ref: str, signal_at: str | None = N
         for stamp in root.glob(f"*/{artifact}.json"):
             try:
                 data = json.loads(stamp.read_text())
+                stat = stamp.stat()
             except (OSError, json.JSONDecodeError):
                 continue
             observed = data.get("observed_at") or data.get("written_at")
@@ -570,7 +777,25 @@ def read_runtime_proof(artifact: str, target_ref: str, signal_at: str | None = N
                 continue
             if min_time and (not observed or parse_time(str(observed)) <= min_time):
                 continue
-            return {"method": "runtime_stamp", "source": str(stamp), "loaded_ref": target_ref, "observed_at": observed}
+            try:
+                pid = int(data["pid"])
+                monotonic_nonce = int(data["monotonic_nonce"])
+                process_start_time = str(data["process_start_time"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            return {
+                "method": "runtime_stamp",
+                "runtime_source": {"kind": "file", "path": str(stamp), "source": "runtime-stamp"},
+                "observed_at": str(observed),
+                "stamp_freshness_evidence": {
+                    "reload_signal_at": str(signal_at or observed),
+                    "stamp_mtime": iso_from_timestamp(stat.st_mtime),
+                    "pid": pid,
+                    "process_start_time": process_start_time,
+                    "monotonic_nonce": monotonic_nonce,
+                    "loaded_ref": target_ref,
+                },
+            }
     return None
 
 

@@ -3,8 +3,15 @@ from __future__ import annotations
 import datetime as dt
 import json
 import pathlib
+import sys
 
 import pytest
+
+CHIEF_SPEC_SDK = pathlib.Path("/root/code/chief/chief-spec/sdk/python")
+if CHIEF_SPEC_SDK.exists():
+    sys.path.insert(0, str(CHIEF_SPEC_SDK))
+
+from chief_spec.validation import validate_event
 
 from hermes_converger import core
 
@@ -369,7 +376,7 @@ def test_restart_failure_attempts_rollback_once_then_stops(monkeypatch):
 
 
 class DummyTransport:
-    def emit(self, event_type, payload):
+    def emit(self, envelope):
         pass
 
 
@@ -449,3 +456,80 @@ def test_malformed_target_ref_rejected_before_git_checkout(tmp_path, monkeypatch
 
     assert ["git", "fetch", "--all", "--prune"] in calls
     assert not any(cmd[:2] == ["git", "checkout"] for cmd in calls)
+
+
+def spec_verification(target_ref="abc1234", reload_signal_at="2026-06-19T00:00:01Z"):
+    return {
+        "method": "runtime_stamp",
+        "runtime_source": {"kind": "file", "path": "/run/chief/runtime/chief-node.service/hermes-node.json", "source": "runtime-stamp"},
+        "observed_at": "2026-06-19T00:00:05Z",
+        "stamp_freshness_evidence": {
+            "reload_signal_at": reload_signal_at,
+            "stamp_mtime": "2026-06-19T00:00:05Z",
+            "pid": 1234,
+            "process_start_time": "2026-06-19T00:00:03Z",
+            "monotonic_nonce": 987654321,
+            "loaded_ref": target_ref,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "event_name,extra",
+    [
+        ("started", {"trigger": "operator"}),
+        ("fetched", {}),
+        ("applied", {"verification": spec_verification()}),
+        ("failed", {"reason": "steady_health_timeout"}),
+        ("deferred", {"reason": "active_directive", "idle_snapshot": {"active_directives": ["dir_01"]}}),
+        ("rolled_back", {"rollback_ref": "def5678", "verification": spec_verification("def5678")}),
+    ],
+)
+def test_convergence_event_envelopes_validate_against_chief_spec(event_name, extra):
+    verified = verify(make_plan(force=True))
+    envelope = core.build_convergence_envelope(event_name, verified, observed_at="2026-06-19T00:00:02Z", **extra)
+
+    validate_event(envelope)
+    assert envelope["type"] == f"hermes.fleet.convergence.{event_name}"
+    assert envelope["source"] == f"hermes-converger://{NODE}"
+    assert envelope["entityid"] == f"ent_node_{NODE}"
+    assert envelope["actorid"] == f"act_node_{NODE}"
+    assert envelope["data"]["executor"]["instance"].startswith(f"{NODE}/cnv_")
+
+
+def test_convergence_id_is_stable_across_one_run():
+    verified = verify(make_plan())
+    started = core.build_convergence_envelope("started", verified, observed_at="2026-06-19T00:00:02Z")
+    fetched = core.build_convergence_envelope("fetched", verified, observed_at="2026-06-19T00:00:03Z")
+    applied = core.build_convergence_envelope("applied", verified, observed_at="2026-06-19T00:00:06Z", verification=spec_verification())
+
+    assert started["data"]["convergence_id"] == fetched["data"]["convergence_id"] == applied["data"]["convergence_id"]
+
+
+def test_transport_emit_posts_observations_endpoint(tmp_path, monkeypatch):
+    verified = verify(make_plan())
+    envelope = core.build_convergence_envelope("started", verified, observed_at="2026-06-19T00:00:02Z")
+    captured = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def fake_urlopen(req, timeout):
+        captured["url"] = req.full_url
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        captured["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr(core.urllib.request, "urlopen", fake_urlopen)
+
+    core.Transport("http://core.example", NODE, token_path=tmp_path / "missing.token").emit(envelope)
+
+    assert captured["url"] == "http://core.example/v1/observations"
+    assert captured["body"]["type"] == "hermes.fleet.convergence.started"
