@@ -1,4 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export PYTHONPATH="/usr/local/lib/hermes-host-bootstrap:${PYTHONPATH:-}"
-exec python3 -m hermes_converger "$@"
+
+# Prefer a modern Python that also has chief_spec available (the node venv) so the
+# converger can locally validate the CloudEvents envelopes it emits. Fall back to
+# system python3 (the code is 3.9-compatible — uses dt.timezone.utc, future
+# annotations — and degrades to a hand-built envelope if chief_spec is absent).
+PY=""
+for cand in \
+  /root/code/chief/hermes-node/.venv/bin/python \
+  "$HOME/code/chief/hermes-node/.venv/bin/python" \
+  /Users/*/code/chief/hermes-node/.venv/bin/python; do
+  if [[ -x "$cand" ]]; then PY="$cand"; break; fi
+done
+[[ -z "$PY" ]] && PY="$(command -v python3)"
+
+exec "$PY" -m hermes_converger "$@"

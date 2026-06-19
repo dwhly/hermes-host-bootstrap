@@ -103,7 +103,7 @@ def _tool_subprocess_env() -> dict[str, str]:
 
 
 def utcnow() -> dt.datetime:
-    return dt.datetime.now(dt.UTC)
+    return dt.datetime.now(dt.timezone.utc)
 
 
 def parse_time(value: str) -> dt.datetime:
@@ -111,8 +111,8 @@ def parse_time(value: str) -> dt.datetime:
         value = value[:-1] + "+00:00"
     parsed = dt.datetime.fromisoformat(value)
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.UTC)
-    return parsed.astimezone(dt.UTC)
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
 
 
 def iso_now() -> str:
@@ -120,7 +120,7 @@ def iso_now() -> str:
 
 
 def iso_from_timestamp(value: float) -> str:
-    return dt.datetime.fromtimestamp(value, dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return dt.datetime.fromtimestamp(value, dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def iso_after(seconds: int) -> str:
