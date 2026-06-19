@@ -300,6 +300,41 @@ own `.hermes-bootstrap.conf`, and never has to touch the repo itself.
 
 ---
 
+## Governance inheritance (how prime directives reach a new host)
+
+A new fleet host does not just get packages — it inherits the fleet's
+**governance wiring** automatically, via the synced `~/.hermes` config repo
+(`92-hermes-config.sh` clones/pulls `HERMES_CONFIG_REPO`). Two whitelisted
+paths in that repo carry it:
+
+- **`memories/MEMORY.md`** — injected into every agent turn. Holds the
+  *constitutional pointer*: "Chief work is governed by playbooks + the wiki;
+  load the `chief-playbooks` skill first; classify station-vs-direct and state
+  it." This is the only always-on channel, so it holds pointers + a few
+  reflexes, never process prose.
+- **agent-authored `skills/`** (e.g. `chief-playbooks`, `hermes-fleet-maintenance`)
+  — the *loaders* that read the live source-of-truth docs before acting.
+
+So provisioning a host = it inherits the same prime directives the rest of the
+fleet runs under, no per-host setup. The authoritative model — **source of
+truth (Chief `docs/` playbooks + wiki) → loader (Hermes skills) → reflex
+(memory)**, plus the promotion path and the station-vs-direct directive — lives
+in the Chief umbrella at `docs/playbooks/governing-knowledge-and-process.md`
+(this README only points at it; one source of truth).
+
+> **Known gap (memory is fleet-global, undifferentiated — by accident, not
+> design).** Because `memories/` is whitelisted in the config repo's
+> `.gitignore`, *all* memory propagates to *every* host on `sync.sh` pull. That
+> is correct for universal facts (who the user is, the constitution) but wrong
+> for host-specific ones ("this box is RAM-tight") which get broadcast to every
+> machine as if universal. There is no universal-vs-host-specific split today;
+> the fleet-global behaviour is an emergent property of one `.gitignore` line,
+> not a declared policy. Tightening that whitelist would silently make memory
+> host-local and nobody would notice until two boxes disagreed. Tracked as
+> future work in `governing-knowledge-and-process.md` §8.
+
+---
+
 ## Shell sessions that survive Mac sleep (mosh + tmux)
 
 The default `ssh` session from a Mac dies the moment the laptop sleeps —
