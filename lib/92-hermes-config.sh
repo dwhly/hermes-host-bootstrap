@@ -250,6 +250,15 @@ display_cfg = data.get("display")
 if not isinstance(display_cfg, dict):
     display_cfg = {}
 display_cfg.setdefault("mouse_tracking", "wheel")
+# Work-preserving TUI default: queue input typed while the agent is busy as
+# the next prompt instead of interrupting the running turn. The framework
+# default (CLI / messaging adapters) is "interrupt", and an explicit value in
+# config.yaml overrides the TUI's own built-in "queue" default — so a host that
+# was ever set to "interrupt" silently loses an in-progress draft when you type
+# a follow-up while the agent streams. Seed "queue" here so every fleet host
+# gets the draft-safe behavior by default; a host can still opt into
+# "interrupt"/"steer" explicitly and this setdefault won't clobber it.
+display_cfg.setdefault("busy_input_mode", "queue")
 data["display"] = display_cfg
 
 path.write_text(yaml.safe_dump(data, sort_keys=False))
