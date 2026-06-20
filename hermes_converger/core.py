@@ -139,6 +139,22 @@ def _tool_subprocess_env() -> dict[str, str]:
     return {**os.environ, "PATH": f"{prefix}:{os.environ.get('PATH', '')}"}
 
 
+# Root-owned github credential file (written by lib/94 install_root_git_cred) so the
+# converger — running as root, whose HOME has no lib/45 user git config — can fetch
+# the private chief repos from origin. Same read-only fleet PAT, scoped to github.com.
+ROOT_GIT_CRED = "/etc/chief/.git-fleet-credentials"
+
+
+def _git_fetch_env() -> dict[str, str]:
+    env = _tool_subprocess_env()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    if os.path.isfile(ROOT_GIT_CRED):
+        env["GIT_CONFIG_COUNT"] = "1"
+        env["GIT_CONFIG_KEY_0"] = "credential.https://github.com.helper"
+        env["GIT_CONFIG_VALUE_0"] = f"store --file={ROOT_GIT_CRED}"
+    return env
+
+
 def unit_for(token: str) -> str:
     validate_supervised_process(token, action="unit")
     mapping = MACOS_UNIT_MAP if IS_MACOS else LINUX_UNIT_MAP
@@ -814,17 +830,45 @@ class HostOps:
         # Local destinations are fixed by artifact; actual source sync is intentionally typed.
         path = self.artifact_path(plan.artifact)
         git = _resolve_tool("git")
-        subprocess.run([git, "fetch", "--all", "--prune"], cwd=path, check=True)
+        env = _git_fetch_env()
+        # Fetch from origin (best-effort): if the target ref is already present locally
+        # the checkout still succeeds, so a fetch failure (e.g. transient network) is
+        # only fatal when we then can't resolve the target. Don't hard-abort here.
+        fetch = subprocess.run([git, "fetch", "--all", "--prune"], cwd=path, env=env,
+                               capture_output=True, text=True)
+        if fetch is not None and getattr(fetch, "returncode", 0) != 0:
+            self.journal_before("fetch_warning", {"artifact": plan.artifact, "stderr": (getattr(fetch, "stderr", "") or "")[-500:]})
         if plan.artifact in RESTART_REQUIRED:
             target_ref = str(plan.raw["target_ref"])
             validate_git_ref(target_ref)
-            subprocess.run([git, "checkout", "--detach", target_ref], cwd=path, check=True)
+            # Verify the target is resolvable locally before checkout (fail loud if not,
+            # e.g. fetch failed AND ref absent). Skipped when subprocess is mocked (None).
+            resolve = subprocess.run([git, "rev-parse", "--verify", "--quiet", f"{target_ref}^{{commit}}"],
+                                     cwd=path, env=env, capture_output=True, text=True)
+            if resolve is not None and getattr(resolve, "returncode", 0) != 0:
+                raise ConvergerError(f"target_ref_not_resolvable:{target_ref}")
+            subprocess.run([git, "checkout", "--detach", target_ref], cwd=path, env=env, check=True)
+
+    def _chief_code_root(self) -> str:
+        # Where the chief git working copies live. Linux/h-do1: /root/code/chief.
+        # macOS: the login user's ~/code/chief (the converger runs as root, so derive
+        # the login user from SUDO_USER, not root's HOME). Overridable for tests/odd
+        # layouts via CHIEF_CODE_ROOT.
+        env = os.environ.get("CHIEF_CODE_ROOT")
+        if env:
+            return env.rstrip("/")
+        if IS_MACOS:
+            user = os.environ.get("SUDO_USER") or os.environ.get("USER") or ""
+            if user:
+                return f"/Users/{user}/code/chief"
+        return "/root/code/chief"
 
     def artifact_path(self, artifact: str) -> str:
+        root = self._chief_code_root()
         mapping = {
-            "chief": "/root/code/chief",
-            "hermes-node": "/root/code/chief/hermes-node",
-            "harness": "/root/code/chief/harness",
+            "chief": root,
+            "hermes-node": f"{root}/hermes-node",
+            "harness": f"{root}/harness",
             "config": "/etc/chief/config",
             "remits": "/etc/chief/remits",
             "theme": "/etc/chief/theme",
@@ -836,7 +880,7 @@ class HostOps:
         if plan.artifact == "hermes-node":
             subprocess.run(
                 [_resolve_tool("uv"), "pip", "install", "--python", ".venv/bin/python", "-q", "-e", "../chief-spec/sdk/python", "-e", "."],
-                cwd="/root/code/chief/hermes-node",
+                cwd=f"{self._chief_code_root()}/hermes-node",
                 env=_tool_subprocess_env(),
                 check=True,
             )
