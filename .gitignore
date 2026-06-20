@@ -13,3 +13,5 @@
 .env
 .env.local
 local.sh
+__pycache__/
+*.pyc
