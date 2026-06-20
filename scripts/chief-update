@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# chief-update — passwordless, integrity-safe reinstall of the converger code/bins
+# from the AUTHENTICATED remote (NOT from any user-writable working copy).
+#
+# WHY: converger code updates must reach /usr/local/lib (root) without an
+# interactive sudo, but a NOPASSWD on a plain "reinstall from ~/code" would be
+# NOPASSWD-on-arbitrary-root (the user could edit the source first). So this
+# script is the ONLY thing granted NOPASSWD, it is root-owned + not user-writable,
+# takes NO arguments, and it installs ONLY code it pulls fresh from the remote
+# into a ROOT-OWNED checkout the login user cannot write. The user can trigger an
+# update-to-latest; the user cannot control WHAT code gets installed.
+#
+# Trust chain: read-only fleet PAT (github, contents:read) -> root-owned checkout
+# /usr/local/lib/hermes-host-bootstrap-src (root:root, 0755, user cannot write) ->
+# copy hermes_converger + the two bins into place. dano cannot push to the remote
+# (read-only) and cannot write the root checkout, so cannot inject root code.
+#
+# Install: lib/94 installs this root-owned 0755 and adds the NOPASSWD line.
+# Usage (passwordless via sudoers): sudo chief-update
+set -euo pipefail
+
+SRC=/usr/local/lib/hermes-host-bootstrap-src
+DEST=/usr/local/lib/hermes-host-bootstrap
+REMOTE="https://github.com/dwhly/hermes-host-bootstrap.git"
+# NO arguments accepted: the NOPASSWD grant must be fixed-behavior. Always installs
+# the latest reviewed origin/main. (A pinned-rollback path, if ever needed, would be
+# a separate explicitly-authorized action — not this passwordless one.)
+REF="origin/main"
+
+# Refuse to run if not root (the sudoers entry provides root; a non-root invocation
+# would silently fail to write /usr/local — fail loud instead).
+[[ "$(id -u)" -eq 0 ]] || { echo "chief-update: must run as root (via sudo)"; exit 1; }
+
+# Credentials: lib/94 writes a root-owned 0600 github credential file from the same
+# op-resolved read-only fleet PAT, scoped to github.com. Point git at it explicitly
+# (root's HOME differs from the login user's, so we can't rely on lib/45's user config).
+export GIT_TERMINAL_PROMPT=0
+ROOT_CRED=/etc/chief/.git-fleet-credentials
+if [[ -f "$ROOT_CRED" ]]; then
+  export GIT_CONFIG_COUNT=2
+  export GIT_CONFIG_KEY_0="credential.https://github.com.helper"
+  export GIT_CONFIG_VALUE_0="store --file=$ROOT_CRED"
+  export GIT_CONFIG_KEY_1="credential.https://github.com.useHttpPath"
+  export GIT_CONFIG_VALUE_1="false"
+fi
+
+if [[ ! -d "$SRC/.git" ]]; then
+  echo "chief-update: cloning $REMOTE -> $SRC"
+  rm -rf "$SRC"
+  git clone --quiet "$REMOTE" "$SRC"
+else
+  git -C "$SRC" remote set-url origin "$REMOTE"
+  git -C "$SRC" fetch --quiet --all --prune
+fi
+
+# Pin to the requested ref from the REMOTE (origin/*), hard reset — the working
+# tree is fully remote-determined, never trusts local edits.
+git -C "$SRC" reset --hard --quiet "$REF"
+NEW_SHA="$(git -C "$SRC" rev-parse --short HEAD)"
+
+install -d -m 0755 "$DEST"
+rm -rf "$DEST/hermes_converger"
+cp -R "$SRC/hermes_converger" "$DEST/"
+chmod -R go-w "$DEST/hermes_converger"
+install -m 0755 "$SRC/scripts/hermes-converger"        /usr/local/bin/hermes-converger
+install -m 0755 "$SRC/scripts/chief-node-supervisor"   /usr/local/bin/chief-node-supervisor
+
+echo "chief-update: converger reinstalled from $REF ($NEW_SHA)"
