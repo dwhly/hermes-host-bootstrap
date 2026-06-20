@@ -196,8 +196,8 @@ def test_live_shape_verifies_and_selects_single_desired_row():
     assert verified.artifact == "hermes-node"
     assert verified.raw["desired_id"] == "des_01"
     assert verified.raw["target_ref"] == "abc1234"
-    assert verified.restart_units == ("chief-node.service",)
-    assert verified.affected_processes == ("chief-node.service",)
+    assert verified.restart_units == ("chief-node",)
+    assert verified.affected_processes == ("chief-node",)
 
 
 def test_multi_desired_requires_target_artifact_and_selects_matching_row():
@@ -233,7 +233,7 @@ def test_multi_desired_requires_target_artifact_and_selects_matching_row():
 
     verified = verify(plan, target_artifact="harness")
     assert verified.artifact == "harness"
-    assert verified.restart_units == ("chief-loop-watchdog.service",)
+    assert verified.restart_units == ("chief-loop-watchdog",)
 
 
 def test_missing_or_mismatched_auth_entry_rejected_fail_closed():
@@ -422,8 +422,66 @@ def test_plan_supplied_reload_targets_are_ignored_for_fixed_artifact_map(tmp_pat
 
     assert calls == [["systemctl", "kill", "-s", "HUP", "chief-node.service"]]
     data = json.loads((tmp_path / "var/lib/chief/converger/reload-signal-times.json").read_text())
-    assert set(data) == {"chief-node.service"}
-    assert set(data["chief-node.service"]) == {"config"}
+    assert set(data) == {"chief-node"}
+    assert set(data["chief-node"]) == {"config"}
+
+
+def test_macos_hermes_node_restart_uses_launchd_gui_domain(tmp_path, monkeypatch):
+    monkeypatch.setattr(core.sys, "platform", "darwin")
+    monkeypatch.setattr(core, "IS_MACOS", core.sys.platform == "darwin")
+    monkeypatch.setenv("SUDO_UID", "501")
+    verified = verify(make_plan())
+    ops = core.HostOps(core.LocalState(tmp_path), DummyTransport())
+    calls = []
+    monkeypatch.setattr(core, "_resolve_tool", lambda name: name)
+    monkeypatch.setattr(core.subprocess, "run", lambda cmd, *a, **kw: calls.append(cmd))
+
+    assert core.unit_for("chief-node") == "com.chief.node"
+    ops.restart_units(verified)
+
+    assert calls == [["launchctl", "kickstart", "-k", "gui/501/com.chief.node"]]
+
+
+@pytest.mark.parametrize("is_macos", [False, True])
+def test_unknown_supervised_token_rejected_fail_closed_on_each_os(monkeypatch, is_macos):
+    monkeypatch.setattr(core.sys, "platform", "darwin" if is_macos else "linux")
+    monkeypatch.setattr(core, "IS_MACOS", core.sys.platform == "darwin")
+
+    with pytest.raises(core.ConvergerError, match="unit_not_allowlisted:not-chief"):
+        core.unit_for("not-chief")
+
+
+def test_macos_reload_records_signal_time_before_launchd_kickstart(tmp_path, monkeypatch):
+    monkeypatch.setattr(core.sys, "platform", "darwin")
+    monkeypatch.setattr(core, "IS_MACOS", core.sys.platform == "darwin")
+    monkeypatch.setenv("SUDO_UID", "501")
+    plan = make_plan(artifact="config", apply_mode="live_patch", target_ref="abcdef0")
+    verified = verify(plan)
+    ops = core.HostOps(core.LocalState(tmp_path), DummyTransport())
+    calls = []
+    stamp = tmp_path / "var/lib/chief/converger/reload-signal-times.json"
+
+    def capture_run(cmd, *args, **kwargs):
+        data = json.loads(stamp.read_text())
+        assert "chief-node" in data
+        assert data["chief-node"]["config"]
+        calls.append(cmd)
+
+    monkeypatch.setattr(core, "_resolve_tool", lambda name: name)
+    monkeypatch.setattr(core.subprocess, "run", capture_run)
+
+    reload_at = ops.record_reload_and_signal(verified)
+
+    assert json.loads(stamp.read_text())["chief-node"]["config"] == reload_at
+    assert calls == [["launchctl", "kickstart", "-k", "gui/501/com.chief.node"]]
+
+
+def test_macos_runtime_stamp_roots_honor_fixed_env_override(monkeypatch):
+    monkeypatch.setattr(core.sys, "platform", "darwin")
+    monkeypatch.setattr(core, "IS_MACOS", core.sys.platform == "darwin")
+    monkeypatch.setenv("HERMES_RUNTIME_STAMP_DIR", "/usr/local/var/chief/runtime")
+
+    assert core.runtime_stamp_roots() == [pathlib.Path("/usr/local/var/chief/runtime")]
 
 
 class BusyInsideOps:

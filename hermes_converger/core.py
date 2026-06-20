@@ -11,6 +11,7 @@ import hmac
 import json
 import os
 import pathlib
+import pwd
 import re
 import secrets
 import signal
@@ -33,14 +34,28 @@ except ImportError:  # pragma: no cover - exercised only on hosts without chief-
 ALLOWLIST = {"chief", "hermes-node", "harness", "config", "remits", "theme"}
 LIVE_PATCH = {"config", "remits", "theme"}
 RESTART_REQUIRED = {"chief", "hermes-node", "harness"}
-SUPERVISED_PROCESS_ALLOWLIST = {"chief-node.service", "chief-loop-watchdog.service", "chief-stack-core-1"}
+IS_MACOS = sys.platform == "darwin"
+SUPERVISED_PROCESS_ALLOWLIST = {"chief-node", "chief-loop-watchdog", "chief-core"}
+LINUX_UNIT_MAP = {
+    "chief-node": "chief-node.service",
+    "chief-loop-watchdog": "chief-loop-watchdog.service",
+    "chief-core": "chief-stack-core-1",
+}
+MACOS_UNIT_MAP = {
+    "chief-node": "com.chief.node",
+    "chief-loop-watchdog": "com.chief.loop-watchdog",
+    "chief-core": "chief-stack-core-1",
+}
+DOCKER_TOKENS = {"chief-core"}
+MACOS_USER_AGENT_TOKENS = {"chief-node"}
+MACOS_RUNTIME_STAMP_DIR = pathlib.Path("/var/run/chief/runtime")
 ARTIFACT_PROCESS_MAP = {
-    "chief": (("chief-stack-core-1",), ("chief-stack-core-1",)),
-    "hermes-node": (("chief-node.service",), ("chief-node.service",)),
-    "harness": (("chief-loop-watchdog.service",), ("chief-loop-watchdog.service",)),
-    "config": (tuple(), ("chief-node.service",)),
-    "remits": (tuple(), ("chief-node.service",)),
-    "theme": (tuple(), ("chief-node.service",)),
+    "chief": (("chief-core",), ("chief-core",)),
+    "hermes-node": (("chief-node",), ("chief-node",)),
+    "harness": (("chief-loop-watchdog",), ("chief-loop-watchdog",)),
+    "config": (tuple(), ("chief-node",)),
+    "remits": (tuple(), ("chief-node",)),
+    "theme": (tuple(), ("chief-node",)),
 }
 GIT_REF_RE = re.compile(r"^[0-9a-f]{7,40}$")
 DEFAULT_FRESHNESS_S = 600
@@ -91,15 +106,40 @@ def _resolve_tool(name: str) -> str:
     found = shutil.which(name)
     if found:
         return found
-    for directory in TOOL_FALLBACK_DIRS:
+    for directory in _tool_fallback_dirs():
         candidate = os.path.join(directory, name)
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
     raise ConvergerError(f"tool_not_found:{name}")
 
 
+def _login_user_home() -> str | None:
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root":
+        try:
+            return pwd.getpwnam(sudo_user).pw_dir
+        except KeyError:
+            return None
+    return None
+
+
+def _tool_fallback_dirs() -> tuple[str, ...]:
+    dirs = list(TOOL_FALLBACK_DIRS)
+    login_home = _login_user_home()
+    if login_home:
+        dirs.append(os.path.join(login_home, ".local/bin"))
+    return tuple(dict.fromkeys(dirs))
+
+
 def _tool_subprocess_env() -> dict[str, str]:
-    return {**os.environ, "PATH": f"{TOOL_SUBPROCESS_PATH_PREFIX}:{os.environ.get('PATH', '')}"}
+    prefix = ":".join((*_tool_fallback_dirs(), "/bin"))
+    return {**os.environ, "PATH": f"{prefix}:{os.environ.get('PATH', '')}"}
+
+
+def unit_for(token: str) -> str:
+    validate_supervised_process(token, action="unit")
+    mapping = MACOS_UNIT_MAP if IS_MACOS else LINUX_UNIT_MAP
+    return mapping[token]
 
 
 def utcnow() -> dt.datetime:
@@ -324,6 +364,56 @@ def verify_plan(
 def validate_supervised_process(target: str, *, action: str) -> None:
     if target not in SUPERVISED_PROCESS_ALLOWLIST:
         raise ConvergerError(f"{action}_not_allowlisted:{target}")
+
+
+def _sudo_uid() -> int | None:
+    value = os.environ.get("SUDO_UID")
+    if not value:
+        return None
+    try:
+        uid = int(value)
+    except ValueError:
+        return None
+    return uid if uid > 0 else None
+
+
+def _console_uid() -> int | None:
+    try:
+        result = subprocess.run([_resolve_tool("stat"), "-f", "%u", "/dev/console"], check=True, capture_output=True, text=True)
+        uid = int(result.stdout.strip())
+    except (ConvergerError, OSError, subprocess.CalledProcessError, ValueError):
+        return None
+    return uid if uid > 0 else None
+
+
+def _launch_agent_plist_owner_uid(label: str) -> int | None:
+    homes: list[str] = []
+    login_home = _login_user_home()
+    if login_home:
+        homes.append(login_home)
+    for user_home in pathlib.Path("/Users").glob("*/Library/LaunchAgents"):
+        homes.append(str(user_home.parent.parent))
+    for home in dict.fromkeys(homes):
+        plist = pathlib.Path(home) / "Library" / "LaunchAgents" / f"{label}.plist"
+        try:
+            uid = plist.stat().st_uid
+        except OSError:
+            continue
+        if uid > 0:
+            return uid
+    return None
+
+
+def _launchd_target(token: str, label: str) -> str:
+    if token in MACOS_USER_AGENT_TOKENS:
+        # The converger normally runs as root via sudo, while the node is a login
+        # user's LaunchAgent. Prefer SUDO_UID from sudo's preserved context, then
+        # the plist owner, then the active console uid.
+        uid = _sudo_uid() or _launch_agent_plist_owner_uid(label) or _console_uid()
+        if uid is None:
+            raise ConvergerError(f"launchd_user_uid_not_found:{label}")
+        return f"gui/{uid}/{label}"
+    return f"system/{label}"
 
 
 def validate_git_ref(target_ref: str) -> None:
@@ -749,28 +839,34 @@ class HostOps:
             )
 
     def restart_units(self, plan: VerifiedPlan) -> None:
-        for unit in plan.restart_units:
-            validate_supervised_process(unit, action="restart_unit")
-            self.journal_before("restart", {"unit": unit})
-            if unit.endswith(".service"):
+        for token in plan.restart_units:
+            validate_supervised_process(token, action="restart_unit")
+            unit = unit_for(token)
+            self.journal_before("restart", {"unit": unit, "token": token})
+            if IS_MACOS and token not in DOCKER_TOKENS:
+                subprocess.run([_resolve_tool("launchctl"), "kickstart", "-k", _launchd_target(token, unit)], check=True)
+            elif unit.endswith(".service"):
                 subprocess.run([_resolve_tool("systemctl"), "restart", unit], check=True)
             else:
                 subprocess.run([_resolve_tool("docker"), "restart", unit], check=True)
 
     def record_reload_and_signal(self, plan: VerifiedPlan) -> str:
-        for process in plan.affected_processes:
-            validate_supervised_process(process, action="reload_target")
+        for token in plan.affected_processes:
+            validate_supervised_process(token, action="reload_target")
         reload_at = iso_now()
         path = self.state.state_dir / "reload-signal-times.json"
         times = self.state.read_json(path, {})
-        for process in plan.affected_processes:
-            times.setdefault(process, {})[plan.artifact] = reload_at
+        for token in plan.affected_processes:
+            times.setdefault(token, {})[plan.artifact] = reload_at
         self.journal_before("record_reload_signal_at", {"path": str(path), "reload_signal_at": reload_at})
         self.state.write_json_0640(path, times)
-        for process in plan.affected_processes:
-            self.journal_before("signal_reload", {"process": process})
-            if process.endswith(".service"):
-                subprocess.run([_resolve_tool("systemctl"), "kill", "-s", "HUP", process], check=True)
+        for token in plan.affected_processes:
+            unit = unit_for(token)
+            self.journal_before("signal_reload", {"process": unit, "token": token})
+            if IS_MACOS and token not in DOCKER_TOKENS:
+                subprocess.run([_resolve_tool("launchctl"), "kickstart", "-k", _launchd_target(token, unit)], check=True)
+            elif unit.endswith(".service"):
+                subprocess.run([_resolve_tool("systemctl"), "kill", "-s", "HUP", unit], check=True)
         return reload_at
 
     def poll_runtime_ack(self, plan: VerifiedPlan, signal_at: str, timeout_s: int = 30) -> dict[str, Any] | None:
@@ -784,10 +880,7 @@ class HostOps:
 
 
 def read_runtime_proof(artifact: str, target_ref: str, signal_at: str | None = None) -> dict[str, Any] | None:
-    roots = [pathlib.Path("/run/chief/runtime")]
-    tmp = os.environ.get("TMPDIR")
-    if tmp:
-        roots.append(pathlib.Path(tmp) / "chief/runtime")
+    roots = runtime_stamp_roots()
     min_time = parse_time(signal_at) if signal_at else None
     for root in roots:
         if not root.exists():
@@ -802,6 +895,8 @@ def read_runtime_proof(artifact: str, target_ref: str, signal_at: str | None = N
             if data.get("loaded_ref") != target_ref or data.get("health") not in {None, "healthy"}:
                 continue
             if min_time and (not observed or parse_time(str(observed)) <= min_time):
+                continue
+            if min_time and dt.datetime.fromtimestamp(stat.st_mtime, dt.timezone.utc) <= min_time:
                 continue
             try:
                 pid = int(data["pid"])
@@ -823,6 +918,21 @@ def read_runtime_proof(artifact: str, target_ref: str, signal_at: str | None = N
                 },
             }
     return None
+
+
+def runtime_stamp_roots() -> list[pathlib.Path]:
+    override = os.environ.get("HERMES_RUNTIME_STAMP_DIR")
+    if override:
+        return [pathlib.Path(override)]
+    if IS_MACOS:
+        # The macOS node's default tempfile directory may be per-user, while the
+        # converger runs as root. The node LaunchAgent must set this same path.
+        return [MACOS_RUNTIME_STAMP_DIR]
+    roots = [pathlib.Path("/run/chief/runtime")]
+    tmp = os.environ.get("TMPDIR")
+    if tmp:
+        roots.append(pathlib.Path(tmp) / "chief/runtime")
+    return roots
 
 
 def plan_only_output(plan: VerifiedPlan, idle: IdleSnapshot | None) -> str:
