@@ -1174,7 +1174,15 @@ def converge(args: argparse.Namespace, reconcile_mode: bool = False) -> int:
     if args.plan_only:
         print(plan_only_output(verified, idle))
         return 0
-    result = execute_plan(verified, HostOps(state, transport), idle_snapshot, read_idle_snapshot)
+    try:
+        result = execute_plan(verified, HostOps(state, transport), idle_snapshot, read_idle_snapshot)
+    except BaseException:
+        import traceback as _tb
+        try:
+            pathlib.Path("/tmp/converger_traceback.txt").write_text(_tb.format_exc())
+        except Exception:
+            pass
+        raise
     return 0 if result in {"applied", "deferred", "rolled_back"} else 1
 
 
