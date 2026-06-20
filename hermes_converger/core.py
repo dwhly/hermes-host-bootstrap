@@ -853,6 +853,11 @@ class HostOps:
             resolve = subprocess.run([git, "rev-parse", "--verify", "--quiet", f"{target_ref}^{{commit}}"],
                                      cwd=path, env=env, capture_output=True, text=True)
             if resolve is not None and getattr(resolve, "returncode", 0) != 0:
+                try:
+                    with open("/tmp/converger_fetch_debug.txt", "w") as _f:
+                        _f.write(f"cwd={path}\ntarget={target_ref}\nfetch_rc={getattr(fetch,'returncode','?')}\nfetch_err={getattr(fetch,'stderr','')}\nresolve_rc={resolve.returncode}\nresolve_out={resolve.stdout}\nresolve_err={resolve.stderr}\nuid={os.getuid()}\n")
+                except Exception:
+                    pass
                 raise ConvergerError(f"target_ref_not_resolvable:{target_ref}")
             subprocess.run([git, "checkout", "--detach", target_ref], cwd=path, env=env, check=True)
 
