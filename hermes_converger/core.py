@@ -148,10 +148,17 @@ ROOT_GIT_CRED = "/etc/chief/.git-fleet-credentials"
 def _git_fetch_env() -> dict[str, str]:
     env = _tool_subprocess_env()
     env["GIT_TERMINAL_PROMPT"] = "0"
+    # Inject git config via env (no on-disk config needed). The converger runs as
+    # ROOT on macOS but the repo is owned by the login user → git's dubious-ownership
+    # guard would abort rev-parse/fetch/checkout; safe.directory=* permits it. The
+    # credential helper (when the root cred file exists) lets root fetch from origin.
+    keys: list[tuple[str, str]] = [("safe.directory", "*")]
     if os.path.isfile(ROOT_GIT_CRED):
-        env["GIT_CONFIG_COUNT"] = "1"
-        env["GIT_CONFIG_KEY_0"] = "credential.https://github.com.helper"
-        env["GIT_CONFIG_VALUE_0"] = f"store --file={ROOT_GIT_CRED}"
+        keys.append(("credential.https://github.com.helper", f"store --file={ROOT_GIT_CRED}"))
+    env["GIT_CONFIG_COUNT"] = str(len(keys))
+    for i, (k, v) in enumerate(keys):
+        env[f"GIT_CONFIG_KEY_{i}"] = k
+        env[f"GIT_CONFIG_VALUE_{i}"] = v
     return env
 
 
