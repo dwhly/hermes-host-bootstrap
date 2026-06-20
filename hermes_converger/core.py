@@ -49,6 +49,9 @@ MACOS_UNIT_MAP = {
 DOCKER_TOKENS = {"chief-core"}
 MACOS_USER_AGENT_TOKENS = {"chief-node"}
 MACOS_RUNTIME_STAMP_DIR = pathlib.Path("/var/run/chief/runtime")
+# Volatile run dir base differs by OS: macOS has /var/run (no /run); Linux uses /run.
+# Keep ALL volatile convergence paths (lease lock, runtime stamp fallback) consistent.
+RUN_BASE = "/var/run" if IS_MACOS else "/run"
 ARTIFACT_PROCESS_MAP = {
     "chief": (("chief-core",), ("chief-core",)),
     "hermes-node": (("chief-node",), ("chief-node",)),
@@ -490,7 +493,7 @@ def build_execution_plan(plan: VerifiedPlan, idle: IdleSnapshot | None) -> list[
         steps.append(PlanStep("evaluate_idle", dataclasses.asdict(idle) if idle else {"idle": "unknown"}, False))
         steps.extend(
             [
-                PlanStep("acquire_convergence_lease", {"ttl_s": LEASE_TTL_S, "lock": f"/run/chief/convergence/{plan.raw['node_id']}.lock"}, True),
+                PlanStep("acquire_convergence_lease", {"ttl_s": LEASE_TTL_S, "lock": f"{RUN_BASE}/chief/convergence/{plan.raw['node_id']}.lock"}, True),
                 PlanStep("reevaluate_idle_inside_lease", {"abort_reason": "accepted_work_after_idle_check"}, False),
                 PlanStep("fetch", {"artifact": plan.artifact, "target_ref": target, "destination": "fixed_repo_path"}, True),
                 PlanStep("emit_fetched", {"event": "hermes.fleet.convergence.fetched"}, True),
@@ -507,7 +510,7 @@ class LocalState:
     def __init__(self, root: pathlib.Path = pathlib.Path("/")):
         self.root = root
         self.state_dir = self._path("/var/lib/chief/converger")
-        self.run_dir = self._path("/run/chief/convergence")
+        self.run_dir = self._path(f"{RUN_BASE}/chief/convergence")
 
     def _path(self, absolute: str) -> pathlib.Path:
         return self.root / absolute.lstrip("/")
