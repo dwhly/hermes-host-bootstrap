@@ -40,6 +40,8 @@ AGENT
   + Codex CLI (via npm)
   + Himalaya Email CLI (IMAP/SMTP; used by Hermes email-assistant workflows)
   + faster-whisper (Hermes local STT)
+  + Fabric AI CLI (danielmiessler/fabric; patterns/prompts over any LLM;
+    release-binary installer → ~/.local/bin; run `fabric --setup` per host for keys)
   + playwright system deps + bundled chromium
 
 GHOSTTY (client/both role only)
