@@ -875,15 +875,23 @@ class HostOps:
         }
         return mapping[artifact]
 
+    def _login_user(self) -> str | None:
+        # The user that owns the macOS venv / LaunchAgent (converger runs as root).
+        return os.environ.get("SUDO_USER") or (os.environ.get("USER") if os.getuid() != 0 else None)
+
     def install_restart_required(self, plan: VerifiedPlan) -> None:
         self.journal_before("install", {"artifact": plan.artifact})
         if plan.artifact == "hermes-node":
-            subprocess.run(
-                [_resolve_tool("uv"), "pip", "install", "--python", ".venv/bin/python", "-q", "-e", "../chief-spec/sdk/python", "-e", "."],
-                cwd=f"{self._chief_code_root()}/hermes-node",
-                env=_tool_subprocess_env(),
-                check=True,
-            )
+            cwd = f"{self._chief_code_root()}/hermes-node"
+            cmd = [_resolve_tool("uv"), "pip", "install", "--python", ".venv/bin/python", "-q", "-e", "../chief-spec/sdk/python", "-e", "."]
+            # On macOS the venv is owned by the LOGIN user, not root. The converger runs
+            # as root (via the scoped sudoers), so a plain `uv pip install` would create
+            # root-owned files inside the user's venv and break the user's own deploys.
+            # Drop to the login user for the install (root->user needs no password).
+            user = self._login_user()
+            if IS_MACOS and user and user != "root":
+                cmd = ["/usr/bin/sudo", "-n", "-u", user, *cmd]
+            subprocess.run(cmd, cwd=cwd, env=_tool_subprocess_env(), check=True)
 
     def restart_units(self, plan: VerifiedPlan) -> None:
         for token in plan.restart_units:
