@@ -1075,6 +1075,10 @@ def execute_plan(
         ops.emit("deferred", plan, reason=exc.reason, idle_snapshot=exc.snapshot)
         return "deferred"
     except Exception as exc:
+        try:
+            pathlib.Path("/tmp/converger_traceback.txt").write_text(f"{type(exc).__name__}: {exc}\n" + __import__("traceback").format_exc())
+        except Exception:
+            pass
         ops.emit("failed", plan, reason=type(exc).__name__, verification=None)
         rolled = attempt_rollback_once(plan, ops)
         if rolled:
