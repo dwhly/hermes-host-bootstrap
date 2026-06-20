@@ -853,26 +853,22 @@ class HostOps:
             resolve = subprocess.run([git, "rev-parse", "--verify", "--quiet", f"{target_ref}^{{commit}}"],
                                      cwd=path, env=env, capture_output=True, text=True)
             if resolve is not None and getattr(resolve, "returncode", 0) != 0:
-                try:
-                    with open("/tmp/converger_fetch_debug.txt", "w") as _f:
-                        _f.write(f"cwd={path}\ntarget={target_ref}\nfetch_rc={getattr(fetch,'returncode','?')}\nfetch_err={getattr(fetch,'stderr','')}\nresolve_rc={resolve.returncode}\nresolve_out={resolve.stdout}\nresolve_err={resolve.stderr}\nuid={os.getuid()}\n")
-                except Exception:
-                    pass
                 raise ConvergerError(f"target_ref_not_resolvable:{target_ref}")
             subprocess.run([git, "checkout", "--detach", target_ref], cwd=path, env=env, check=True)
 
     def _chief_code_root(self) -> str:
         # Where the chief git working copies live. Linux/h-do1: /root/code/chief.
         # macOS: the login user's ~/code/chief (the converger runs as root, so derive
-        # the login user from SUDO_USER, not root's HOME). Overridable for tests/odd
-        # layouts via CHIEF_CODE_ROOT.
+        # the login user's REAL home from the password DB — NOT /Users/<user>, because
+        # the username can differ from the home dir basename, e.g. user 'danz' lives in
+        # /Users/dan_1 on h-mini). Overridable for tests/odd layouts via CHIEF_CODE_ROOT.
         env = os.environ.get("CHIEF_CODE_ROOT")
         if env:
             return env.rstrip("/")
         if IS_MACOS:
-            user = os.environ.get("SUDO_USER") or os.environ.get("USER") or ""
-            if user:
-                return f"/Users/{user}/code/chief"
+            home = _login_user_home()
+            if home:
+                return f"{home.rstrip('/')}/code/chief"
         return "/root/code/chief"
 
     def artifact_path(self, artifact: str) -> str:
@@ -1075,10 +1071,6 @@ def execute_plan(
         ops.emit("deferred", plan, reason=exc.reason, idle_snapshot=exc.snapshot)
         return "deferred"
     except Exception as exc:
-        try:
-            pathlib.Path("/tmp/converger_traceback.txt").write_text(f"{type(exc).__name__}: {exc}\n" + __import__("traceback").format_exc())
-        except Exception:
-            pass
         ops.emit("failed", plan, reason=type(exc).__name__, verification=None)
         rolled = attempt_rollback_once(plan, ops)
         if rolled:
@@ -1178,15 +1170,7 @@ def converge(args: argparse.Namespace, reconcile_mode: bool = False) -> int:
     if args.plan_only:
         print(plan_only_output(verified, idle))
         return 0
-    try:
-        result = execute_plan(verified, HostOps(state, transport), idle_snapshot, read_idle_snapshot)
-    except BaseException:
-        import traceback as _tb
-        try:
-            pathlib.Path("/tmp/converger_traceback.txt").write_text(_tb.format_exc())
-        except Exception:
-            pass
-        raise
+    result = execute_plan(verified, HostOps(state, transport), idle_snapshot, read_idle_snapshot)
     return 0 if result in {"applied", "deferred", "rolled_back"} else 1
 
 
