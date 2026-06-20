@@ -19,30 +19,56 @@ set -euo pipefail
 CORE="${CHIEF_CORE_URL:-http://100.122.202.37:8088}"
 SRC_ROOT="${CHIEF_SRC_ROOT:-/root/code/chief}"          # source of truth on h-do1
 BOOTSTRAP_SRC="${CHIEF_BOOTSTRAP_SRC:-/root/projects/hermes-host-bootstrap}"
-
-# host  -> "ssh_target|home|role"   (ssh_target empty = local)
-declare -A HOSTS=(
-  [h-do1]="|/root|server"
-  [h-mini2]="dano@h-mini2|/Users/dano|both"
-  [h-mini]="danz@h-mini|/Users/dan_1|both"
-)
+HOSTS_DIR="${HERMES_HOME:-$HOME/.hermes}/hosts"          # SINGLE source of truth: registry
 
 log() { printf '\033[36m[deploy-node %s]\033[0m %s\n' "$1" "$2" >&2; }
 err() { printf '\033[31m[deploy-node %s] ERROR:\033[0m %s\n' "$1" "$2" >&2; }
 
+# Read a top-level scalar (or nested under a known parent) from a host registry yaml.
+_yget() {  # _yget <file> <key>
+  grep -E "^[[:space:]]*$2:" "$1" 2>/dev/null | head -1 \
+    | sed -E "s/^[[:space:]]*$2:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^\"?([^\"]*)\"?[[:space:]]*$/\1/"
+}
+
+# Derive ssh_target|home|role from the registry yaml — NO hardcoded host list.
+# Adding a host to ~/.hermes/hosts/<h>.yaml is the ONE action that lights it up here.
+host_spec() {  # host_spec <host> -> echoes "ssh_target|home|role" or returns 2
+  local host="$1" yaml="$HOSTS_DIR/$1.yaml"
+  [[ -f "$yaml" ]] || { err "$host" "no registry entry $yaml — add it to make this host a fleet target"; return 2; }
+  local user ip oskind role self homev
+  user="$(_yget "$yaml" ssh_user)"; [[ -z "$user" ]] && user="$(_yget "$yaml" default_user)"
+  ip="$(_yget "$yaml" ssh_host)"; [[ -z "$ip" ]] && ip="$(_yget "$yaml" tailscale_ip)"
+  oskind="$(_yget "$yaml" kind)"
+  role="$(_yget "$yaml" role)"; [[ -z "$role" ]] && role="both"
+  homev="$(_yget "$yaml" home)"   # explicit home wins (e.g. h-mini: user danz, home /Users/dan_1)
+  # Local host? (this machine IS the target — no ssh)
+  self="$(hostname -s 2>/dev/null)"
+  local ssh_target="" home
+  if [[ "$host" == "$self" || "$host" == "h-do1" ]]; then
+    ssh_target=""; home="${homev:-$HOME}"
+  else
+    [[ -n "$user" && -n "$ip" ]] || { err "$host" "registry missing ssh_user/ssh_host"; return 2; }
+    ssh_target="${user}@${ip}"
+    if [[ -n "$homev" ]]; then home="$homev"
+    elif [[ "$oskind" == "macos" ]]; then home="/Users/${user}"
+    else home="/root"; fi
+  fi
+  printf '%s|%s|%s' "$ssh_target" "$home" "$role"
+}
+
 deploy_one() {
   local host="$1"
-  local spec="${HOSTS[$host]:-}"
-  [[ -z "$spec" ]] && { err "$host" "unknown host"; return 2; }
+  local spec; spec="$(host_spec "$host")" || return $?
   local ssh_target="${spec%%|*}" rest="${spec#*|}"
   local home="${rest%%|*}" role="${rest##*|}"
   local node_dir="$home/code/chief/hermes-node"
   local spec_dir="$home/code/chief/chief-spec/sdk/python"
-  local bootstrap_dir="$home/projects/hermes-host-bootstrap"
+  local bootstrap_dir="$home/code/hermes-host-bootstrap"
+  [[ "$host" == "h-do1" ]] && bootstrap_dir="$BOOTSTRAP_SRC"
 
   # --- reachability (Macs sleep) ---
   if [[ -n "$ssh_target" ]]; then
-    if ! ssh -o ConnectTimeout=10 "$ssh_target" 'true' 2>/dev/null; then
+    if ! ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$ssh_target" 'true' 2>/dev/null; then
       err "$host" "unreachable (asleep/offline) — skipping; re-run when it's online"
       return 1
     fi
@@ -113,7 +139,12 @@ main() {
   [[ -z "$target" ]] && { err "-" "usage: deploy-node <host|all>"; exit 2; }
   local rc=0
   if [[ "$target" == "all" ]]; then
-    for h in "${!HOSTS[@]}"; do deploy_one "$h" || rc=1; done
+    for y in "$HOSTS_DIR"/*.yaml; do
+      [[ -e "$y" ]] || continue
+      local h; h="$(basename "$y" .yaml)"
+      [[ "$h" == *.live ]] && continue
+      deploy_one "$h" || rc=1
+    done
   else
     deploy_one "$target" || rc=$?
   fi
