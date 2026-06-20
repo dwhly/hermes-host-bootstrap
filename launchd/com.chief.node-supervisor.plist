@@ -3,6 +3,10 @@
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.chief.node-supervisor</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HERMES_RUNTIME_STAMP_DIR</key><string>/var/run/chief/runtime</string>
+  </dict>
   <key>ProgramArguments</key>
   <array>
     <string>/usr/local/bin/chief-node-supervisor</string>
