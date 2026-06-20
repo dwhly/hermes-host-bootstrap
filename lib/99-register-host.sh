@@ -101,6 +101,9 @@ DOCKER_VER="$(get_ver 'docker --version')"
 TMUX_VER="$(get_ver 'tmux -V')"
 MOSH_VER="$(mosh --version 2>/dev/null | head -n 1 || echo "not installed")"
 GIT_VER="$(get_ver 'git --version')"
+# Fleet rule (fleet-management playbook): every package in a tier MANIFEST is
+# version-tracked here — no exceptions. Add a *_VER line when you manifest a package.
+FABRIC_VER="$(get_ver 'fabric --version')"
 
 # Resource snapshot
 if [[ "$OS_KIND" == "macos" ]]; then
@@ -184,6 +187,7 @@ versions:
   tmux: "$TMUX_VER"
   mosh: "$MOSH_VER"
   git: "$GIT_VER"
+  fabric: "$FABRIC_VER"
 YAML
 
 ok "host registry: $TARGET"
