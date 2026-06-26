@@ -56,6 +56,22 @@ if have tmux && tier_allows R && ! is_skipped tmux-workspace-colors; then
   ok "tmux workspace colors installed (per-session statusbar)"
 fi
 
+# ~/.zshenv PATH — guarantee ~/.local/bin (and cargo/fnm) on PATH for EVERY zsh,
+# including NON-INTERACTIVE login shells (`zsh -lc`). zsh sources .zshenv for
+# every invocation but only sources .zshrc when interactive; the bootstrap's
+# PATH tweaks historically lived in the zshrc snippet, so `ssh host 'zsh -lc
+# "fleet-cli"'` (e.g. hermes-workspace's remote dispatch) hit "command not
+# found". Sourcing a minimal PATH-only snippet from .zshenv fixes that whole
+# class at the source. Provisioned on every zsh host regardless of OMZ.
+# Skip key: zshenv.
+if have zsh && tier_allows R && ! is_skipped zshenv; then
+  cp "$REPO_ROOT/dotfiles/zshenv-snippet.sh" "$HOME/.hermes-host-bootstrap.zshenv.sh"
+  touch "$HOME/.zshenv"
+  ensure_line "# ── hermes-host-bootstrap zshenv (PATH for non-interactive shells) ──" "$HOME/.zshenv"
+  ensure_line "[ -f $HOME/.hermes-host-bootstrap.zshenv.sh ] && . $HOME/.hermes-host-bootstrap.zshenv.sh" "$HOME/.zshenv"
+  ok "zshenv PATH snippet installed (~/.local/bin on PATH for non-interactive zsh)"
+fi
+
 # oh-my-zsh — only if zsh present, OMZ missing, and user opts in (default: yes for R)
 if have zsh && tier_allows R && ! is_skipped oh-my-zsh; then
   if [[ ! -d "$HOME/.oh-my-zsh" ]]; then
