@@ -126,43 +126,12 @@ if [[ -n "${HERMES_MAC_HOSTNAME:-}" ]] && ! is_skipped mac-hostname; then
   fi
 fi
 
-# Ghostty 4-pane workspace launcher (AppleScript).
-# Drops the .applescript file and a wrapper command, both idempotent. Requires
-# Ghostty 1.3.0+ for AppleScript support (current Homebrew cask is fine).
-if ! is_skipped ghostty-workspace; then
-  if [[ -d /Applications/Ghostty.app ]]; then
-    workspace_dir="$HOME/.hermes-host-bootstrap"
-    mkdir -p "$workspace_dir"
-    cp "$REPO_ROOT/scripts/ghostty-workspace.applescript" \
-       "$workspace_dir/ghostty-workspace.applescript"
-
-    # Wrapper command on PATH — `hermes-workspace` opens the 2x2 grid.
-    bin_dir="$HOME/.local/bin"
-    mkdir -p "$bin_dir"
-    cat > "$bin_dir/hermes-workspace" <<'WRAPPER'
-#!/bin/sh
-# hermes-workspace — open a 4-pane Ghostty grid SSH'd into named tmux sessions.
-#
-# Usage:
-#   hermes-workspace                # default: h-do1 resolved via ~/.hermes/hosts
-#   hermes-workspace h-mini         # resolves via ~/.hermes/hosts/h-mini.yaml
-#   hermes-workspace root@h-do1     # explicit user@host
-#   hmw …                           # same, via the alias
-#
-# Resolve fleet hostnames through ~/.hermes/hosts before AppleScript builds the
-# pane commands. This avoids depending on local MagicDNS/SSH config state.
-target="${1:-h-do1}"
-if command -v hermes-host-resolve >/dev/null 2>&1; then
-  target="$(hermes-host-resolve "$target")"
-fi
-exec osascript "$HOME/.hermes-host-bootstrap/ghostty-workspace.applescript" "$target"
-WRAPPER
-    chmod +x "$bin_dir/hermes-workspace"
-    ok "Ghostty workspace launcher installed (run: hermes-workspace)"
-  else
-    skip "Ghostty not installed yet — workspace launcher skipped"
-  fi
-fi
+# Workspace launcher: now unified + cross-platform (scripts/hermes-workspace,
+# pure bash+tmux), installed on ALL hosts by lib/99-register-host.sh. The old
+# macOS-only Ghostty AppleScript launcher was retired 2026-06 — `hmw` now
+# behaves identically on macOS and Linux (tmux draws the two-pane split; for a
+# remote host it ssh-dispatches to the same script). Nothing macOS-specific to
+# install here anymore.
 
 ok "macOS client setup complete"
 

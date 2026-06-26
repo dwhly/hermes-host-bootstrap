@@ -302,11 +302,11 @@ if [[ -f "$REPO_ROOT/scripts/hermes-tui-theme-patch" ]]; then
 fi
 
 # ── Install hermes-pane on PATH ────────────────────────────────────────
-# Restart-proof per-pane Hermes launcher for the Ghostty workspace. Stamps
-# each pane with its own --source tag and resumes that pane's own most-recent
-# session, so a `hermes update` (which forces a hermes restart) no longer
-# orphans the pane into a fresh empty session. Used by
-# scripts/ghostty-workspace.applescript as each pane's initial command.
+# Restart-proof per-pane Hermes launcher for the workspace. Stamps each pane
+# with its own --source tag and resumes that pane's own most-recent session, so
+# a `hermes update` (which forces a hermes restart) no longer orphans the pane
+# into a fresh empty session. Used by scripts/hermes-workspace as each pane's
+# command.
 if [[ -f "$REPO_ROOT/scripts/hermes-pane" ]]; then
   mkdir -p "$HOME/.local/bin"
   TARGET_LINK="$HOME/.local/bin/hermes-pane"
@@ -315,6 +315,22 @@ if [[ -f "$REPO_ROOT/scripts/hermes-pane" ]]; then
   fi
   ln -s "$REPO_ROOT/scripts/hermes-pane" "$TARGET_LINK"
   ok "hermes-pane → $TARGET_LINK"
+fi
+
+# ── Install hermes-workspace on PATH ───────────────────────────────────
+# Unified, pure bash+tmux workspace launcher (alias: hmw). ONE implementation
+# for the whole fleet — identical on macOS and Linux, no AppleScript/Ghostty
+# API. Two side-by-side panes (code | scratch) drawn by tmux; `hmw <host>`
+# ssh-dispatches to the same script on the remote. Replaces the old macOS-only
+# ghostty-workspace.applescript wrapper.
+if [[ -f "$REPO_ROOT/scripts/hermes-workspace" ]]; then
+  mkdir -p "$HOME/.local/bin"
+  TARGET_LINK="$HOME/.local/bin/hermes-workspace"
+  if [[ -L "$TARGET_LINK" || -f "$TARGET_LINK" ]]; then
+    rm -f "$TARGET_LINK"
+  fi
+  ln -s "$REPO_ROOT/scripts/hermes-workspace" "$TARGET_LINK"
+  ok "hermes-workspace → $TARGET_LINK"
 fi
 
 # Helpful hint for the user: if ~/.hermes is git-tracked (the typical

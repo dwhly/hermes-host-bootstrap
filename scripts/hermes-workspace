@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# hermes-workspace (alias: hmw) — unified, pure bash+tmux workspace launcher.
+#
+# ONE implementation for the whole fleet. Identical on macOS and Linux; no
+# AppleScript, no Ghostty API, no GUI-pane choreography. Replaces the old
+# macOS-only ghostty-workspace.applescript. The GUI terminal (Ghostty,
+# Terminal.app, iTerm, a Linux console, …) is just a dumb transport — tmux
+# draws the layout.
+#
+# Symlinked to ~/.local/bin/hermes-workspace by lib/99-register-host.sh.
+#
+# LAYOUT: exactly TWO panes, side by side, in ONE tmux window named "ws":
+#     ┌───────────────┬───────────────┐
+#     │  code         │  scratch      │
+#     │  hermes-pane  │  hermes-pane  │
+#     └───────────────┴───────────────┘
+# Each pane runs `hermes-pane <label>`, the restart-proof launcher that tags
+# the session (--source pane:<label>) and resumes that pane's own most-recent
+# session across `hermes update` (see the tmux-workspace-pattern skill).
+#
+# USAGE
+#   hermes-workspace                # build + attach the split on THIS host
+#   hermes-workspace <host>         # ssh -t into <host> and build + attach there
+#   hermes-workspace user@host      # explicit ssh target
+#   hmw [host]                      # alias
+#
+# Remote mode (`hmw h-do1` from a Mac) is the common case: it opens ONE ssh
+# connection and attaches a single tmux window that tmux splits server-side, so
+# the workspace survives disconnect/sleep — strictly better than GUI panes,
+# which die with the window.
+
+set -uo pipefail
+
+# ── Remote dispatch ──────────────────────────────────────────────────────
+# If given a host arg, re-invoke THIS SAME script on the remote over ssh -t.
+# We don't copy the script; the remote already has it (same bootstrap install),
+# so we just call `hermes-workspace` there with no args → it runs in local mode.
+if [ "$#" -gt 0 ]; then
+  target="$1"
+  case "$target" in
+    *@*) ssh_target="$target" ;;
+    h-mini) ssh_target="danz@$target" ;;     # h-mini logs in as danz
+    *)      ssh_target="$target" ;;          # rely on ~/.ssh/config / hosts.yaml default_user
+  esac
+  # -t forces a TTY so tmux attaches interactively. Login shell on the remote
+  # ensures ~/.local/bin (where hermes-workspace lives) is on PATH.
+  exec ssh -t "$ssh_target" 'exec "$SHELL" -lc "hermes-workspace"'
+fi
+
+# ── Local mode: build the two-pane split and attach ──────────────────────
+PANE_CMD="hermes-pane"
+if ! command -v "$PANE_CMD" >/dev/null 2>&1; then
+  echo "hermes-workspace: '$PANE_CMD' not on PATH — run hermes-reload (hmr) to install it." >&2
+  exit 1
+fi
+
+SESSION=ws
+
+if tmux has-session -t "=$SESSION" 2>/dev/null; then
+  # Already built — just (re)attach / switch to it. hermes-pane in each pane
+  # has kept the panes alive (it drops to a shell on hermes exit), so resuming
+  # the existing window preserves both panes' live state.
+  if [ -n "${TMUX:-}" ]; then
+    exec tmux switch-client -t "$SESSION"
+  else
+    exec tmux attach-session -t "$SESSION"
+  fi
+fi
+
+# Fresh build: window with the left (code) pane, split right for scratch.
+tmux new-session  -d -s "$SESSION" -n ws "$PANE_CMD code"
+tmux split-window -h -t "$SESSION":ws "$PANE_CMD scratch"
+tmux select-layout -t "$SESSION":ws even-horizontal   # equal 50/50 left|right
+tmux select-pane   -t "$SESSION":ws.0                 # focus the code pane
+
+if [ -n "${TMUX:-}" ]; then
+  exec tmux switch-client -t "$SESSION"
+else
+  exec tmux attach-session -t "$SESSION"
+fi
