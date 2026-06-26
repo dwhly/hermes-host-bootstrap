@@ -96,9 +96,14 @@ if [ -n "$host" ]; then
       [ -n "${ssh_target:-}" ] || ssh_target="$host"
       ;;
   esac
-  # -t forces a TTY so tmux attaches interactively. Login shell on the remote
-  # ensures ~/.local/bin (where hermes-workspace lives) is on PATH.
-  exec ssh -t "$ssh_target" "exec \"\$SHELL\" -lc \"hermes-workspace $panes\""
+  # -t forces a TTY so tmux attaches interactively. We DON'T rely on the remote
+  # login shell putting ~/.local/bin on PATH: a non-interactive `zsh -lc` sources
+  # .zprofile/.zlogin but SKIPS .zshrc, and the bootstrap adds ~/.local/bin only
+  # in .zshrc — so `hermes-workspace` would be "command not found". Instead we
+  # prepend ~/.local/bin explicitly (that's where 99-register-host symlinks it)
+  # before invoking, which is robust across bash/zsh and interactive/login modes.
+  exec ssh -t "$ssh_target" \
+    "exec \"\$SHELL\" -lc 'PATH=\"\$HOME/.local/bin:\$PATH\" hermes-workspace $panes'"
 fi
 
 # ── Local mode: build N stably-named panes side by side, then attach ───────
