@@ -2,52 +2,71 @@
 # hermes-workspace (alias: hmw) — unified, pure bash+tmux workspace launcher.
 #
 # ONE implementation for the whole fleet. Identical on macOS and Linux; no
-# AppleScript, no Ghostty API, no GUI-pane choreography. Replaces the old
-# macOS-only ghostty-workspace.applescript. The GUI terminal (Ghostty,
-# Terminal.app, iTerm, a Linux console, …) is just a dumb transport — tmux
-# draws the layout.
+# AppleScript, no Ghostty API, no GUI-pane choreography. The GUI terminal
+# (Ghostty, Terminal.app, iTerm, a Linux console, …) is just a dumb transport —
+# tmux draws the layout.
 #
 # Symlinked to ~/.local/bin/hermes-workspace by lib/99-register-host.sh.
 #
-# LAYOUT: exactly TWO panes, side by side, in ONE tmux window named "ws":
-#     ┌───────────────┬───────────────┐
-#     │  code         │  scratch      │
-#     │  hermes-pane  │  hermes-pane  │
-#     └───────────────┴───────────────┘
-# Each pane runs `hermes-pane <label>`, the restart-proof launcher that tags
-# the session (--source pane:<label>) and resumes that pane's own most-recent
-# session across `hermes update` (see the tmux-workspace-pattern skill).
+# LAYOUT: N side-by-side panes in ONE tmux window named "ws". Panes are named
+# STABLY H1, H2, H3, … so `hmw N` always builds the first N — i.e. `hmw 3`'s
+# first two panes (H1, H2) are exactly the same sessions as `hmw 2`:
+#     hmw 2 →  ┌──────┬──────┐        hmw 3 → ┌─────┬─────┬─────┐
+#              │  H1  │  H2  │                │ H1  │ H2  │ H3  │
+#              └──────┴──────┘                └─────┴─────┴─────┘
+# Each pane runs `hermes-pane H<n>`, the restart-proof launcher that tags the
+# session (--source pane:H<n>) and resumes that pane's own most-recent session
+# across `hermes update` (see the tmux-workspace-pattern skill).
 #
 # USAGE
-#   hermes-workspace                # build + attach the split on THIS host
-#   hermes-workspace <host>         # ssh -t into <host> and build + attach there
-#   hermes-workspace user@host      # explicit ssh target
-#   hmw [host]                      # alias
+#   hermes-workspace                # 2 panes (default) on THIS host
+#   hermes-workspace N              # N panes on THIS host (N >= 1)
+#   hermes-workspace <host>         # 2 panes on <host> (ssh -t)
+#   hermes-workspace <host> N       # N panes on <host>
+#   hermes-workspace user@host N    # explicit ssh target + count
+#   hmw [host] [N]                  # alias (order of host/N is flexible)
 #
-# Remote mode (`hmw h-do1` from a Mac) is the common case: it opens ONE ssh
-# connection and attaches a single tmux window that tmux splits server-side, so
-# the workspace survives disconnect/sleep — strictly better than GUI panes,
-# which die with the window.
+# Remote mode (`hmw h-do1` from a Mac) opens ONE ssh connection and attaches a
+# single tmux window that tmux splits server-side, so the workspace survives
+# disconnect/sleep — strictly better than GUI panes, which die with the window.
 
 set -uo pipefail
 
+DEFAULT_PANES=2
+
+# ── Parse args: a bare integer is the pane COUNT; anything else is the HOST.
+# Order-independent, so `hmw h-do1 3` and `hmw 3 h-do1` both work.
+host=""
+panes=""
+for arg in "$@"; do
+  if [[ "$arg" =~ ^[0-9]+$ ]]; then
+    panes="$arg"
+  else
+    host="$arg"
+  fi
+done
+panes="${panes:-$DEFAULT_PANES}"
+if [ "$panes" -lt 1 ]; then
+  echo "hermes-workspace: pane count must be >= 1 (got $panes)" >&2
+  exit 2
+fi
+
 # ── Remote dispatch ──────────────────────────────────────────────────────
-# If given a host arg, re-invoke THIS SAME script on the remote over ssh -t.
-# We don't copy the script; the remote already has it (same bootstrap install),
-# so we just call `hermes-workspace` there with no args → it runs in local mode.
-if [ "$#" -gt 0 ]; then
-  target="$1"
-  case "$target" in
-    *@*) ssh_target="$target" ;;
-    h-mini) ssh_target="danz@$target" ;;     # h-mini logs in as danz
-    *)      ssh_target="$target" ;;          # rely on ~/.ssh/config / hosts.yaml default_user
+# If a host was given, re-invoke THIS SAME script on the remote over ssh -t,
+# forwarding the pane count. The remote already has hermes-workspace on PATH
+# (same bootstrap install), so we just call it there with the count.
+if [ -n "$host" ]; then
+  case "$host" in
+    *@*) ssh_target="$host" ;;
+    h-mini) ssh_target="danz@$host" ;;        # h-mini logs in as danz
+    *)      ssh_target="$host" ;;             # rely on ~/.ssh/config / hosts.yaml default_user
   esac
   # -t forces a TTY so tmux attaches interactively. Login shell on the remote
   # ensures ~/.local/bin (where hermes-workspace lives) is on PATH.
-  exec ssh -t "$ssh_target" 'exec "$SHELL" -lc "hermes-workspace"'
+  exec ssh -t "$ssh_target" "exec \"\$SHELL\" -lc \"hermes-workspace $panes\""
 fi
 
-# ── Local mode: build the two-pane split and attach ──────────────────────
+# ── Local mode: build N stably-named panes side by side, then attach ───────
 PANE_CMD="hermes-pane"
 if ! command -v "$PANE_CMD" >/dev/null 2>&1; then
   echo "hermes-workspace: '$PANE_CMD' not on PATH — run hermes-reload (hmr) to install it." >&2
@@ -56,25 +75,39 @@ fi
 
 SESSION=ws
 
-if tmux has-session -t "=$SESSION" 2>/dev/null; then
-  # Already built — just (re)attach / switch to it. hermes-pane in each pane
-  # has kept the panes alive (it drops to a shell on hermes exit), so resuming
-  # the existing window preserves both panes' live state.
+attach() {
   if [ -n "${TMUX:-}" ]; then
     exec tmux switch-client -t "$SESSION"
   else
     exec tmux attach-session -t "$SESSION"
   fi
+}
+
+# Stable pane label for index n (1-based): H1, H2, H3, …
+label_for() { echo "H$1"; }
+
+if tmux has-session -t "=$SESSION" 2>/dev/null; then
+  # Session exists. Add any panes still missing up to the requested count so
+  # `hmw 3` after a prior `hmw 2` just adds H3 (H1/H2 keep their live state).
+  # We never destroy or shrink an existing workspace.
+  have="$(tmux list-panes -t "$SESSION":ws 2>/dev/null | wc -l | tr -d ' ')"
+  n="$have"
+  while [ "$n" -lt "$panes" ]; do
+    n=$((n + 1))
+    tmux split-window -h -t "$SESSION":ws "$PANE_CMD $(label_for "$n")"
+    tmux select-layout -t "$SESSION":ws even-horizontal
+  done
+  tmux select-pane -t "$SESSION":ws.0
+  attach
 fi
 
-# Fresh build: window with the left (code) pane, split right for scratch.
-tmux new-session  -d -s "$SESSION" -n ws "$PANE_CMD code"
-tmux split-window -h -t "$SESSION":ws "$PANE_CMD scratch"
-tmux select-layout -t "$SESSION":ws even-horizontal   # equal 50/50 left|right
-tmux select-pane   -t "$SESSION":ws.0                 # focus the code pane
-
-if [ -n "${TMUX:-}" ]; then
-  exec tmux switch-client -t "$SESSION"
-else
-  exec tmux attach-session -t "$SESSION"
-fi
+# Fresh build: window with H1, then split right for H2..HN.
+tmux new-session -d -s "$SESSION" -n ws "$PANE_CMD $(label_for 1)"
+n=1
+while [ "$n" -lt "$panes" ]; do
+  n=$((n + 1))
+  tmux split-window -h -t "$SESSION":ws "$PANE_CMD $(label_for "$n")"
+done
+tmux select-layout -t "$SESSION":ws even-horizontal   # equal-width columns
+tmux select-pane   -t "$SESSION":ws.0                 # focus the first (H1) pane
+attach
