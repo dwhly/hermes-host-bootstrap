@@ -80,10 +80,21 @@ fi
 # script on the remote over ssh -t, forwarding the pane count. The remote
 # already has hermes-workspace on PATH (same bootstrap install).
 if [ -n "$host" ]; then
+  # Resolve the host through the fleet registry (~/.hermes/hosts/<host>.yaml) so
+  # a bare name like "h-do1" becomes a reachable "root@100.122.202.37" — the
+  # SAME resolution hssh / hermes-fleet use. Without this, bare `ssh h-do1` on a
+  # Mac depends on ~/.ssh/config or MagicDNS and times out when neither resolves
+  # the name to the tailnet IP. Preserve explicit user@host untouched.
   case "$host" in
-    *@*) ssh_target="$host" ;;
-    h-mini) ssh_target="danz@$host" ;;        # h-mini logs in as danz
-    *)      ssh_target="$host" ;;             # rely on ~/.ssh/config / hosts.yaml default_user
+    *@*) ssh_target="$host" ;;               # explicit target — honor verbatim
+    *)
+      if command -v hermes-host-resolve >/dev/null 2>&1; then
+        ssh_target="$(hermes-host-resolve "$host" 2>/dev/null || true)"
+      fi
+      # Fall back to the raw name if the resolver is missing or returns nothing
+      # (e.g. host not in the registry → rely on ~/.ssh/config as before).
+      [ -n "${ssh_target:-}" ] || ssh_target="$host"
+      ;;
   esac
   # -t forces a TTY so tmux attaches interactively. Login shell on the remote
   # ensures ~/.local/bin (where hermes-workspace lives) is on PATH.
