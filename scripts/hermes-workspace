@@ -19,20 +19,31 @@
 # across `hermes update` (see the tmux-workspace-pattern skill).
 #
 # USAGE
-#   hermes-workspace                # 2 panes (default) on THIS host
-#   hermes-workspace N              # N panes on THIS host (N >= 1)
+#   hermes-workspace                # 2 panes on the DEFAULT host (h-do1) — or
+#                                   #   locally if you're already on h-do1
+#   hermes-workspace N              # N panes on the default host (N >= 1)
 #   hermes-workspace <host>         # 2 panes on <host> (ssh -t)
 #   hermes-workspace <host> N       # N panes on <host>
 #   hermes-workspace user@host N    # explicit ssh target + count
-#   hmw [host] [N]                  # alias (order of host/N is flexible)
+#   hmw [host] [N]                  # alias (host/N order is flexible)
 #
-# Remote mode (`hmw h-do1` from a Mac) opens ONE ssh connection and attaches a
-# single tmux window that tmux splits server-side, so the workspace survives
-# disconnect/sleep — strictly better than GUI panes, which die with the window.
+# DEFAULT TARGET: with no host arg, hmw aims at h-do1 (override via
+# HMW_DEFAULT_HOST), so `hmw` / `hmw 3` from a Mac drives h-do1 — the old
+# reflex. The exception: when you're already ON the default host, bare hmw
+# builds locally (no pointless self-SSH). So `hmw 3` on h-do1 makes 3 panes
+# right there; `hmw 3` on a Mac makes 3 panes on h-do1.
+#
+# Remote mode opens ONE ssh connection and attaches a single tmux window that
+# tmux splits server-side, so the workspace survives disconnect/sleep —
+# strictly better than GUI panes, which die with the window.
 
 set -uo pipefail
 
 DEFAULT_PANES=2
+# Default remote target when no host arg is given AND we're not already on it.
+# Restores the old reflex: bare `hmw` (or `hmw N`) from a Mac drives h-do1.
+# Override per-host via HMW_DEFAULT_HOST (e.g. in ~/.hermes-bootstrap.conf).
+DEFAULT_HOST="${HMW_DEFAULT_HOST:-h-do1}"
 
 # ── Parse args: a bare integer is the pane COUNT; anything else is the HOST.
 # Order-independent, so `hmw h-do1 3` and `hmw 3 h-do1` both work.
@@ -51,10 +62,23 @@ if [ "$panes" -lt 1 ]; then
   exit 2
 fi
 
+# ── Default-target resolution ─────────────────────────────────────────────
+# No explicit host arg → aim at DEFAULT_HOST, EXCEPT when we're already running
+# on that host (avoid a pointless h-do1→h-do1 SSH loopback). Compare on the
+# short hostname against the default's bare name (strip any user@ and domain).
+if [ -z "$host" ]; then
+  default_bare="${DEFAULT_HOST##*@}"; default_bare="${default_bare%%.*}"
+  here="$(hostname -s 2>/dev/null || hostname)"
+  if [ "$here" != "$default_bare" ]; then
+    host="$DEFAULT_HOST"
+  fi
+  # else: we ARE the default host → fall through to local mode.
+fi
+
 # ── Remote dispatch ──────────────────────────────────────────────────────
-# If a host was given, re-invoke THIS SAME script on the remote over ssh -t,
-# forwarding the pane count. The remote already has hermes-workspace on PATH
-# (same bootstrap install), so we just call it there with the count.
+# If a host is set (explicit arg or resolved default), re-invoke THIS SAME
+# script on the remote over ssh -t, forwarding the pane count. The remote
+# already has hermes-workspace on PATH (same bootstrap install).
 if [ -n "$host" ]; then
   case "$host" in
     *@*) ssh_target="$host" ;;

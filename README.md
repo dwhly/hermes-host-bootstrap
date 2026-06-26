@@ -142,7 +142,7 @@ Each module can also be run on its own:
 | `op` | install the 1Password CLI (for secrets resolution via `.env.template`) |
 | `op-resolve` | resolve `~/.hermes/.env.template` → `~/.hermes/.env` via `op inject` on each bootstrap run |
 | `hermes-wiki` / `hermes-wiki-pull` / `hermes-wiki-build` | local Hermes Automation Wiki clone/pull/build |
-| `hermes-workspace` | cross-platform (macOS + Linux): `hmw [host] [N]` tmux workspace launcher — N stably-named panes (H1…HN, default 2), `hmw N` reuses H1…H(N-1) from the smaller layout; installed on all hosts via `99-register-host` |
+| `hermes-workspace` | cross-platform (macOS + Linux): `hmw [host] [N]` tmux workspace launcher — N stably-named panes (H1…HN, default 2). No host arg → defaults to **h-do1** (override `HMW_DEFAULT_HOST`), except when already on h-do1 (builds locally, no self-SSH). `hmw N` reuses H1…H(N-1) from the smaller layout; installed on all hosts via `99-register-host` |
 | `mosh-firewall` | UFW rule for mosh UDP 60000-61000 (rule still added if ufw stays disabled) |
 | `zsh` / `oh-my-zsh`  | zsh / OMZ |
 | `inputrc`       | .inputrc install |
