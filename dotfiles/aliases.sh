@@ -26,6 +26,7 @@ alias hmb='hermes-backlog'
 alias hmw='hermes-workspace'
 alias hmwiki='hermes-wiki'
 alias hmreset='hermes-terminal-reset'
+alias hmx='hermes-exit'
 # ── END hermes ──
 
 # ── BEGIN git ──

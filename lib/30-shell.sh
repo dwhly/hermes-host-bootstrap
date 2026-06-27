@@ -193,6 +193,21 @@ if tier_allows R && ! is_skipped aliases; then
   ok "shell aliases installed (hmr, hmc, hmf, hmb — sourced from shell rc files)"
 fi
 
+# Mouse-heal snippet — disables leftover SGR mouse-tracking on the OUTER shell
+# when an hmw/ssh -t tmux client gets yanked without a clean detach (which would
+# otherwise leave the console spewing raw `<35;..M` codes). Guarded so it only
+# fires outside tmux. Lives in dotfiles/mouse-heal.sh; sourced from the same rc
+# files as aliases. Does not depend on Homebrew or tmux.
+if tier_allows R && ! is_skipped mouse-heal; then
+  cp "$REPO_ROOT/dotfiles/mouse-heal.sh" "$HOME/.hermes-host-bootstrap.mouse-heal.sh"
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    touch "$rc"
+    ensure_line "# ── hermes-host-bootstrap mouse-heal ──" "$rc"
+    ensure_line "[ -f $HOME/.hermes-host-bootstrap.mouse-heal.sh ] && . $HOME/.hermes-host-bootstrap.mouse-heal.sh" "$rc"
+  done
+  ok "mouse-heal snippet installed (auto-disables leftover mouse tracking outside tmux)"
+fi
+
 # Make zsh the default login shell on Linux (matches macOS defaults since
 # 10.15 — gives Dan one mental model across his Mac and every Hermes host).
 # Only switches when the user is currently NOT on zsh and zsh is installed.

@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# scripts/hermes-exit (alias: hmx) — leave a Hermes workspace CLEANLY.
+#
+# Symlinked to ~/.local/bin/hermes-exit by lib/99-register-host.sh.
+#
+# THE PROBLEM IT SOLVES
+#   The hmw workspace attaches a mouse-enabled tmux (`set -g mouse on`) over
+#   `ssh -t`. When mouse mode is on, tmux puts your OUTER terminal (Ghostty on
+#   the Mac, etc.) into SGR mouse-tracking mode (\e[?1000h / \e[?1006h). On a
+#   clean tmux detach, tmux emits the matching DISABLE sequence and your outer
+#   terminal goes back to normal. But if you "exit" by closing the tab / yanking
+#   the SSH connection / network blip, the tmux client is SIGHUP'd before it can
+#   restore your terminal — so the outer terminal is left in mouse-tracking mode
+#   and every mouse move dumps raw `<35;..M` garbage onto the console.
+#
+#   hmx is the CORRECT way out: it DETACHES tmux (which runs tmux's own restore),
+#   and — belt and suspenders — emits the mouse-disable battery itself so the
+#   leak can't happen even if the detach path misbehaves.
+#
+# BEHAVIOR
+#   - Inside tmux  → run hermes-terminal-reset (clears any wedged mouse state
+#                    that leaked INTO the pane), then `tmux detach-client`. The
+#                    detach is what makes tmux restore the OUTER terminal. If
+#                    this was a remote `hmw <host>` attach, detaching also ends
+#                    the ssh -t and drops you back to your local shell cleanly.
+#   - Outside tmux → just run hermes-terminal-reset (you're already at a bare
+#                    shell; repair whatever leaked) and exit 0.
+#
+# NOTE: detach does NOT kill your work. The tmux session (and every hermes-pane
+# inside it) keeps running server-side; `hmw` reattaches it exactly as you left
+# it. To actually TEAR DOWN the workspace, use `tmux kill-session -t ws`.
+
+set -uo pipefail
+
+reset_cmd() {
+  if command -v hermes-terminal-reset >/dev/null 2>&1; then
+    hermes-terminal-reset
+  else
+    # Inline fallback if the reset helper isn't on PATH: disable the common
+    # mouse-tracking + focus + bracketed-paste modes and sane the tty.
+    printf '\033[?1016l\033[?1015l\033[?1006l\033[?1005l\033[?1003l\033[?1002l\033[?1001l\033[?1000l\033[?9l\033[?1004l\033[?2004l\033[?25h'
+    stty sane 2>/dev/null || true
+  fi
+}
+
+if [ -n "${TMUX:-}" ]; then
+  # In a tmux client. Reset first (repairs leaked-in state), then detach so
+  # tmux restores the outer terminal and the ssh -t (if remote) tears down.
+  reset_cmd
+  exec tmux detach-client
+else
+  # Bare shell — nothing to detach. Just repair the terminal.
+  reset_cmd
+fi

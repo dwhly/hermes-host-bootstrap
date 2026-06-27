@@ -274,6 +274,20 @@ if [[ -f "$REPO_ROOT/scripts/hermes-terminal-reset" ]]; then
   ok "hermes-terminal-reset → $TARGET_LINK"
 fi
 
+# ── Install hermes-exit on PATH ────────────────────────────────────────
+# Clean way to LEAVE an hmw workspace: detaches tmux (which restores the outer
+# terminal's mouse mode) + resets, so closing/yanking the connection doesn't
+# leave the console spewing raw mouse codes. Aliased to `hmx`.
+if [[ -f "$REPO_ROOT/scripts/hermes-exit" ]]; then
+  mkdir -p "$HOME/.local/bin"
+  TARGET_LINK="$HOME/.local/bin/hermes-exit"
+  if [[ -L "$TARGET_LINK" || -f "$TARGET_LINK" ]]; then
+    rm -f "$TARGET_LINK"
+  fi
+  ln -s "$REPO_ROOT/scripts/hermes-exit" "$TARGET_LINK"
+  ok "hermes-exit → $TARGET_LINK"
+fi
+
 # ── Install hermes-wiki on PATH ────────────────────────────────────────
 # Opens the local Hermes Automation Wiki in a browser. Aliased to `hmwiki`.
 if [[ -f "$REPO_ROOT/scripts/hermes-wiki" ]]; then
