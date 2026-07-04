@@ -42,6 +42,8 @@ AGENT
   + faster-whisper (Hermes local STT)
   + Fabric AI CLI (danielmiessler/fabric; patterns/prompts over any LLM;
     release-binary installer → ~/.local/bin; run `fabric --setup` per host for keys)
+  + Herdr agent multiplexer (ogulcancelik/herdr; "tmux for AI agents"; per-host
+    release binary → ~/.local/bin; also symlinks the experimental hmw-herdr launcher)
   + playwright system deps + bundled chromium
 
 GHOSTTY (client/both role only)

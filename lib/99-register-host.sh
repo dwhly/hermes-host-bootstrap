@@ -104,6 +104,7 @@ GIT_VER="$(get_ver 'git --version')"
 # Fleet rule (fleet-management playbook): every package in a tier MANIFEST is
 # version-tracked here — no exceptions. Add a *_VER line when you manifest a package.
 FABRIC_VER="$(get_ver 'fabric --version')"
+HERDR_VER="$(get_ver 'herdr --version')"
 
 # Resource snapshot
 if [[ "$OS_KIND" == "macos" ]]; then
@@ -188,6 +189,7 @@ versions:
   mosh: "$MOSH_VER"
   git: "$GIT_VER"
   fabric: "$FABRIC_VER"
+  herdr: "$HERDR_VER"
 YAML
 
 ok "host registry: $TARGET"
