@@ -164,7 +164,10 @@ require_sudo() {
 # values: minimal | recommended | full
 tier_allows() {
   local item_tier="$1"
-  case "$TIER" in
+  # Default to bootstrap's own default tier if TIER is unset — lets a module be
+  # run standalone (e.g. `bash lib/NN-x.sh` for debugging) without crashing under
+  # `set -u`. Through bootstrap.sh, TIER is always exported so this is a no-op.
+  case "${TIER:-recommended}" in
     minimal)     [[ "$item_tier" == "E" ]] ;;
     recommended) [[ "$item_tier" == "E" || "$item_tier" == "R" ]] ;;
     full)        true ;;
