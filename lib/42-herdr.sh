@@ -80,3 +80,22 @@ if [[ -f "$REPO_ROOT/scripts/hmw-herdr.sh" ]]; then
   ln -sf "$REPO_ROOT/scripts/hmw-herdr.sh" "$install_dir/hmw-herdr"
   ok "linked hmw-herdr → $install_dir/hmw-herdr (herdr-backed workspace launcher, experimental)"
 fi
+
+# ── Install the Hermes agent-state integration ────────────────────────────
+# Without this, herdr can't tell a Hermes pane's state and the sidebar always
+# shows "idle". The integration is a Hermes plugin
+# (~/.hermes/plugins/herdr-agent-state/) that reports working/blocked/idle from
+# Hermes lifecycle hooks (pre_llm_call→working, pre_approval_request→blocked,
+# post_llm_call→idle) to herdr's socket when running inside a herdr pane.
+# Idempotent: `herdr integration install hermes` re-installs/updates in place.
+herdr_bin="$install_dir/herdr"; have herdr && herdr_bin="herdr"
+if "$herdr_bin" integration status 2>/dev/null | grep -q "hermes: current"; then
+  skip "herdr hermes integration already current"
+else
+  info "installing herdr↔hermes agent-state integration (fixes 'always idle' sidebar)"
+  if "$herdr_bin" integration install hermes 2>&1 | grep -qiE "installed|enabled|current"; then
+    ok "herdr hermes integration installed ($("$herdr_bin" integration status 2>/dev/null | grep -o 'hermes: [^(]*' | head -1))"
+  else
+    warn "herdr hermes integration install failed — run: herdr integration install hermes"
+  fi
+fi
