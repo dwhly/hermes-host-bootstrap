@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.hermes.dashboard-server</string>
+  <!-- Per-user LaunchAgent (gui/<uid>/…): runs as the fleet user so it can read
+       $HOME/.hermes/.env (dashboard auth secrets) and $HOME/.local/bin/hermes.
+       __HOME__ is substituted by the bootstrap installer (lib/97) at install time. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HERMES_HOME</key><string>__HOME__/.hermes</string>
+  </dict>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/hermes-dashboard-server</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>__HOME__/.hermes/logs/dashboard-server.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/.hermes/logs/dashboard-server.err</string>
+</dict>
+</plist>

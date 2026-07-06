@@ -1,5 +1,5 @@
 [Unit]
-Description=Hermes web dashboard (auth-gated, tailnet)
+Description=Hermes web dashboard (auth-gated, tailnet, port 9000)
 Documentation=https://github.com/dwhly/hermes-host-bootstrap
 Wants=network-online.target tailscaled.service
 After=network-online.target tailscaled.service
@@ -9,9 +9,10 @@ StartLimitBurst=10
 [Service]
 Type=simple
 # The wrapper waits for the Tailscale IPv4 to exist, then binds to it — so this
-# survives reboot ordering (tailscaled not yet up) and tailnet IP changes.
-# The dashboard's non-loopback bind is permitted only because basic_auth is
-# configured in ~/.hermes/config.yaml (auth gate).
+# survives restart ordering (tailscaled not yet up) and tailnet IP changes.
+# The dashboard's non-loopback bind is permitted only because the basic_auth
+# plugin is configured via HERMES_DASHBOARD_BASIC_AUTH_* env vars, which the
+# launcher sources from ~/.hermes/.env (resolved from 1Password, not synced).
 ExecStart=/usr/local/bin/hermes-dashboard-server
 Restart=always
 RestartSec=5
