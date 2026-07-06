@@ -12,7 +12,7 @@
   </dict>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/hermes-dashboard-server</string>
+    <string>__LAUNCHER__</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>

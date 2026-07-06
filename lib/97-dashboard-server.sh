@@ -46,8 +46,10 @@ fi
 # Warn (don't fail) if the dashboard auth env vars aren't resolved yet — the
 # tailnet bind will be refused until they are.
 HERMES_ENV="${HERMES_HOME:-$HOME/.hermes}/.env"
-if [[ -f "$HERMES_ENV" ]] && ! grep -q '^HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH=' "$HERMES_ENV" 2>/dev/null; then
-  warn "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH not found in $HERMES_ENV — the tailnet bind will be REFUSED until the dashboard auth secrets resolve. Ensure the DashboardAuth-fleet 1Password item exists and re-run the secrets module (r --only=35-secrets)."
+if [[ -f "$HERMES_ENV" ]] \
+   && ! grep -q '^HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=*** "$HERMES_ENV" 2>/dev/null \
+   && ! grep -q '^HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH=*** "$HERMES_ENV" 2>/dev/null; then
+  warn "no dashboard password (HERMES_DASHBOARD_BASIC_AUTH_PASSWORD or _PASSWORD_HASH) found in $HERMES_ENV — the tailnet bind will be REFUSED until the dashboard auth secret resolves. Ensure the DashboardAuth-fleet 1Password item exists and re-run the secrets module (r --only=35-secrets)."
 fi
 
 # --- macOS: per-user LaunchAgent -----------------------------------------------
@@ -57,13 +59,23 @@ if [[ "$OS" == "macos" ]]; then
   agent_dir="$home/Library/LaunchAgents"
   plist_dst="$agent_dir/$label.plist"
 
-  info "installing /usr/local/bin/hermes-dashboard-server"
-  sudo install -m 0755 "$REPO_ROOT/scripts/hermes-dashboard-server.sh" /usr/local/bin/hermes-dashboard-server 2>/dev/null \
-    || install -m 0755 "$REPO_ROOT/scripts/hermes-dashboard-server.sh" /usr/local/bin/hermes-dashboard-server
+  # Install the launcher into a user-writable, on-PATH location. Macs typically
+  # can't write /usr/local/bin and sudo needs a TTY (unavailable over SSH), so
+  # prefer ~/.local/bin (already on PATH for the fleet user).
+  if [[ -w /usr/local/bin ]]; then
+    launcher_dst="/usr/local/bin/hermes-dashboard-server"
+  else
+    mkdir -p "$home/.local/bin"
+    launcher_dst="$home/.local/bin/hermes-dashboard-server"
+  fi
+  info "installing $launcher_dst"
+  install -m 0755 "$REPO_ROOT/scripts/hermes-dashboard-server.sh" "$launcher_dst"
 
   mkdir -p "$agent_dir" "$home/.hermes/logs"
   info "installing $label LaunchAgent"
-  sed "s|__HOME__|$home|g" "$REPO_ROOT/launchd/$label.plist" > "$plist_dst"
+  # Substitute both the home dir and the resolved launcher path into the plist.
+  sed -e "s|__HOME__|$home|g" -e "s|__LAUNCHER__|$launcher_dst|g" \
+    "$REPO_ROOT/launchd/$label.plist" > "$plist_dst"
   chmod 0644 "$plist_dst"
 
   uid="$(id -u)"
