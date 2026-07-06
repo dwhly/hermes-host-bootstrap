@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""hermes-dashboard-500-patch — idempotently guard the dashboard auth gate's
+single-provider auto-SSO shortcut against a password-only provider.
+
+WHY: `_auto_sso_response()` in hermes_cli/dashboard_auth/middleware.py 302-redirects
+an unauthenticated HTML load to /auth/login?provider=<name> whenever exactly ONE
+interactive provider is registered — WITHOUT checking whether that provider does
+OAuth. A password-only provider (BasicAuthProvider, which the fleet uses for the
+tailnet dashboard) has no start_login() → NotImplementedError → HTTP 500 "Internal
+Server Error" on the dashboard root. The correct landing for a password provider is
+the server-rendered /login credential form.
+
+This is an UPSTREAM bug (present on NousResearch/hermes-agent main). Until it ships
+upstream, this patch re-applies the one-line guard after every `hermes update`
+(which overwrites the editable-install source). Idempotent + safe: no-op if already
+patched or if the anchor can't be found.
+
+Run standalone (`python3 scripts/hermes-dashboard-500-patch`) or via bootstrap
+module lib/98-hermes-dashboard-500-patch.sh. Honors HERMES_HOME.
+"""
+import os
+import sys
+import pathlib
+
+home = pathlib.Path(os.environ.get("HERMES_HOME", pathlib.Path.home() / ".hermes"))
+# The editable checkout can live under $HERMES_HOME/hermes-agent (Mac/user installs)
+# or /usr/local/lib/hermes-agent (Linux packaged installs). Try both.
+candidates = [
+    home / "hermes-agent" / "hermes_cli" / "dashboard_auth" / "middleware.py",
+    pathlib.Path("/usr/local/lib/hermes-agent/hermes_cli/dashboard_auth/middleware.py"),
+]
+target = next((p for p in candidates if p.is_file()), None)
+if target is None:
+    print("RESULT=no-middleware-file")
+    sys.exit(0)
+
+src = target.read_text()
+if 'getattr(providers[0], "supports_password"' in src:
+    print("RESULT=already-patched")
+    sys.exit(0)
+
+anchor = (
+    "    providers = list_session_providers()\n"
+    "    if len(providers) != 1:\n"
+    "        # Zero → nothing to redirect to. Two+ → user must choose at /login.\n"
+    "        return None\n"
+)
+guard = (
+    "\n"
+    "    # A password-only provider (e.g. BasicAuthProvider) has no OAuth\n"
+    "    # start_login() flow — auto-redirecting to /auth/login raises\n"
+    "    # NotImplementedError → 500. Fall through to the /login credential form.\n"
+    '    if getattr(providers[0], "supports_password", False):\n'
+    "        return None\n"
+)
+if anchor not in src:
+    print("RESULT=anchor-not-found (upstream may have refactored — review manually)")
+    sys.exit(1)
+
+target.write_text(src.replace(anchor, anchor + guard, 1))
+print(f"RESULT=patched {target}")
