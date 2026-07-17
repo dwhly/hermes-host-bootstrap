@@ -87,11 +87,19 @@
 # export HERMES_SSH_HARDEN=0
 # export HERMES_UFW_ENABLE=0
 
+# macOS containers use the open-source Colima runtime and Homebrew Docker CLI
+# plugins. Client-role Macs install the tools without starting a VM. Build hosts
+# can opt in here; server/both roles also start Colima automatically unless this
+# is explicitly set to 0. Resource values are CPU count and GiB.
+# export HERMES_COLIMA_START=1
+# export HERMES_COLIMA_CPU=4       # 1-64
+# export HERMES_COLIMA_MEMORY=8    # 1-256 GiB
+# export HERMES_COLIMA_DISK=80     # 1-2048 GiB
+# export HERMES_COLIMA_ARCH=native  # native, aarch64, or x86_64
+
 # Skip individual modules / packages. Hermes itself does NOT require Docker
 # (the terminal tool's "modal" container mode is opt-in via TERMINAL_MODAL_IMAGE
 # in ~/.hermes/.env; absent that, the terminal tool runs on the real shell).
-# Docker Desktop on macOS keeps ~1GB RAM resident even idle, which is too
-# expensive a default for "I want to manage this Mac with Hermes" use cases.
 # Uncomment to skip:
 # export HERMES_SKIP=docker
 # Multiple modules: comma-separated, e.g. HERMES_SKIP=docker,xrdp

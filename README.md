@@ -89,7 +89,7 @@ lib/
 ├── 30-shell.sh           tmux, zsh, oh-my-zsh, neovim, mosh, micro
 ├── 40-cli.sh             rg, fd, fzf, bat, jq, htop, btop, eza, zoxide, delta, …
 ├── 50-languages.sh       python + uv + pipx, fnm + Node LTS, Rust
-├── 60-containers.sh      Docker + compose, user added to docker group
+├── 60-containers.sh      Docker + compose; Colima runtime on macOS, Docker Engine on Linux
 ├── 70-network.sh         Tailscale, cloudflared
 ├── 80-media.sh           ffmpeg, imagemagick, poppler, tesseract, pandoc, espeak-ng
 ├── 90-agents.sh          hermes, gh, Claude Code CLI, Codex CLI, faster-whisper
@@ -148,7 +148,7 @@ Each module can also be run on its own:
 | `inputrc`       | .inputrc install |
 | `mosh`, `neovim`, `micro` | per-tool |
 | `python`, `uv`, `node`, `rust`, `pnpm` | language runtimes |
-| `docker`        | Docker engine |
+| `docker`        | Docker CLI/runtime (Colima formulas on macOS, Docker Engine on Linux) |
 | `tailscale`, `cloudflared` | network tools |
 | `media`         | ffmpeg + imagemagick + poppler + tesseract + pandoc |
 | `hermes`, `gh`, `claude-code`, `codex`, `faster-whisper`, `browser-deps` | agent layer |
@@ -164,6 +164,9 @@ Each module can also be run on its own:
 | `HERMES_AUTHORIZED_KEYS` | newline-separated public SSH keys to ensure in `~/.ssh/authorized_keys` |
 | `HERMES_AUTHORIZED_KEYS_FILE` | file of public SSH keys to ensure in `~/.ssh/authorized_keys` |
 | `HERMES_MAC_REMOTE_LOGIN=1` | macOS only: enable Remote Login for SSH and allow the current user |
+| `HERMES_COLIMA_START=1` | macOS only: start Colima; otherwise it starts automatically only for `server`/`both` roles |
+| `HERMES_COLIMA_CPU=4` / `HERMES_COLIMA_MEMORY=8` / `HERMES_COLIMA_DISK=80` | macOS Colima VM resources; maximums are 64 CPUs, 256 GiB memory, and 2048 GiB disk |
+| `HERMES_COLIMA_ARCH=native` | macOS Colima VM architecture: `native`, `aarch64`, or `x86_64` |
 | `HERMES_SSH_HARDEN=1` | actually apply ssh hardening (off by default to avoid lockout) |
 | `HERMES_UFW_ENABLE=1` | actually enable ufw (off by default to avoid lockout) |
 | `HERMES_CONFIG_REPO=git@github.com:USER/hermes-config.git` | clone/pull personal `~/.hermes` config during bootstrap |
@@ -172,6 +175,32 @@ Each module can also be run on its own:
 | `HERMES_MODEL_PROVIDER=openrouter` | non-interactively seed `model.provider` so `hermes setup` is unnecessary |
 | `HERMES_MODEL_DEFAULT=openai/gpt-5.5` | non-interactively seed `model.default` |
 | `HERMES_GATEWAY_INSTALL=1` / `HERMES_GATEWAY_START=1` | install/start gateway after config + secrets are in place |
+
+---
+
+## macOS containers with Colima
+
+The recommended tier installs the open-source Homebrew formulas `colima`,
+`docker`, `docker-compose`, `docker-buildx`, and `qemu`. It does not install
+Docker Desktop. On a normal Mac client, the module installs the tools but does
+not start the default 4 CPU / 8 GiB / 80 GiB VM. Colima starts automatically
+for `server` or `both` roles, or explicitly with `HERMES_COLIMA_START=1`.
+
+For the `h-mini2` build host, prefer a native Apple Silicon VM and use Buildx
+plus QEMU for individual amd64 builds:
+
+```bash
+HERMES_COLIMA_START=1 HERMES_COLIMA_ARCH=native \
+  ./bootstrap.sh --tier=recommended --role=server --only=60-containers
+
+docker buildx build --platform linux/amd64 -t example/image:tag --load .
+```
+
+If the entire VM must be Intel-compatible instead, set
+`HERMES_COLIMA_ARCH=x86_64`; this is slower than keeping the VM native.
+
+Verification reports `docker-cli`, `docker-daemon`, and `colima` separately so
+an installed CLI is not mistaken for a running daemon.
 
 ---
 
