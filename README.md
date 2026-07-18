@@ -187,7 +187,12 @@ not start the default 4 CPU / 8 GiB / 80 GiB VM. Colima starts automatically
 for `server` or `both` roles, or explicitly with `HERMES_COLIMA_START=1`.
 
 For the `h-mini2` build host, prefer a native Apple Silicon VM and use Buildx
-plus QEMU for individual amd64 builds:
+plus QEMU for individual amd64 builds. h-mini2 also has a dedicated GitHub build
+credential, separate from the fleet-wide read-only token: the host overlay resolves
+`CHIEF_BUILD_GIT_TOKEN`, and `lib/46-github-build-auth.sh` authenticates `gh` plus
+Git-over-HTTPS for reviewed branch pushes and pull-request operations. The module
+is host-gated and skips every host except h-mini2.
+
 
 ```bash
 HERMES_COLIMA_START=1 HERMES_COLIMA_ARCH=native \
