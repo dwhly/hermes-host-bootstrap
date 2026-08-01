@@ -15,8 +15,8 @@
 # that node), so every node that runs agents needs its own herdr. See the herdr
 # research page in the automation wiki for the fleet-fit rationale.
 #
-# Also symlinks the `hmw-herdr` backend-selecting wrapper (scripts/hmw-herdr.sh)
-# so the Herdr-backed workspace is reachable on PATH like hmw. Skip key: herdr.
+# Also links the Herdr workspace + independent-agent helpers and renders the
+# fleet keybinding (Ctrl-b, then a) into Herdr's config. Skip key: herdr.
 
 set -euo pipefail
 # shellcheck disable=SC1091
@@ -79,6 +79,45 @@ if [[ -f "$REPO_ROOT/scripts/hmw-herdr.sh" ]]; then
   chmod +x "$REPO_ROOT/scripts/hmw-herdr.sh" 2>/dev/null || true
   ln -sf "$REPO_ROOT/scripts/hmw-herdr.sh" "$install_dir/hmw-herdr"
   ok "linked hmw-herdr → $install_dir/hmw-herdr (shared Herdr workspace backend)"
+fi
+
+if [[ -f "$REPO_ROOT/scripts/herdr-new-agent" ]]; then
+  chmod +x "$REPO_ROOT/scripts/herdr-new-agent" 2>/dev/null || true
+  ln -sf "$REPO_ROOT/scripts/herdr-new-agent" "$install_dir/herdr-new-agent"
+  ok "linked herdr-new-agent → $install_dir/herdr-new-agent"
+fi
+
+# A plain split inherits the shell and may autoattach the same tmux session.
+# This semantic action starts a new `hermes-pane HN` process/session instead.
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/herdr"
+config_file="$config_dir/config.toml"
+mkdir -p "$config_dir"
+touch "$config_file"
+python3 - "$config_file" <<'PY'
+from pathlib import Path
+import re, sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+block = '''# BEGIN HERMES FLEET KEYBINDINGS
+[[keys.command]]
+key = "prefix+a"
+type = "shell"
+command = "herdr-new-agent right"
+# END HERMES FLEET KEYBINDINGS'''
+pattern = re.compile(r'(?ms)^# BEGIN HERMES FLEET KEYBINDINGS\n.*?^# END HERMES FLEET KEYBINDINGS\n?')
+if pattern.search(text):
+    text = pattern.sub(block + "\n", text)
+else:
+    text = text.rstrip() + ("\n\n" if text.strip() else "") + block + "\n"
+path.write_text(text)
+PY
+ok "Herdr Ctrl-b, a → fresh Hermes agent to the right"
+
+# Reload applies config to a running server without terminating its agents.
+herdr_bin="$install_dir/herdr"; have herdr && herdr_bin="herdr"
+if "$herdr_bin" status server --json 2>/dev/null | grep -q '"running":true'; then
+  "$herdr_bin" server reload-config >/dev/null 2>&1 || warn "Herdr config written; reload it with: herdr server reload-config"
 fi
 
 # ── Install the Hermes agent-state integration ────────────────────────────

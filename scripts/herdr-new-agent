@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Start a fresh Hermes session beside the focused Herdr pane.
+
+set -euo pipefail
+
+direction="${1:-right}"
+case "$direction" in
+  right|down) ;;
+  *) printf 'usage: herdr-new-agent [right|down]\n' >&2; exit 2 ;;
+esac
+
+session="${HERDR_SESSION:-ws}"
+command -v herdr >/dev/null 2>&1 || { printf 'herdr-new-agent: herdr not found\n' >&2; exit 1; }
+command -v hermes-pane >/dev/null 2>&1 || { printf 'herdr-new-agent: hermes-pane not found\n' >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { printf 'herdr-new-agent: python3 not found\n' >&2; exit 1; }
+
+inventory="$(herdr --session "$session" agent list)" || {
+  printf "herdr-new-agent: cannot read Herdr session '%s'\n" "$session" >&2
+  exit 1
+}
+
+db="${HERMES_HOME:-$HOME/.hermes}/state.db"
+label="$(printf '%s' "$inventory" | python3 -c '
+import json, re, sqlite3, sys
+
+data = json.load(sys.stdin)
+live = set()
+for agent in data.get("result", {}).get("agents", []):
+    match = re.fullmatch(r"H([1-9][0-9]*)", str(agent.get("name", "")))
+    if match:
+        live.add(int(match.group(1)))
+used = set(live)
+try:
+    db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+    rows = db.execute("SELECT source FROM sessions WHERE source GLOB ?", ("pane:H[0-9]*",))
+    for (source,) in rows:
+        match = re.fullmatch(r"pane:H([1-9][0-9]*)", source or "")
+        if match:
+            used.add(int(match.group(1)))
+    db.close()
+except (OSError, sqlite3.Error):
+    pass
+number = max(used, default=0) + 1
+while number in live:
+    number += 1
+print(f"H{number}")
+' "$db")"
+
+args=(--session "$session" agent start "$label")
+if [[ -n "${HERDR_PANE_ID:-}" ]]; then
+  pane="$(herdr --session "$session" pane get "$HERDR_PANE_ID" 2>/dev/null || true)"
+  if [[ -n "$pane" ]]; then
+    tab_id="$(printf '%s' "$pane" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("result",{}).get("pane",{}).get("tab_id",""))')"
+    cwd="$(printf '%s' "$pane" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("result",{}).get("pane",{}).get("cwd",""))')"
+    [[ -n "$tab_id" ]] && args+=(--tab "$tab_id")
+    [[ -n "$cwd" ]] && args+=(--cwd "$cwd")
+  fi
+fi
+args+=(--split "$direction" --focus -- hermes-pane "$label")
+
+herdr "${args[@]}" >/dev/null
+printf 'Started %s as a fresh Hermes session (%s).\n' "$label" "$direction"
