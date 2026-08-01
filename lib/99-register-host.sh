@@ -319,6 +319,19 @@ if [[ -f "$REPO_ROOT/scripts/hermes-tui-theme-patch" ]]; then
   ok "hermes-tui-theme-patch → $TARGET_LINK"
 fi
 
+# ── Install hermes-tui-clock-indicator-patch on PATH ──────────────────
+# Reapplies Dan's motion-free static-dot + elapsed-time busy indicator
+# after an in-place Hermes update. Idempotent; also run by module 91.
+if [[ -f "$REPO_ROOT/scripts/hermes-tui-clock-indicator-patch" ]]; then
+  mkdir -p "$HOME/.local/bin"
+  TARGET_LINK="$HOME/.local/bin/hermes-tui-clock-indicator-patch"
+  if [[ -L "$TARGET_LINK" || -f "$TARGET_LINK" ]]; then
+    rm -f "$TARGET_LINK"
+  fi
+  ln -s "$REPO_ROOT/scripts/hermes-tui-clock-indicator-patch" "$TARGET_LINK"
+  ok "hermes-tui-clock-indicator-patch → $TARGET_LINK"
+fi
+
 # ── Install hermes-pane on PATH ────────────────────────────────────────
 # Restart-proof per-pane Hermes launcher for the workspace. Stamps each pane
 # with its own --source tag and resumes that pane's own most-recent session, so

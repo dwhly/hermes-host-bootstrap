@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# hermes-tui-clock-indicator-patch — reapply Dan's motion-free TUI indicator
+# after an in-place `hermes update`, then rebuild the Ink bundle.
+set -euo pipefail
+
+log()  { printf '  %s\n' "$*"; }
+warn() { printf '  ! %s\n' "$*" >&2; }
+
+resolve_root() {
+  if [ -n "${HERMES_TUI_DIR:-}" ] && [ -f "${HERMES_TUI_DIR%/}/../package.json" ]; then
+    dirname "${HERMES_TUI_DIR%/}"
+    return 0
+  fi
+  command -v hermes >/dev/null 2>&1 || return 1
+  local shim resolved root
+  shim="$(command -v hermes)"
+  resolved="$(readlink -f "$shim" 2>/dev/null || true)"
+  [ -n "$resolved" ] || resolved="$shim"
+  root="$(dirname "$(dirname "$(dirname "$resolved")")")"
+  [ -d "$root/ui-tui" ] && { printf '%s\n' "$root"; return 0; }
+  return 1
+}
+
+ROOT="$(resolve_root)" || { warn "could not locate Hermes install"; exit 1; }
+PATCH="$(cd "$(dirname "$0")/.." && pwd)/patches/hermes-tui-clock-indicator.patch"
+[ -f "$PATCH" ] || { warn "missing $PATCH"; exit 1; }
+
+if git -C "$ROOT" apply --check "$PATCH" >/dev/null 2>&1; then
+  git -C "$ROOT" apply "$PATCH"
+  log "applied motion-free clock indicator patch"
+elif git -C "$ROOT" apply --reverse --check "$PATCH" >/dev/null 2>&1; then
+  log "clock indicator patch already present"
+else
+  warn "clock patch does not apply cleanly; upstream changed — reconcile manually"
+  exit 1
+fi
+
+# Ensure the active config selects the added style. `hermes config` is the
+# supported writer for config.yaml; do not edit security-sensitive config direct.
+hermes config set display.tui_status_indicator clock >/dev/null
+
+# npm 12 enforces the checkout's declared engine. Keep this explicit so a
+# stale npm 10 installation fails clearly rather than leaving a stale bundle.
+node_major="$(node --version | tr -cd '0-9\n' | head -1)"
+npm_major="$(npm --version | cut -d. -f1)"
+[ "${node_major:-0}" -ge 20 ] || { warn "Node >=20 required"; exit 1; }
+[ "${npm_major:-0}" -ge 12 ] || { warn "npm >=12 required"; exit 1; }
+
+( cd "$ROOT" && npm run build:ink --workspace ui-tui && npm run build --workspace ui-tui )
+
+grep -q "frame: '•'" "$ROOT/ui-tui/src/components/appChrome.tsx"
+grep -q '"clock"' "$ROOT/hermes_constants.py"
+grep -q "tui_status_indicator: clock" "${HERMES_HOME:-$HOME/.hermes}/config.yaml"
+log "✓ static clock indicator selected and TUI bundle rebuilt"

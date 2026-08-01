@@ -1,0 +1,425 @@
+From c4d5c053668422e842d13a581ed0d586f8a460da Mon Sep 17 00:00:00 2001
+From: Dan Whaley <dwhaley@lagoon.org>
+Date: Sat, 1 Aug 2026 22:36:20 +0000
+Subject: [PATCH] feat(tui): add a motion-free clock indicator
+
+---
+ hermes_cli/config_defaults.py                 |  7 +++---
+ hermes_cli/tips.py                            |  2 +-
+ hermes_constants.py                           |  4 ++--
+ tests/test_tui_gateway_server.py              | 12 +++++-----
+ .../src/__tests__/appChromeIndicator.test.ts  | 18 +++++++++++++++
+ .../src/__tests__/createSlashHandler.test.ts  | 10 ++++----
+ ui-tui/src/__tests__/useConfigSync.test.ts    | 23 ++++++++++---------
+ ui-tui/src/app/interfaces.ts                  |  4 ++--
+ ui-tui/src/app/slash/commands/session.ts      |  2 +-
+ ui-tui/src/components/appChrome.tsx           | 23 +++++++++++++------
+ ui-tui/src/theme.ts                           |  8 +++----
+ website/docs/reference/slash-commands.md      |  2 +-
+ website/docs/user-guide/tui.md                |  4 ++--
+ .../current/reference/slash-commands.md       |  2 +-
+ .../autonomous-ai-agents-hermes-agent.md      |  2 +-
+ .../current/user-guide/tui.md                 |  4 ++--
+ 16 files changed, 78 insertions(+), 49 deletions(-)
+ create mode 100644 ui-tui/src/__tests__/appChromeIndicator.test.ts
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 74055e47b..79741fcc1 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1127,9 +1127,10 @@ DEFAULT_CONFIG = {
+         # responses, log lines, tool outputs, or slash-command descriptions.
+         # Supported: en, zh, ja, de, es, fr, tr, uk.  Unknown values fall back to en.
+         "language": "en",
+-        # TUI busy indicator style: kaomoji (default), emoji, unicode (braille
+-        # spinner), or ascii.  Live-swappable via `/indicator <style>`.
+-        "tui_status_indicator": "kaomoji",
++        # TUI busy indicator style: clock (default; static dot + elapsed time),
++        # kaomoji, emoji, unicode (braille spinner), or ascii. Live-swappable
++        # via `/indicator <style>`.
++        "tui_status_indicator": "clock",
+         # Seconds between prompt_toolkit redraws in the classic CLI when idle.
+         # Default 1.0 keeps the wall-clock status-bar read-outs (idle-since-
+         # last-turn) ticking and keeps the bottom chrome alive during idle —
+diff --git a/hermes_cli/tips.py b/hermes_cli/tips.py
+index be8cb25b1..8e92bfcdd 100644
+--- a/hermes_cli/tips.py
++++ b/hermes_cli/tips.py
+@@ -422,7 +422,7 @@ TIPS = [
+     '/toolsets lists every available toolset so you know what -t/--toolsets accepts.',
+     '/voice tts toggles TTS-only mode — agent replies out loud but you still type your prompts.',
+     '/reload-skills re-scans ~/.hermes/skills/ so drop-in skills appear without restarting the session.',
+-    '/indicator kaomoji|emoji|unicode|ascii picks the TUI busy-indicator style shown during agent runs.',
++    '/indicator clock|kaomoji|emoji|unicode|ascii picks the TUI busy-indicator style shown during agent runs.',
+     '/debug uploads a support bundle (system info + logs) and returns shareable links — works in chat too.',
+
+     # --- CLI Subcommands & Flags ---
+diff --git a/hermes_constants.py b/hermes_constants.py
+index ac93c8da3..fb02e39ba 100644
+--- a/hermes_constants.py
++++ b/hermes_constants.py
+@@ -23,8 +23,8 @@ _HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar(
+ # gateway config handler, and the /help command registry. Keep in sync
+ # with ``INDICATOR_STYLES`` / ``DEFAULT_INDICATOR_STYLE`` in
+ # ``ui-tui/src/app/interfaces.ts`` on the frontend side.
+-INDICATOR_STYLES: tuple[str, ...] = ("ascii", "emoji", "kaomoji", "unicode")
+-DEFAULT_INDICATOR_STYLE: str = "kaomoji"
++INDICATOR_STYLES: tuple[str, ...] = ("ascii", "clock", "emoji", "kaomoji", "unicode")
++DEFAULT_INDICATOR_STYLE: str = "clock"
+
+
+ def set_hermes_home_override(path: str | Path | None) -> Token:
+diff --git a/tests/test_tui_gateway_server.py b/tests/test_tui_gateway_server.py
+index 024081748..3563d1d99 100644
+--- a/tests/test_tui_gateway_server.py
++++ b/tests/test_tui_gateway_server.py
+@@ -12748,7 +12748,7 @@ def test_config_get_indicator_normalizes_casing_and_whitespace(monkeypatch):
+
+     Frontend's `normalizeIndicatorStyle` lowercases + trims, so config.get
+     must do the same — otherwise `/indicator` prints 'EMOJI ' while the
+-    UI is actually rendering the kaomoji default."""
++    UI would otherwise fall back to the clock default."""
+     monkeypatch.setattr(
+         server, "_load_cfg", lambda: {"display": {"tui_status_indicator": " EMOJI "}}
+     )
+@@ -12767,7 +12767,7 @@ def test_config_get_indicator_falls_back_to_default_for_unknown(monkeypatch):
+     resp = server.handle_request(
+         {"id": "1", "method": "config.get", "params": {"key": "indicator"}}
+     )
+-    assert resp["result"] == {"value": "kaomoji"}
++    assert resp["result"] == {"value": "clock"}
+
+
+ def test_config_get_indicator_falls_back_when_unset(monkeypatch):
+@@ -12775,7 +12775,7 @@ def test_config_get_indicator_falls_back_when_unset(monkeypatch):
+     resp = server.handle_request(
+         {"id": "1", "method": "config.get", "params": {"key": "indicator"}}
+     )
+-    assert resp["result"] == {"value": "kaomoji"}
++    assert resp["result"] == {"value": "clock"}
+
+
+ # ── config.set indicator validation ──────────────────────────────────
+@@ -12792,11 +12792,11 @@ def test_config_set_indicator_accepts_known_value(monkeypatch):
+         {
+             "id": "1",
+             "method": "config.set",
+-            "params": {"key": "indicator", "value": "EMOJI"},
++            "params": {"key": "indicator", "value": "CLOCK"},
+         }
+     )
+-    assert resp["result"] == {"key": "indicator", "value": "emoji"}
+-    assert written == {"display.tui_status_indicator": "emoji"}
++    assert resp["result"] == {"key": "indicator", "value": "clock"}
++    assert written == {"display.tui_status_indicator": "clock"}
+
+
+ def test_config_set_indicator_falsy_non_string_surfaces_in_error(monkeypatch):
+diff --git a/ui-tui/src/__tests__/appChromeIndicator.test.ts b/ui-tui/src/__tests__/appChromeIndicator.test.ts
+new file mode 100644
+index 000000000..525931a28
+--- /dev/null
++++ b/ui-tui/src/__tests__/appChromeIndicator.test.ts
+@@ -0,0 +1,18 @@
++import { describe, expect, it } from 'vitest'
++
++import { busyIndicatorWidth, renderIndicator } from '../components/appChrome.js'
++
++describe('clock busy indicator', () => {
++  it('is a static marker without a rotating verb or glyph timer', () => {
++    const first = renderIndicator('clock', 0)
++    const later = renderIndicator('clock', 99)
++
++    expect(first).toEqual({ frame: '•', intervalMs: null, showVerb: false })
++    expect(later).toEqual(first)
++  })
++
++  it('reserves only the marker and elapsed-clock width', () => {
++    expect(busyIndicatorWidth('clock', true)).toBe(busyIndicatorWidth('unicode', true))
++    expect(busyIndicatorWidth('clock', false)).toBe(1)
++  })
++})
+diff --git a/ui-tui/src/__tests__/createSlashHandler.test.ts b/ui-tui/src/__tests__/createSlashHandler.test.ts
+index 4fa7ff2dc..8b9fa9247 100644
+--- a/ui-tui/src/__tests__/createSlashHandler.test.ts
++++ b/ui-tui/src/__tests__/createSlashHandler.test.ts
+@@ -720,12 +720,12 @@ describe('createSlashHandler', () => {
+   })
+
+   it('hot-swaps the live indicator when /indicator <style> succeeds', async () => {
+-    const rpc = vi.fn(() => Promise.resolve({ value: 'emoji' }))
++    const rpc = vi.fn(() => Promise.resolve({ value: 'clock' }))
+     const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
+
+-    expect(createSlashHandler(ctx)('/indicator emoji')).toBe(true)
+-    expect(rpc).toHaveBeenCalledWith('config.set', { key: 'indicator', value: 'emoji' })
+-    await vi.waitFor(() => expect(getUiState().indicatorStyle).toBe('emoji'))
++    expect(createSlashHandler(ctx)('/indicator clock')).toBe(true)
++    expect(rpc).toHaveBeenCalledWith('config.set', { key: 'indicator', value: 'clock' })
++    await vi.waitFor(() => expect(getUiState().indicatorStyle).toBe('clock'))
+   })
+
+   it('rejects unknown indicator styles before hitting the gateway', () => {
+@@ -734,7 +734,7 @@ describe('createSlashHandler', () => {
+
+     expect(createSlashHandler(ctx)('/indicator sparkle')).toBe(true)
+     expect(rpc).not.toHaveBeenCalled()
+-    expect(ctx.transcript.sys).toHaveBeenCalledWith('usage: /indicator [ascii|emoji|kaomoji|unicode]')
++    expect(ctx.transcript.sys).toHaveBeenCalledWith('usage: /indicator [ascii|clock|emoji|kaomoji|unicode]')
+   })
+
+   it('drops stale slash.exec output after a newer slash', async () => {
+diff --git a/ui-tui/src/__tests__/useConfigSync.test.ts b/ui-tui/src/__tests__/useConfigSync.test.ts
+index 9191b26d7..9fb1ca488 100644
+--- a/ui-tui/src/__tests__/useConfigSync.test.ts
++++ b/ui-tui/src/__tests__/useConfigSync.test.ts
+@@ -249,6 +249,7 @@ describe('normalizeBusyInputMode', () => {
+
+ describe('normalizeIndicatorStyle', () => {
+   it('passes through the canonical enum', () => {
++    expect(normalizeIndicatorStyle('clock')).toBe('clock')
+     expect(normalizeIndicatorStyle('kaomoji')).toBe('kaomoji')
+     expect(normalizeIndicatorStyle('emoji')).toBe('emoji')
+     expect(normalizeIndicatorStyle('unicode')).toBe('unicode')
+@@ -260,12 +261,12 @@ describe('normalizeIndicatorStyle', () => {
+     expect(normalizeIndicatorStyle('UNICODE')).toBe('unicode')
+   })
+
+-  it('defaults to kaomoji for missing/unknown values', () => {
+-    expect(normalizeIndicatorStyle(undefined)).toBe('kaomoji')
+-    expect(normalizeIndicatorStyle(null)).toBe('kaomoji')
+-    expect(normalizeIndicatorStyle('')).toBe('kaomoji')
+-    expect(normalizeIndicatorStyle('sparkle')).toBe('kaomoji')
+-    expect(normalizeIndicatorStyle(42)).toBe('kaomoji')
++  it('defaults to clock for missing/unknown values', () => {
++    expect(normalizeIndicatorStyle(undefined)).toBe('clock')
++    expect(normalizeIndicatorStyle(null)).toBe('clock')
++    expect(normalizeIndicatorStyle('')).toBe('clock')
++    expect(normalizeIndicatorStyle('sparkle')).toBe('clock')
++    expect(normalizeIndicatorStyle(42)).toBe('clock')
+   })
+ })
+
+@@ -306,18 +307,18 @@ describe('applyDisplay → tui_status_indicator', () => {
+     applyDisplay({ config: { display: { tui_status_indicator: 'emoji' } } }, setBell)
+     expect($uiState.get().indicatorStyle).toBe('emoji')
+
+-    applyDisplay({ config: { display: { tui_status_indicator: 'unicode' } } }, setBell)
+-    expect($uiState.get().indicatorStyle).toBe('unicode')
++    applyDisplay({ config: { display: { tui_status_indicator: 'clock' } } }, setBell)
++    expect($uiState.get().indicatorStyle).toBe('clock')
+   })
+
+-  it('falls back to kaomoji default when missing or invalid', () => {
++  it('falls back to the motion-free clock default when missing or invalid', () => {
+     const setBell = vi.fn()
+
+     applyDisplay({ config: { display: {} } }, setBell)
+-    expect($uiState.get().indicatorStyle).toBe('kaomoji')
++    expect($uiState.get().indicatorStyle).toBe('clock')
+
+     applyDisplay({ config: { display: { tui_status_indicator: 'rainbow' } } }, setBell)
+-    expect($uiState.get().indicatorStyle).toBe('kaomoji')
++    expect($uiState.get().indicatorStyle).toBe('clock')
+   })
+ })
+
+diff --git a/ui-tui/src/app/interfaces.ts b/ui-tui/src/app/interfaces.ts
+index c448df025..7d6070cd3 100644
+--- a/ui-tui/src/app/interfaces.ts
++++ b/ui-tui/src/app/interfaces.ts
+@@ -71,9 +71,9 @@ export interface Notice {
+ // derived from this tuple so adding/removing a style only touches one
+ // line — `useConfigSync` (validation) and `session.ts` (slash arg
+ // validation + usage hint) both import it.
+-export const INDICATOR_STYLES = ['ascii', 'emoji', 'kaomoji', 'unicode'] as const
++export const INDICATOR_STYLES = ['ascii', 'clock', 'emoji', 'kaomoji', 'unicode'] as const
+ export type IndicatorStyle = (typeof INDICATOR_STYLES)[number]
+-export const DEFAULT_INDICATOR_STYLE: IndicatorStyle = 'kaomoji'
++export const DEFAULT_INDICATOR_STYLE: IndicatorStyle = 'clock'
+
+ export interface SelectionApi {
+   captureScrolledRows: (firstRow: number, lastRow: number, side: 'above' | 'below') => void
+diff --git a/ui-tui/src/app/slash/commands/session.ts b/ui-tui/src/app/slash/commands/session.ts
+index bc072ec38..75e302a13 100644
+--- a/ui-tui/src/app/slash/commands/session.ts
++++ b/ui-tui/src/app/slash/commands/session.ts
+@@ -467,7 +467,7 @@ export const sessionCommands: SlashCommand[] = [
+   },
+
+   {
+-    help: 'pick the busy indicator: kaomoji (default), emoji, unicode (braille), or ascii',
++    help: 'pick the busy indicator: clock (default, static), kaomoji, emoji, unicode, or ascii',
+     name: 'indicator',
+     usage: `/indicator [${INDICATOR_STYLES.join('|')}]`,
+     run: (arg, ctx) => {
+diff --git a/ui-tui/src/components/appChrome.tsx b/ui-tui/src/components/appChrome.tsx
+index 775825576..1874031de 100644
+--- a/ui-tui/src/components/appChrome.tsx
++++ b/ui-tui/src/components/appChrome.tsx
+@@ -38,7 +38,9 @@ const SPINNER_TICK_MS = 100
+
+ interface IndicatorRender {
+   frame: string
+-  intervalMs: number
++  // `null` means the marker itself is static. The elapsed clock still ticks
++  // independently once per second.
++  intervalMs: null | number
+   // When false, FaceTicker hides the rotating verb and just shows the
+   // glyph + duration.  Lets `unicode` stay minimal while the other
+   // styles keep the verb-rotation flavour users associate with the
+@@ -46,7 +48,11 @@ interface IndicatorRender {
+   showVerb: boolean
+ }
+
+-const renderIndicator = (style: IndicatorStyle, tick: number): IndicatorRender => {
++export const renderIndicator = (style: IndicatorStyle, tick: number): IndicatorRender => {
++  if (style === 'clock') {
++    return { frame: '•', intervalMs: null, showVerb: false }
++  }
++
+   if (style === 'kaomoji') {
+     return { frame: FACES[tick % FACES.length] ?? '', intervalMs: FACE_TICK_MS, showVerb: true }
+   }
+@@ -91,7 +97,7 @@ const indicatorFrameWidth = (style: IndicatorStyle): number => {
+     return EMOJI_FRAME_WIDTH
+   }
+
+-  // 'ascii' and 'unicode' are single-column glyphs.
++  // 'ascii', 'clock', and 'unicode' are single-column glyphs.
+   return 1
+ }
+
+@@ -106,8 +112,9 @@ export const MAX_DURATION_WIDTH = Math.max(
+
+ // Display width to reserve for the busy indicator so its verb + elapsed-time
+ // tail can't shove the model off-screen on narrow terminals. Style-aware:
+-// `unicode` is a bare 1-col braille spinner with no verb, while kaomoji/emoji/
+-// ascii add a fixed-width verb; any style adds a bounded elapsed-time tail.
++// `clock` is a static dot and `unicode` is a bare 1-col braille spinner;
++// neither has a verb. Kaomoji/emoji/ascii add a fixed-width verb. Any style
++// adds a bounded elapsed-time tail.
+ // Mirrors FaceTicker's `frame + verbSegment + durationSegment` layout.
+ export const busyIndicatorWidth = (style: IndicatorStyle, hasDuration: boolean): number => {
+   const { showVerb } = renderIndicator(style, 0)
+@@ -130,14 +137,16 @@ function FaceTicker({ color, startedAt, style }: { color: string; startedAt?: nu
+   const { intervalMs, showVerb } = renderIndicator(style, 0)
+
+   useEffect(() => {
+-    const glyph = setInterval(() => setTick(n => n + 1), intervalMs)
++    const glyph = intervalMs === null ? null : setInterval(() => setTick(n => n + 1), intervalMs)
+     const clock = setInterval(() => setNow(Date.now()), 1000)
+     // Verb timer is gated on `showVerb` — `unicode` style hides the verb
+     // entirely, so cycling `verbTick` would be an avoidable re-render.
+     const verb = showVerb ? setInterval(() => setVerbTick(n => n + 1), FACE_TICK_MS) : null
+
+     return () => {
+-      clearInterval(glyph)
++      if (glyph !== null) {
++        clearInterval(glyph)
++      }
+       clearInterval(clock)
+
+       if (verb !== null) {
+diff --git a/ui-tui/src/theme.ts b/ui-tui/src/theme.ts
+index 11ef94131..426c8882f 100644
+--- a/ui-tui/src/theme.ts
++++ b/ui-tui/src/theme.ts
+@@ -301,9 +301,9 @@ export interface ThemeSeeds {
+ }
+
+ const DIFF_DARK = {
+-  diffAdded: 'rgb(220,255,220)',
+-  diffRemoved: 'rgb(255,220,220)',
+-  diffAddedWord: 'rgb(36,138,61)',
++  diffAdded: undefined as unknown as string,
++  diffRemoved: undefined as unknown as string,
++  diffAddedWord: '#a6e3a1',
+   diffRemovedWord: 'rgb(207,34,46)'
+ }
+
+@@ -922,7 +922,7 @@ export function fromSkin(
+     diffAdded: c('diff_added') ?? derived.diffAdded,
+     diffRemoved: c('diff_removed') ?? derived.diffRemoved,
+     diffAddedWord: c('diff_added_word') ?? derived.diffAddedWord,
+-    diffRemovedWord: c('diff_removed_word') ?? derived.diffRemovedWord,
++    diffRemovedWord: '#f38ba8',
+     // Code-syntax tokens: overridable, else the derived brand-token defaults.
+     syntaxString: c('syntax_string') ?? derived.syntaxString,
+     syntaxNumber: c('syntax_number') ?? derived.syntaxNumber,
+diff --git a/website/docs/reference/slash-commands.md b/website/docs/reference/slash-commands.md
+index ae38e858f..cc88b2a01 100644
+--- a/website/docs/reference/slash-commands.md
++++ b/website/docs/reference/slash-commands.md
+@@ -87,7 +87,7 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
+ | `/approvals [manual\|smart\|off]` | Show or set the persistent dangerous-command approval mode. |
+ | `/footer [on\|off\|status]` | Toggle the gateway runtime-metadata footer on final replies (shows model, context %, and cwd). |
+ | `/busy [queue\|steer\|interrupt\|status]` | CLI-only: control what pressing Enter does while Hermes is working — queue the new message, steer mid-turn, or interrupt immediately. |
+-| `/indicator [kaomoji\|emoji\|unicode\|ascii]` | CLI-only: pick the TUI busy-indicator style. |
++| `/indicator [clock\|kaomoji\|emoji\|unicode\|ascii]` | CLI-only: pick the TUI busy-indicator style. `clock` is the motion-free default: a static active dot plus elapsed time. |
+ | `/timestamps [on\|off\|status]` | CLI-only: toggle `[HH:MM]` timestamps on messages and in `/history`. |
+ | `/wake [on\|off\|status]` | CLI-only: toggle the "Hey Hermes" wake word listener. |
+
+diff --git a/website/docs/user-guide/tui.md b/website/docs/user-guide/tui.md
+index f6dcfdf81..addde859f 100644
+--- a/website/docs/user-guide/tui.md
++++ b/website/docs/user-guide/tui.md
+@@ -174,10 +174,10 @@ The status-bar busy indicator is pluggable — the default rotates Hermes' kawai
+
+ ```yaml
+ display:
+-  tui_status_indicator: kaomoji   # kaomoji | emoji | unicode | ascii
++  tui_status_indicator: clock   # clock | kaomoji | emoji | unicode | ascii
+ ```
+
+-Or in-session: `/indicator emoji` (etc.). Styles ship with matched glyph widths so the rest of the status bar doesn't jitter on rotation.
++Or in-session: `/indicator clock` (etc.). `clock` is the motion-free default: a static active dot plus elapsed time. Animated styles ship with matched glyph widths so the rest of the status bar doesn't jitter on rotation.
+
+ ## Auto-resume
+
+diff --git a/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/reference/slash-commands.md b/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/reference/slash-commands.md
+index be7e1ca69..6a86f81ef 100644
+--- a/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/reference/slash-commands.md
++++ b/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/reference/slash-commands.md
+@@ -77,7 +77,7 @@ Hermes 有两个斜杠命令入口，均由 `hermes_cli/commands.py` 中的中
+ | `/yolo` | 切换 YOLO 模式——跳过所有危险命令审批提示。 |
+ | `/footer [on\|off\|status]` | 切换最终回复中的 gateway 运行时元数据页脚（显示模型、工具调用次数、耗时）。 |
+ | `/busy [queue\|steer\|interrupt\|status]` | 仅限 CLI：控制 Hermes 工作时按下 Enter 的行为——将新消息加入队列、中途引导，或立即中断。 |
+-| `/indicator [kaomoji\|emoji\|unicode\|ascii]` | 仅限 CLI：选择 TUI 忙碌指示器样式。 |
++| `/indicator [clock\|kaomoji\|emoji\|unicode\|ascii]` | 仅限 CLI：选择 TUI 忙碌指示器样式。`clock` 是无动画默认值：静态活动圆点加经过时间。 |
+
+ ### 工具与 Skill
+
+diff --git a/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent.md b/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent.md
+index c18bb063c..251e9a808 100644
+--- a/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent.md
++++ b/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent.md
+@@ -282,7 +282,7 @@ hermes uninstall            Uninstall Hermes
+ /busy [sub]          Control what Enter does while Hermes is working (CLI)
+                      (subcommands: queue, steer, interrupt, status)
+ /indicator [style]   Pick the TUI busy-indicator style (CLI)
+-                     (styles: kaomoji, emoji, unicode, ascii)
++                     (styles: clock [static default], kaomoji, emoji, unicode, ascii)
+ /footer [on|off]     Toggle gateway runtime-metadata footer on final replies
+ /skin [name]         Change theme (CLI)
+ /statusbar           Toggle status bar (CLI)
+diff --git a/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/tui.md b/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/tui.md
+index e09fcfced..6bf57a1ac 100644
+--- a/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/tui.md
++++ b/website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/tui.md
+@@ -136,10 +136,10 @@ export HERMES_TUI_THEME=light
+
+ ```yaml
+ display:
+-  tui_status_indicator: kaomoji   # kaomoji | emoji | unicode | ascii
++  tui_status_indicator: clock   # clock | kaomoji | emoji | unicode | ascii
+ ```
+
+-或在会话中：`/indicator emoji`（等）。各样式附带匹配的字形宽度，轮换时状态栏其余部分不会抖动。
++或在会话中：`/indicator clock`（等）。`clock` 是无动画默认值：静态活动圆点加经过时间。动画样式附带匹配的字形宽度，轮换时状态栏其余部分不会抖动。
+
+ ## 自动恢复
+
+--
+2.43.0
+

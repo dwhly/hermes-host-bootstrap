@@ -22,6 +22,11 @@
 # via lib/91-hermes-tui-theme.sh on `hmr`). It is idempotent: if the patch is
 # already applied it just rebuilds (or no-ops if the bundle is current).
 #
+# The current checkout requires npm >=12. If npm 10 reports EBADENGINE, upgrade
+# npm before retrying; otherwise the source may be patched while dist/entry.js
+# remains stale. Tests additionally require a dev-workspace install plus
+# `npm run build:ink --workspace ui-tui` before Vitest.
+#
 # Exit codes: 0 = patched/already-applied (and rebuilt), 1 = could not locate
 # the install or build failed.
 set -euo pipefail

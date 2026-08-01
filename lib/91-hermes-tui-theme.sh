@@ -38,3 +38,12 @@ if bash "$PATCH_SCRIPT"; then
 else
   warn "TUI theme patch did not complete (see output above) — non-fatal, continuing"
 fi
+
+CLOCK_PATCH_SCRIPT="$(dirname "$0")/../scripts/hermes-tui-clock-indicator-patch"
+if [[ -f "$CLOCK_PATCH_SCRIPT" ]]; then
+  if bash "$CLOCK_PATCH_SCRIPT"; then
+    ok "Hermes motion-free clock indicator restored + bundle rebuilt"
+  else
+    warn "TUI clock indicator patch did not complete — non-fatal, continuing"
+  fi
+fi
