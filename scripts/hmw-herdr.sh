@@ -28,7 +28,9 @@ done
 panes="${panes:-2}"
 
 # ── default-target resolution (skip self-ssh when already on the default host)
-if [ -z "$host" ]; then
+# HMW_HERDR_LOCAL is set only by this launcher's remote dispatch so the copy on
+# the target executes locally instead of recursively forwarding to h-do1.
+if [ -z "$host" ] && [ "${HMW_HERDR_LOCAL:-0}" != "1" ]; then
   default_bare="${DEFAULT_HOST##*@}"; default_bare="${default_bare%%.*}"
   here="$(hostname -s 2>/dev/null || hostname)"
   [ "$here" != "$default_bare" ] && host="$DEFAULT_HOST"
@@ -51,6 +53,8 @@ fi
 # The remote command: ensure N hermes-pane agents exist in the herdr session via
 # the socket API (idempotent-ish: only starts panes if the server has none), then
 # attach the herdr TUI. If herdr isn't installed on the target, fail with a hint.
+# In verification mode, perform setup and list agents without replacing the test
+# shell with the interactive TUI.
 remote_cmd=$(cat <<REMOTE
 export PATH="\$HOME/.local/bin:\$PATH"
 if ! command -v herdr >/dev/null 2>&1; then
@@ -69,15 +73,24 @@ while [ "\$n" -lt "$panes" ]; do
   n=\$((n+1))
   herdr agent start "H\$n" --split right -- hermes-pane "H\$n" >/dev/null 2>&1 || true
 done
+if [ "\${HMW_HERDR_VERIFY:-0}" = "1" ]; then
+  herdr status server
+  herdr agent list
+  exit 0
+fi
 # Attach the herdr TUI (interactive).
 exec herdr --session "$SESSION"
 REMOTE
 )
 
 if [ -n "$ssh_target" ]; then
-  exec ssh -t "$ssh_target" "\"\$SHELL\" -lc '$remote_cmd'"
+  # Re-run the fleet-owned launcher on the target instead of embedding a
+  # multiline shell program inside `zsh -lc '…'`. The old nested quoting broke
+  # at command substitutions such as `have=$(herdr agent list …)`.
+  exec ssh -t "$ssh_target" \
+    "PATH=\"\$HOME/.local/bin:\$PATH\" HMW_HERDR_LOCAL=1 HMW_HERDR_VERIFY=${HMW_HERDR_VERIFY:-0} hmw-herdr $panes"
 else
-  # local mode (already on the default host)
+  # local mode (already on the default host, or remote dispatch set LOCAL=1)
   export PATH="$HOME/.local/bin:$PATH"
   bash -lc "$remote_cmd"
 fi
