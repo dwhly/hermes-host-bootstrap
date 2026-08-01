@@ -336,11 +336,9 @@ if [[ -f "$REPO_ROOT/scripts/hermes-pane" ]]; then
 fi
 
 # ── Install hermes-workspace on PATH ───────────────────────────────────
-# Unified, pure bash+tmux workspace launcher (alias: hmw). ONE implementation
-# for the whole fleet — identical on macOS and Linux, no AppleScript/Ghostty
-# API. Two side-by-side panes (code | scratch) drawn by tmux; `hmw <host>`
-# ssh-dispatches to the same script on the remote. Replaces the old macOS-only
-# ghostty-workspace.applescript wrapper.
+# Unified tmux/Herdr workspace core (alias: hmw remains tmux-default). One
+# implementation owns parsing, remote dispatch, exact H1..HN slots, and verify
+# output across the fleet; `hmw <host>` re-enters this script on the remote.
 if [[ -f "$REPO_ROOT/scripts/hermes-workspace" ]]; then
   mkdir -p "$HOME/.local/bin"
   TARGET_LINK="$HOME/.local/bin/hermes-workspace"

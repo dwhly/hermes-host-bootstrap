@@ -1,153 +1,520 @@
 #!/usr/bin/env bash
-# hermes-workspace (alias: hmw) — unified, pure bash+tmux workspace launcher.
-#
-# ONE implementation for the whole fleet. Identical on macOS and Linux; no
-# AppleScript, no Ghostty API, no GUI-pane choreography. The GUI terminal
-# (Ghostty, Terminal.app, iTerm, a Linux console, …) is just a dumb transport —
-# tmux draws the layout.
-#
-# Symlinked to ~/.local/bin/hermes-workspace by lib/99-register-host.sh.
-#
-# LAYOUT: N side-by-side panes in ONE tmux window named "ws". Panes are named
-# STABLY H1, H2, H3, … so `hmw N` always builds the first N — i.e. `hmw 3`'s
-# first two panes (H1, H2) are exactly the same sessions as `hmw 2`:
-#     hmw 2 →  ┌──────┬──────┐        hmw 3 → ┌─────┬─────┬─────┐
-#              │  H1  │  H2  │                │ H1  │ H2  │ H3  │
-#              └──────┴──────┘                └─────┴─────┴─────┘
-# Each pane runs `hermes-pane H<n>`, the restart-proof launcher that tags the
-# session (--source pane:H<n>) and resumes that pane's own most-recent session
-# across `hermes update` (see the tmux-workspace-pattern skill).
-#
-# USAGE
-#   hermes-workspace                # 2 panes on the DEFAULT host (h-do1) — or
-#                                   #   locally if you're already on h-do1
-#   hermes-workspace N              # N panes on the default host (N >= 1)
-#   hermes-workspace <host>         # 2 panes on <host> (ssh -t)
-#   hermes-workspace <host> N       # N panes on <host>
-#   hermes-workspace user@host N    # explicit ssh target + count
-#   hmw [host] [N]                  # alias (host/N order is flexible)
-#
-# DEFAULT TARGET: with no host arg, hmw aims at h-do1 (override via
-# HMW_DEFAULT_HOST), so `hmw` / `hmw 3` from a Mac drives h-do1 — the old
-# reflex. The exception: when you're already ON the default host, bare hmw
-# builds locally (no pointless self-SSH). So `hmw 3` on h-do1 makes 3 panes
-# right there; `hmw 3` on a Mac makes 3 panes on h-do1.
-#
-# Remote mode opens ONE ssh connection and attaches a single tmux window that
-# tmux splits server-side, so the workspace survives disconnect/sleep —
-# strictly better than GUI panes, which die with the window.
+# hermes-workspace (alias: hmw) — persistent H1..HN workspaces via tmux or Herdr.
 
 set -uo pipefail
 
-DEFAULT_PANES=2
-# Default remote target when no host arg is given AND we're not already on it.
-# Restores the old reflex: bare `hmw` (or `hmw N`) from a Mac drives h-do1.
-# Override per-host via HMW_DEFAULT_HOST (e.g. in ~/.hermes-bootstrap.conf).
+DEFAULT_COUNT=2
 DEFAULT_HOST="${HMW_DEFAULT_HOST:-h-do1}"
-
-# ── Parse args: a bare integer is the pane COUNT; anything else is the HOST.
-# Order-independent, so `hmw h-do1 3` and `hmw 3 h-do1` both work.
-host=""
-panes=""
-for arg in "$@"; do
-  if [[ "$arg" =~ ^[0-9]+$ ]]; then
-    panes="$arg"
-  else
-    host="$arg"
-  fi
-done
-panes="${panes:-$DEFAULT_PANES}"
-if [ "$panes" -lt 1 ]; then
-  echo "hermes-workspace: pane count must be >= 1 (got $panes)" >&2
-  exit 2
+BACKEND="${HMW_BACKEND:-tmux}"
+if [ -n "${HMW_VERIFY+x}" ]; then
+  VERIFY=$HMW_VERIFY
+elif [ "$BACKEND" = "herdr" ] && [ "${HMW_HERDR_VERIFY:-0}" = "1" ]; then
+  VERIFY=1
+else
+  VERIFY=0
 fi
 
-# ── Default-target resolution ─────────────────────────────────────────────
-# No explicit host arg → aim at DEFAULT_HOST, EXCEPT when we're already running
-# on that host (avoid a pointless h-do1→h-do1 SSH loopback). Compare on the
-# short hostname against the default's bare name (strip any user@ and domain).
-if [ -z "$host" ]; then
-  default_bare="${DEFAULT_HOST##*@}"; default_bare="${default_bare%%.*}"
+usage_error() {
+  printf 'hermes-workspace: %s\n' "$1" >&2
+  exit 2
+}
+
+parse_request() {
+  local arg
+
+  REQUEST_HOST=""
+  REQUEST_COUNT=""
+  HOST_EXPLICIT=0
+
+  if [ "${HMW_REMOTE:-0}" = "1" ]; then
+    [ "$#" -eq 1 ] || usage_error 'remote re-entry requires exactly one pane count'
+    case "$1" in
+      ''|*[!0-9]*) usage_error "pane count must be a positive decimal (got $1)" ;;
+    esac
+    [ "$1" -ge 1 ] || usage_error "pane count must be >= 1 (got $1)"
+    REQUEST_COUNT="$1"
+    return
+  fi
+
+  [ "$#" -le 2 ] || usage_error 'expected at most one host and one pane count'
+  for arg in "$@"; do
+    case "$arg" in
+      '')
+        usage_error 'arguments must not be empty'
+        ;;
+      -[0-9]* )
+        usage_error "pane count must be a positive decimal (got $arg)"
+        ;;
+      -* )
+        usage_error "unsupported option: $arg"
+        ;;
+      *[!0-9]*)
+        [ -z "$REQUEST_HOST" ] || usage_error 'multiple hosts supplied'
+        REQUEST_HOST="$arg"
+        HOST_EXPLICIT=1
+        ;;
+      *)
+        [ -z "$REQUEST_COUNT" ] || usage_error 'multiple pane counts supplied'
+        REQUEST_COUNT="$arg"
+        ;;
+    esac
+  done
+
+  REQUEST_COUNT="${REQUEST_COUNT:-$DEFAULT_COUNT}"
+  [ "$REQUEST_COUNT" -ge 1 ] || usage_error "pane count must be >= 1 (got $REQUEST_COUNT)"
+}
+
+resolve_default_target() {
+  local default_bare here
+
+  [ "$HOST_EXPLICIT" -eq 0 ] || return
+  default_bare="${DEFAULT_HOST##*@}"
+  default_bare="${default_bare%%.*}"
   here="$(hostname -s 2>/dev/null || hostname)"
   if [ "$here" != "$default_bare" ]; then
-    host="$DEFAULT_HOST"
-  fi
-  # else: we ARE the default host → fall through to local mode.
-fi
-
-# ── Remote dispatch ──────────────────────────────────────────────────────
-# If a host is set (explicit arg or resolved default), re-invoke THIS SAME
-# script on the remote over ssh -t, forwarding the pane count. The remote
-# already has hermes-workspace on PATH (same bootstrap install).
-if [ -n "$host" ]; then
-  # Resolve the host through the fleet registry (~/.hermes/hosts/<host>.yaml) so
-  # a bare name like "h-do1" becomes a reachable "root@100.122.202.37" — the
-  # SAME resolution hssh / hermes-fleet use. Without this, bare `ssh h-do1` on a
-  # Mac depends on ~/.ssh/config or MagicDNS and times out when neither resolves
-  # the name to the tailnet IP. Preserve explicit user@host untouched.
-  case "$host" in
-    *@*) ssh_target="$host" ;;               # explicit target — honor verbatim
-    *)
-      if command -v hermes-host-resolve >/dev/null 2>&1; then
-        ssh_target="$(hermes-host-resolve "$host" 2>/dev/null || true)"
-      fi
-      # Fall back to the raw name if the resolver is missing or returns nothing
-      # (e.g. host not in the registry → rely on ~/.ssh/config as before).
-      [ -n "${ssh_target:-}" ] || ssh_target="$host"
-      ;;
-  esac
-  # -t forces a TTY so tmux attaches interactively. We DON'T rely on the remote
-  # login shell putting ~/.local/bin on PATH: a non-interactive `zsh -lc` sources
-  # .zprofile/.zlogin but SKIPS .zshrc, and the bootstrap adds ~/.local/bin only
-  # in .zshrc — so `hermes-workspace` would be "command not found". Instead we
-  # prepend ~/.local/bin explicitly (that's where 99-register-host symlinks it)
-  # before invoking, which is robust across bash/zsh and interactive/login modes.
-  exec ssh -t "$ssh_target" \
-    "exec \"\$SHELL\" -lc 'PATH=\"\$HOME/.local/bin:\$PATH\" hermes-workspace $panes'"
-fi
-
-# ── Local mode: build N stably-named panes side by side, then attach ───────
-PANE_CMD="hermes-pane"
-if ! command -v "$PANE_CMD" >/dev/null 2>&1; then
-  echo "hermes-workspace: '$PANE_CMD' not on PATH — run hermes-reload (hmr) to install it." >&2
-  exit 1
-fi
-
-SESSION=ws
-
-attach() {
-  if [ -n "${TMUX:-}" ]; then
-    exec tmux switch-client -t "$SESSION"
-  else
-    exec tmux attach-session -t "$SESSION"
+    REQUEST_HOST="$DEFAULT_HOST"
   fi
 }
 
-# Stable pane label for index n (1-based): H1, H2, H3, …
-label_for() { echo "H$1"; }
+resolve_ssh_target() {
+  local resolved
 
-if tmux has-session -t "=$SESSION" 2>/dev/null; then
-  # Session exists. Add any panes still missing up to the requested count so
-  # `hmw 3` after a prior `hmw 2` just adds H3 (H1/H2 keep their live state).
-  # We never destroy or shrink an existing workspace.
-  have="$(tmux list-panes -t "$SESSION":ws 2>/dev/null | wc -l | tr -d ' ')"
-  n="$have"
-  while [ "$n" -lt "$panes" ]; do
-    n=$((n + 1))
-    tmux split-window -h -t "$SESSION":ws "$PANE_CMD $(label_for "$n")"
-    tmux select-layout -t "$SESSION":ws even-horizontal
+  case "$REQUEST_HOST" in
+    *@*) SSH_TARGET="$REQUEST_HOST" ;;
+    *)
+      resolved=""
+      if command -v hermes-host-resolve >/dev/null 2>&1; then
+        resolved="$(hermes-host-resolve "$REQUEST_HOST" 2>/dev/null)"
+      fi
+      SSH_TARGET="${resolved:-$REQUEST_HOST}"
+      ;;
+  esac
+}
+
+shell_quote() {
+  local value=$1
+  value=${value//\'/\'\\\'\'}
+  printf "'%s'" "$value"
+}
+
+dispatch_remote() {
+  local payload remote_command
+
+  # shellcheck disable=SC2016
+  payload='PATH="$HOME/.local/bin:$PATH"'
+  payload+=" HMW_REMOTE=$(shell_quote 1)"
+  payload+=" HMW_BACKEND=$(shell_quote "$BACKEND")"
+  payload+=" HMW_VERIFY=$(shell_quote "$VERIFY")"
+  if [ "$BACKEND" = "herdr" ]; then
+    payload+=" HERDR_SESSION=$(shell_quote "$SESSION")"
+  fi
+  payload+=" hermes-workspace $(shell_quote "$REQUEST_COUNT")"
+  remote_command="sh -c $(shell_quote "$payload")"
+
+  if [ "$VERIFY" = "1" ]; then
+    exec ssh "$SSH_TARGET" "$remote_command"
+  else
+    exec ssh -t "$SSH_TARGET" "$remote_command"
+  fi
+}
+
+label_for() {
+  printf 'H%s\n' "$1"
+}
+
+command_for() {
+  printf 'hermes-pane H%s\n' "$1"
+}
+
+local_short_hostname() {
+  hostname -s 2>/dev/null || hostname
+}
+
+TMUX_SEPARATOR='__HMW_SEP__'
+TMUX_SLOT_RECORDS=""
+TMUX_INVENTORY=""
+
+tmux_slots_clear() {
+  TMUX_SLOT_RECORDS=""
+}
+
+tmux_slot_get() {
+  local wanted=$1 record
+
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    if [ "${record%%|*}" = "$wanted" ]; then
+      printf '%s\n' "${record#*|}"
+      return 0
+    fi
+  done <<EOF
+$TMUX_SLOT_RECORDS
+EOF
+  return 1
+}
+
+tmux_slot_has() {
+  tmux_slot_get "$1" >/dev/null 2>&1
+}
+
+tmux_slot_set() {
+  local label=$1 pane_id=$2
+
+  tmux_slot_has "$label" && return 0
+  if [ -n "$TMUX_SLOT_RECORDS" ]; then
+    TMUX_SLOT_RECORDS="$TMUX_SLOT_RECORDS
+$label|$pane_id"
+  else
+    TMUX_SLOT_RECORDS="$label|$pane_id"
+  fi
+}
+
+parse_tmux_inventory_line() {
+  local line=$1 rest
+
+  case "$line" in
+    *"$TMUX_SEPARATOR"*"$TMUX_SEPARATOR"*) ;;
+    *) return 1 ;;
+  esac
+  TMUX_PARSED_PANE_ID=${line%%"$TMUX_SEPARATOR"*}
+  rest=${line#*"$TMUX_SEPARATOR"}
+  TMUX_PARSED_LABEL=${rest%%"$TMUX_SEPARATOR"*}
+  TMUX_PARSED_COMMAND=${rest#*"$TMUX_SEPARATOR"}
+}
+
+tmux_slot_inventory() {
+  local line
+
+  tmux_slots_clear
+  if ! TMUX_INVENTORY="$(tmux list-panes -t ws:ws -F "#{pane_id}${TMUX_SEPARATOR}#{@hmw_label}${TMUX_SEPARATOR}#{pane_start_command}")"; then
+    printf 'hermes-workspace: unable to inventory tmux workspace ws:ws\n' >&2
+    return 1
+  fi
+
+  while IFS= read -r line; do
+    parse_tmux_inventory_line "$line" || continue
+    if [ -n "$TMUX_PARSED_LABEL" ]; then
+      tmux_slot_set "$TMUX_PARSED_LABEL" "$TMUX_PARSED_PANE_ID"
+    fi
+  done <<EOF
+$TMUX_INVENTORY
+EOF
+}
+
+canonicalize_legacy_command() {
+  local command=$1 canonical=$2 executable label
+  local whole_single whole_double tokens_single tokens_double
+
+  executable=${canonical%% *}
+  label=${canonical#* }
+  whole_single="'$canonical'"
+  whole_double="\"$canonical\""
+  tokens_single="'$executable' '$label'"
+  tokens_double="\"$executable\" \"$label\""
+  if [ "$command" != "$canonical" ] &&
+     [ "$command" != "$whole_single" ] &&
+     [ "$command" != "$whole_double" ] &&
+     [ "$command" != "$tokens_single" ] &&
+     [ "$command" != "$tokens_double" ]; then
+    return 1
+  fi
+  printf '%s\n' "$canonical"
+}
+
+adopt_legacy_tmux_slots() {
+  local number label canonical line normalized
+
+  number=1
+  while [ "$number" -le "$REQUEST_COUNT" ]; do
+    label="$(label_for "$number")"
+    canonical="$(command_for "$number")"
+    if ! tmux_slot_has "$label"; then
+      while IFS= read -r line; do
+        parse_tmux_inventory_line "$line" || continue
+        [ -z "$TMUX_PARSED_LABEL" ] || continue
+        if normalized="$(canonicalize_legacy_command "$TMUX_PARSED_COMMAND" "$canonical")" &&
+           [ "$normalized" = "$canonical" ]; then
+          tmux set-option -p -t "$TMUX_PARSED_PANE_ID" @hmw_label "$label"
+          tmux_slot_set "$label" "$TMUX_PARSED_PANE_ID"
+          break
+        fi
+      done <<EOF
+$TMUX_INVENTORY
+EOF
+    fi
+    number=$((number + 1))
   done
-  tmux select-pane -t "$SESSION":ws.0
-  attach
+}
+
+ensure_tmux_workspace() {
+  local number label command pane_id added
+
+  if ! command -v hermes-pane >/dev/null 2>&1; then
+    printf "hermes-workspace: 'hermes-pane' not on PATH — run hermes-reload (hmr) to install it.\n" >&2
+    return 1
+  fi
+
+  if tmux has-session -t '=ws' 2>/dev/null; then
+    tmux_slot_inventory || return
+    adopt_legacy_tmux_slots || return
+    added=0
+    number=1
+    while [ "$number" -le "$REQUEST_COUNT" ]; do
+      label="$(label_for "$number")"
+      command="$(command_for "$number")"
+      if ! tmux_slot_has "$label"; then
+        pane_id="$(tmux split-window -h -P -F '#{pane_id}' -t ws:ws "$command")" || return
+        tmux set-option -p -t "$pane_id" @hmw_label "$label" || return
+        tmux_slot_set "$label" "$pane_id"
+        added=1
+      fi
+      number=$((number + 1))
+    done
+    if [ "$added" -eq 1 ]; then
+      tmux select-layout -t ws:ws even-horizontal || return
+    fi
+  else
+    label=H1
+    command='hermes-pane H1'
+    pane_id="$(tmux new-session -d -P -F '#{pane_id}' -s ws -n ws "$command")" || return
+    tmux set-option -p -t "$pane_id" @hmw_label "$label" || return
+    tmux_slots_clear
+    tmux_slot_set H1 "$pane_id"
+    number=2
+    while [ "$number" -le "$REQUEST_COUNT" ]; do
+      label="$(label_for "$number")"
+      command="$(command_for "$number")"
+      pane_id="$(tmux split-window -h -P -F '#{pane_id}' -t ws:ws "$command")" || return
+      tmux set-option -p -t "$pane_id" @hmw_label "$label" || return
+      tmux_slot_set "$label" "$pane_id"
+      number=$((number + 1))
+    done
+    tmux select-layout -t ws:ws even-horizontal || return
+  fi
+
+  pane_id="$(tmux_slot_get H1)" || return
+  tmux select-pane -t "$pane_id" || return
+}
+
+verify_header() {
+  local backend=$1 session=$2 number
+
+  printf 'HMW_VERIFY backend=%s\n' "$backend"
+  printf 'HMW_VERIFY session=%s\n' "$session"
+  printf 'HMW_VERIFY target=%s\n' "$(local_short_hostname)"
+  printf 'HMW_VERIFY requested=%s\n' "$REQUEST_COUNT"
+  number=1
+  while [ "$number" -le "$REQUEST_COUNT" ]; do
+    printf 'HMW_VERIFY slot=H%s command=hermes-pane H%s\n' "$number" "$number"
+    number=$((number + 1))
+  done
+  printf 'HMW_VERIFY inventory-begin\n'
+}
+
+verify_tmux_workspace() {
+  tmux_slot_inventory || return
+  verify_header tmux ws:ws
+  [ -z "$TMUX_INVENTORY" ] || printf '%s\n' "$TMUX_INVENTORY"
+  printf 'HMW_VERIFY inventory-end\n'
+}
+
+attach_tmux_workspace() {
+  if [ -n "${TMUX:-}" ]; then
+    exec tmux switch-client -t ws
+  else
+    exec tmux attach-session -t ws
+  fi
+}
+
+HERDR_INVENTORY=""
+HERDR_NAMES=""
+
+herdr_status_running() {
+  local status_json
+
+  status_json="$("${HERDR[@]}" status server --json 2>/dev/null)" || return 1
+  printf '%s' "$status_json" | python3 -c 'import json, sys
+try:
+    value = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeDecodeError):
+    raise SystemExit(1)
+raise SystemExit(0 if isinstance(value, dict) and value.get("status") == "running" and value.get("running") is True else 1)'
+}
+
+ensure_herdr_server() {
+  local attempt socket
+
+  attempt=1
+  while [ "$attempt" -le 20 ]; do
+    if herdr_status_running; then
+      return 0
+    fi
+    if [ "$attempt" -eq 1 ]; then
+      nohup "${HERDR[@]}" server >/dev/null 2>&1 &
+    fi
+    if [ "$attempt" -lt 20 ]; then
+      sleep 0.1
+    fi
+    attempt=$((attempt + 1))
+  done
+
+  socket="${XDG_CONFIG_HOME:-$HOME/.config}/herdr/sessions/$SESSION/herdr.sock"
+  printf "hermes-workspace: Herdr session '%s' did not become ready at %s\n" "$SESSION" "$socket" >&2
+  return 1
+}
+
+parse_herdr_inventory() {
+  local parsed
+
+  if ! parsed="$(printf '%s' "$HERDR_INVENTORY" | python3 -c 'import json, sys
+try:
+    value = json.load(sys.stdin)
+    agents = value["result"]["agents"]
+    if not isinstance(agents, list):
+        raise TypeError
+    names = []
+    for agent in agents:
+        name = agent["name"]
+        if not isinstance(name, str):
+            raise TypeError
+        names.append(name)
+except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError):
+    raise SystemExit(1)
+sys.stdout.write("\n".join(names))')"; then
+    printf "hermes-workspace: malformed agent inventory for Herdr session '%s'; refusing to create agents\n" "$SESSION" >&2
+    return 1
+  fi
+  HERDR_NAMES="$parsed"
+}
+
+herdr_slot_inventory() {
+  local attempt
+
+  attempt=1
+  while [ "$attempt" -le 3 ]; do
+    if HERDR_INVENTORY="$("${HERDR[@]}" agent list)"; then
+      parse_herdr_inventory
+      return
+    fi
+    if [ "$attempt" -lt 3 ]; then
+      sleep 0.1
+    fi
+    attempt=$((attempt + 1))
+  done
+  printf "hermes-workspace: unable to inventory Herdr session '%s' after 3 attempts\n" "$SESSION" >&2
+  return 1
+}
+
+herdr_has_label() {
+  local wanted=$1 name
+
+  while IFS= read -r name; do
+    [ "$name" = "$wanted" ] && return 0
+  done <<< "$HERDR_NAMES"
+  return 1
+}
+
+ensure_herdr_workspace() {
+  local number label added
+
+  if ! command -v herdr >/dev/null 2>&1; then
+    printf "hermes-workspace: 'herdr' not on PATH — install Herdr before using the Herdr backend.\n" >&2
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf 'hermes-workspace: Python 3 is required for the Herdr backend; install python3 and retry.\n' >&2
+    return 1
+  fi
+  if ! command -v hermes-pane >/dev/null 2>&1; then
+    printf "hermes-workspace: 'hermes-pane' not on PATH — run hermes-reload (hmr) to install it.\n" >&2
+    return 1
+  fi
+
+  HERDR=(herdr --session "$SESSION")
+  ensure_herdr_server || return
+  herdr_slot_inventory || return
+
+  added=0
+  number=1
+  while [ "$number" -le "$REQUEST_COUNT" ]; do
+    label="$(label_for "$number")"
+    if ! herdr_has_label "$label"; then
+      if ! "${HERDR[@]}" agent start "$label" --split right --no-focus -- hermes-pane "$label" >/dev/null; then
+        if ! herdr_slot_inventory; then
+          printf "hermes-workspace: Herdr agent start failed for %s in session '%s', and inventory refresh could not confirm a competing launch; inspect Herdr server output and retry\n" "$label" "$SESSION" >&2
+          return 1
+        fi
+        if ! herdr_has_label "$label"; then
+          printf "hermes-workspace: Herdr agent start failed for %s in session '%s', and %s is still absent after inventory refresh; inspect Herdr server output and retry\n" "$label" "$SESSION" "$label" >&2
+          return 1
+        fi
+      fi
+      added=1
+    fi
+    number=$((number + 1))
+  done
+
+  if [ "$added" -eq 1 ]; then
+    herdr_slot_inventory || return
+  fi
+  number=1
+  while [ "$number" -le "$REQUEST_COUNT" ]; do
+    label="$(label_for "$number")"
+    if ! herdr_has_label "$label"; then
+      printf "hermes-workspace: Herdr session '%s' is missing expected agent %s after creation\n" "$SESSION" "$label" >&2
+      return 1
+    fi
+    number=$((number + 1))
+  done
+  "${HERDR[@]}" agent focus H1 >/dev/null || return
+}
+
+verify_herdr_workspace() {
+  verify_header herdr "$SESSION"
+  [ -z "$HERDR_INVENTORY" ] || printf '%s\n' "$HERDR_INVENTORY"
+  printf 'HMW_VERIFY inventory-end\n'
+}
+
+attach_herdr_workspace() {
+  exec "${HERDR[@]}"
+}
+
+case "$BACKEND" in
+  tmux) ;;
+  herdr) ;;
+  *) usage_error "unsupported backend: $BACKEND" ;;
+esac
+
+SESSION=ws
+if [ "$BACKEND" = "herdr" ]; then
+  SESSION="${HERDR_SESSION-ws}"
+  [ -n "$SESSION" ] || usage_error 'HERDR_SESSION must not be empty'
 fi
 
-# Fresh build: window with H1, then split right for H2..HN.
-tmux new-session -d -s "$SESSION" -n ws "$PANE_CMD $(label_for 1)"
-n=1
-while [ "$n" -lt "$panes" ]; do
-  n=$((n + 1))
-  tmux split-window -h -t "$SESSION":ws "$PANE_CMD $(label_for "$n")"
-done
-tmux select-layout -t "$SESSION":ws even-horizontal   # equal-width columns
-tmux select-pane   -t "$SESSION":ws.0                 # focus the first (H1) pane
-attach
+parse_request "$@"
+if [ "${HMW_REMOTE:-0}" != "1" ]; then
+  resolve_default_target
+  if [ -n "$REQUEST_HOST" ]; then
+    resolve_ssh_target
+    dispatch_remote
+  fi
+fi
+
+case "$BACKEND" in
+  tmux)
+    ensure_tmux_workspace || exit $?
+    if [ "$VERIFY" = "1" ]; then
+      verify_tmux_workspace || exit $?
+    else
+      attach_tmux_workspace
+    fi
+    ;;
+  herdr)
+    ensure_herdr_workspace || exit $?
+    if [ "$VERIFY" = "1" ]; then
+      verify_herdr_workspace || exit $?
+    else
+      attach_herdr_workspace
+    fi
+    ;;
+esac

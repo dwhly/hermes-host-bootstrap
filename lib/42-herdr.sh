@@ -15,8 +15,8 @@
 # that node), so every node that runs agents needs its own herdr. See the herdr
 # research page in the automation wiki for the fleet-fit rationale.
 #
-# Also symlinks the experimental `hmw-herdr` launcher (scripts/hmw-herdr.sh) so
-# the herdr-backed workspace is reachable on PATH like hmw. Skip key: herdr.
+# Also symlinks the `hmw-herdr` backend-selecting wrapper (scripts/hmw-herdr.sh)
+# so the Herdr-backed workspace is reachable on PATH like hmw. Skip key: herdr.
 
 set -euo pipefail
 # shellcheck disable=SC1091
@@ -74,11 +74,11 @@ else
   fi
 fi
 
-# ── Symlink the experimental hmw-herdr launcher onto PATH (like hmw) ───────
+# ── Symlink the hmw-herdr backend wrapper onto PATH (like hmw) ─────────────
 if [[ -f "$REPO_ROOT/scripts/hmw-herdr.sh" ]]; then
   chmod +x "$REPO_ROOT/scripts/hmw-herdr.sh" 2>/dev/null || true
   ln -sf "$REPO_ROOT/scripts/hmw-herdr.sh" "$install_dir/hmw-herdr"
-  ok "linked hmw-herdr → $install_dir/hmw-herdr (herdr-backed workspace launcher, experimental)"
+  ok "linked hmw-herdr → $install_dir/hmw-herdr (shared Herdr workspace backend)"
 fi
 
 # ── Install the Hermes agent-state integration ────────────────────────────
