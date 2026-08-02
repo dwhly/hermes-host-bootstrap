@@ -12,7 +12,6 @@ grep -q 'brew install --cask fluidvoice' "$MODULE" || fail "official cask instal
 grep -q 'OS.*macos' "$MODULE" || fail "macOS gate missing"
 grep -q 'role_includes client' "$MODULE" || fail "client role gate missing"
 grep -q 'login item.*FluidVoice' "$MODULE" || fail "login item registration missing"
-grep -q 'hidden:true' "$MODULE" || fail "silent login item missing"
 grep -q 'ShowMainWindowAtLoginLaunch -bool false' "$MODULE" || fail "silent-login preference missing"
 grep -q 'LaunchAtStartupCompatibilityFallback -bool true' "$MODULE" || fail "compatibility marker missing"
 grep -q 'FluidVoice' "$ROOT/tiers/recommended.txt" || fail "tier manifest missing"

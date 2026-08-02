@@ -62,16 +62,15 @@ fi
 # For unattended bootstrap, use the app's own supported legacy compatibility
 # Login Item path (the source explicitly knows how to remove this item when the
 # user disables launch-at-startup later). This produces a genuine login-item
-# launch event, allowing FluidVoice to boot silently in the menu bar.
+# launch event; the app preference below suppresses its window at login.
 bundle_id="$(defaults read /Applications/FluidVoice.app/Contents/Info CFBundleIdentifier 2>/dev/null || echo com.FluidApp.app)"
 defaults write "$bundle_id" ShowMainWindowAtLoginLaunch -bool false
 defaults write "$bundle_id" LaunchAtStartupCompatibilityFallback -bool true
 
-if osascript -e 'tell application "System Events" to if not (exists login item "FluidVoice") then make login item at end with properties {name:"FluidVoice", path:"/Applications/FluidVoice.app", hidden:true}' \
-  -e 'tell application "System Events" to set hidden of login item "FluidVoice" to true' >/dev/null 2>&1; then
+if osascript -e 'tell application "System Events" to if not (exists login item "FluidVoice") then make login item at end with properties {name:"FluidVoice", path:"/Applications/FluidVoice.app"}' >/dev/null 2>&1; then
   login_path="$(osascript -e 'tell application "System Events" to if exists login item "FluidVoice" then get path of login item "FluidVoice"' 2>/dev/null || true)"
   if [[ "$login_path" == "/Applications/FluidVoice.app" ]]; then
-    ok "FluidVoice login item enabled (starts silently at graphical login)"
+    ok "FluidVoice login item enabled (window suppressed at graphical login)"
   else
     warn "FluidVoice login item exists but path verification returned: ${login_path:-unknown}"
   fi
