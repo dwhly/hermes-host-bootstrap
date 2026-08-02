@@ -67,7 +67,8 @@ bundle_id="$(defaults read /Applications/FluidVoice.app/Contents/Info CFBundleId
 defaults write "$bundle_id" ShowMainWindowAtLoginLaunch -bool false
 defaults write "$bundle_id" LaunchAtStartupCompatibilityFallback -bool true
 
-if osascript -e 'tell application "System Events" to if not (exists login item "FluidVoice") then make login item at end with properties {name:"FluidVoice", path:"/Applications/FluidVoice.app", hidden:true}' >/dev/null 2>&1; then
+if osascript -e 'tell application "System Events" to if not (exists login item "FluidVoice") then make login item at end with properties {name:"FluidVoice", path:"/Applications/FluidVoice.app", hidden:true}' \
+  -e 'tell application "System Events" to set hidden of login item "FluidVoice" to true' >/dev/null 2>&1; then
   login_path="$(osascript -e 'tell application "System Events" to if exists login item "FluidVoice" then get path of login item "FluidVoice"' 2>/dev/null || true)"
   if [[ "$login_path" == "/Applications/FluidVoice.app" ]]; then
     ok "FluidVoice login item enabled (starts silently at graphical login)"
