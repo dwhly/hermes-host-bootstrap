@@ -40,7 +40,7 @@ verify_check "fabric"     "false" "harness" "fabric --version 2>&1 | sed -n '1p'
 verify_check "herdr"      "false" "harness" "herdr --version 2>&1 | sed -n '1p'"
 verify_check "herdr-new-agent" "false" "harness" "test -x '$HOME/.local/bin/herdr-new-agent' && grep -q 'command = \"herdr-new-agent right\"' '$HOME/.config/herdr/config.toml' && echo present"
 verify_check "fluidvoice" "false" "system" "if test \"$(uname -s)\" != Darwin; then echo not-applicable; elif test -d /Applications/FluidVoice.app; then defaults read /Applications/FluidVoice.app/Contents/Info CFBundleShortVersionString; else exit 1; fi"
-verify_check "fluidvoice-login-item" "false" "system" "if test \"$(uname -s)\" != Darwin; then echo not-applicable; else test \"$(osascript -e 'tell application \\\"System Events\\\" to if exists login item \\\"FluidVoice\\\" then get path of login item \\\"FluidVoice\\\"' 2>/dev/null)\" = /Applications/FluidVoice.app && echo enabled; fi"
+verify_check "fluidvoice-login-item" "false" "system" "if test \"$(uname -s)\" != Darwin; then echo not-applicable; else osascript -e 'tell application \\\"System Events\\\" to if exists login item \\\"FluidVoice\\\" then get path of login item \\\"FluidVoice\\\"' 2>/dev/null | grep -qx /Applications/FluidVoice.app && echo enabled; fi"
 verify_check "hermes"     "false" "hermes" "hermes --version"
 verify_check "himalaya"   "false" "system" "himalaya --version"
 verify_check "ffmpeg"     "false" "system" "ffmpeg -version"
