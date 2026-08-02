@@ -16,6 +16,31 @@ verify_check() {
   HERMES_VERIFY_CHECKS+=("${name}|${required}|${category}|${cmd}")
 }
 
+verify_fluidvoice_app() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    printf '%s\n' not-applicable
+  elif [[ -d /Applications/FluidVoice.app ]]; then
+    defaults read /Applications/FluidVoice.app/Contents/Info CFBundleShortVersionString
+  else
+    return 1
+  fi
+}
+
+verify_fluidvoice_login_item() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    printf '%s\n' not-applicable
+    return 0
+  fi
+  local path bundle_id show_window
+  path="$(osascript -e 'tell application "System Events" to if exists login item "FluidVoice" then get path of login item "FluidVoice"' 2>/dev/null || true)"
+  [[ "$path" == "/Applications/FluidVoice.app" ]] || return 1
+  bundle_id="$(defaults read /Applications/FluidVoice.app/Contents/Info CFBundleIdentifier 2>/dev/null || true)"
+  [[ -n "$bundle_id" ]] || return 1
+  show_window="$(defaults read "$bundle_id" ShowMainWindowAtLoginLaunch 2>/dev/null || true)"
+  [[ "$show_window" == "0" ]] || return 1
+  printf '%s\n' enabled
+}
+
 verify_check "git"        "true"  "system" "git --version"
 verify_check "tmux"       "true"  "system" "tmux -V"
 verify_check "tmux-autoattach" "false" "harness" "test -f '$HOME/.hermes-host-bootstrap.tmux-autoattach.sh' && echo present"
@@ -39,8 +64,8 @@ verify_check "gh"         "false" "system" "gh --version"
 verify_check "fabric"     "false" "harness" "fabric --version 2>&1 | sed -n '1p'"
 verify_check "herdr"      "false" "harness" "herdr --version 2>&1 | sed -n '1p'"
 verify_check "herdr-new-agent" "false" "harness" "test -x '$HOME/.local/bin/herdr-new-agent' && grep -q 'command = \"herdr-new-agent right\"' '$HOME/.config/herdr/config.toml' && echo present"
-verify_check "fluidvoice" "false" "system" "if test \"$(uname -s)\" != Darwin; then echo not-applicable; elif test -d /Applications/FluidVoice.app; then defaults read /Applications/FluidVoice.app/Contents/Info CFBundleShortVersionString; else exit 1; fi"
-verify_check "fluidvoice-login-item" "false" "system" "if test \"$(uname -s)\" != Darwin; then echo not-applicable; else osascript -e 'tell application \"System Events\" to if exists login item \"FluidVoice\" then get path of login item \"FluidVoice\"' 2>/dev/null | grep -qx /Applications/FluidVoice.app && echo enabled; fi"
+verify_check "fluidvoice" "false" "system" "verify_fluidvoice_app"
+verify_check "fluidvoice-login-item" "false" "system" "verify_fluidvoice_login_item"
 verify_check "hermes"     "false" "hermes" "hermes --version"
 verify_check "himalaya"   "false" "system" "himalaya --version"
 verify_check "ffmpeg"     "false" "system" "ffmpeg -version"
