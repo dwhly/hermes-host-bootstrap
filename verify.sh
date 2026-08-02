@@ -17,24 +17,26 @@ verify_check() {
 }
 
 verify_fluidvoice_app() {
+  local app_path="${FLUIDVOICE_APP_PATH:-/Applications/FluidVoice.app}"
   if [[ "$(uname -s)" != "Darwin" ]]; then
     printf '%s\n' not-applicable
-  elif [[ -d /Applications/FluidVoice.app ]]; then
-    defaults read /Applications/FluidVoice.app/Contents/Info CFBundleShortVersionString
+  elif [[ -d "$app_path" ]]; then
+    defaults read "$app_path/Contents/Info" CFBundleShortVersionString
   else
     return 1
   fi
 }
 
 verify_fluidvoice_login_item() {
+  local app_path="${FLUIDVOICE_APP_PATH:-/Applications/FluidVoice.app}"
   if [[ "$(uname -s)" != "Darwin" ]]; then
     printf '%s\n' not-applicable
     return 0
   fi
   local path bundle_id show_window
   path="$(osascript -e 'tell application "System Events" to if exists login item "FluidVoice" then get path of login item "FluidVoice"' 2>/dev/null || true)"
-  [[ "$path" == "/Applications/FluidVoice.app" ]] || return 1
-  bundle_id="$(defaults read /Applications/FluidVoice.app/Contents/Info CFBundleIdentifier 2>/dev/null || true)"
+  [[ "$path" == "$app_path" ]] || return 1
+  bundle_id="$(defaults read "$app_path/Contents/Info" CFBundleIdentifier 2>/dev/null || true)"
   [[ -n "$bundle_id" ]] || return 1
   show_window="$(defaults read "$bundle_id" ShowMainWindowAtLoginLaunch 2>/dev/null || true)"
   [[ "$show_window" == "0" ]] || return 1

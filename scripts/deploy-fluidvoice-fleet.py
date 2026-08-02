@@ -61,6 +61,12 @@ def load_hosts() -> list[dict[str, str]]:
         os_data = data.get("os") or {}
         if os_data.get("kind") != "macos":
             continue
+        bootstrap = data.get("bootstrap") or {}
+        role = str(bootstrap.get("role") or "").strip().lower()
+        # FluidVoice is a GUI input surface. A macOS record must explicitly
+        # include the client role; unknown/server-only records fail closed.
+        if role not in {"client", "both"}:
+            continue
         name = str(data.get("hostname") or path.stem)
         user = str(data.get("ssh_user") or data.get("default_user") or "")
         address = str(data.get("tailscale_ip") or data.get("ssh_host") or "")
