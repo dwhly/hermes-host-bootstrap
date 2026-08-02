@@ -44,6 +44,8 @@ AGENT
     release-binary installer → ~/.local/bin; run `fabric --setup` per host for keys)
   + Herdr agent multiplexer (ogulcancelik/herdr; "tmux for AI agents"; per-host
     release binary → ~/.local/bin; also symlinks the experimental hmw-herdr launcher)
+  + FluidVoice (macOS client/both only; GPLv3 local-first system-wide dictation;
+    official Homebrew cask; first launch needs Microphone + Accessibility grants)
   + playwright system deps + bundled chromium
 
 GHOSTTY (client/both role only)
