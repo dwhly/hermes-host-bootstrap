@@ -69,7 +69,7 @@ def load_hosts() -> list[dict[str, str]]:
 def converge(host: dict[str, str]) -> dict[str, str]:
     cmd = [
         "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
-        host["target"], "bash", "-s",
+        host["target"], "/bin/bash", "--noprofile", "--norc", "-s",
     ]
     try:
         result = subprocess.run(
