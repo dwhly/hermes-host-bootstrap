@@ -31,9 +31,12 @@ else
 fi
 cd "$BD"
 git pull --ff-only origin main >/dev/null
-nohup caffeinate -dimsu -t 1200 </dev/null >/dev/null 2>&1 &
-bash bootstrap.sh --tier=recommended --role=client --only=43-fluidvoice >/tmp/fluidvoice-install.log 2>&1
-bash bootstrap.sh --tier=recommended --role=client --only=99-register-host >/tmp/fluidvoice-register.log 2>&1
+caffeinate -dimsu -t 1200 >/dev/null 2>&1 &
+caffeinate_pid=$!
+bash bootstrap.sh --tier=recommended --role=client --only=43-fluidvoice </dev/null >/tmp/fluidvoice-install.log 2>&1
+kill "$caffeinate_pid" 2>/dev/null || true
+wait "$caffeinate_pid" 2>/dev/null || true
+bash bootstrap.sh --tier=recommended --role=client --only=99-register-host </dev/null >/tmp/fluidvoice-register.log 2>&1
 version="$(defaults read /Applications/FluidVoice.app/Contents/Info CFBundleShortVersionString)"
 bundle_id="$(defaults read /Applications/FluidVoice.app/Contents/Info CFBundleIdentifier)"
 login_path="$(osascript -e 'tell application "System Events" to if exists login item "FluidVoice" then get path of login item "FluidVoice"')"
