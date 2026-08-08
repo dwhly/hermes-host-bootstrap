@@ -46,17 +46,37 @@ while number in live:
 print(f"H{number}")
 ' "$db")"
 
-args=(--session "$session" agent start "$label")
+pane_id="${HERDR_PANE_ID:-}"
+tab_id=""
+cwd=""
 if [[ -n "${HERDR_PANE_ID:-}" ]]; then
   pane="$(herdr --session "$session" pane get "$HERDR_PANE_ID" 2>/dev/null || true)"
   if [[ -n "$pane" ]]; then
     tab_id="$(printf '%s' "$pane" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("result",{}).get("pane",{}).get("tab_id",""))')"
     cwd="$(printf '%s' "$pane" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("result",{}).get("pane",{}).get("cwd",""))')"
-    [[ -n "$tab_id" ]] && args+=(--tab "$tab_id")
-    [[ -n "$cwd" ]] && args+=(--cwd "$cwd")
   fi
 fi
-args+=(--split "$direction" --focus -- hermes-pane "$label")
 
-herdr "${args[@]}" >/dev/null
+if herdr --session "$session" agent start --help >/dev/null 2>&1; then
+  if [[ -n "$pane_id" ]]; then
+    created="$(herdr --session "$session" pane split "$pane_id" --direction "$direction" --no-focus)"
+  else
+    workspace_args=(--session "$session" workspace create --label ws --no-focus)
+    [[ -n "$cwd" ]] && workspace_args+=(--cwd "$cwd")
+    created="$(herdr "${workspace_args[@]}")"
+  fi
+  pane_id="$(printf '%s' "$created" | python3 -c 'import json,sys
+value=json.load(sys.stdin)["result"]
+pane=value.get("pane") or value.get("root_pane")
+print(pane["pane_id"])')"
+  herdr --session "$session" pane rename "$pane_id" "$label" >/dev/null
+  herdr --session "$session" pane run "$pane_id" "hermes-pane $label" >/dev/null
+  herdr --session "$session" agent focus "$pane_id" >/dev/null
+else
+  args=(--session "$session" agent start "$label")
+  [[ -n "$tab_id" ]] && args+=(--tab "$tab_id")
+  [[ -n "$cwd" ]] && args+=(--cwd "$cwd")
+  args+=(--split "$direction" --focus -- hermes-pane "$label")
+  herdr "${args[@]}" >/dev/null
+fi
 printf 'Started %s as a fresh Hermes session (%s).\n' "$label" "$direction"

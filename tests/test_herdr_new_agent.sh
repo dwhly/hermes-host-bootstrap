@@ -17,6 +17,13 @@ case "$*" in
   '--session ws pane get pane-1')
     printf '%s\n' '{"result":{"pane":{"tab_id":"tab-7","cwd":"/tmp/project space"}}}'
     ;;
+  '--session ws agent start --help')
+    [[ "${HERDR_NEW_API:-0}" == 1 ]] || exit 2
+    printf '%s\n' 'Usage: herdr agent start <NAME> --kind <KIND> --pane <ID>'
+    ;;
+  '--session ws pane split pane-1 --direction right --no-focus')
+    printf '%s\n' '{"result":{"pane":{"pane_id":"w1:p2"}}}'
+    ;;
 esac
 EOF
 cat >"$TMP/bin/hermes-pane" <<'EOF'
@@ -47,5 +54,13 @@ rm -f "$TMP/home/.hermes/state.db"
 out="$(HOME="$TMP/home" PATH="$TMP/bin:$PATH" HERDR_TEST_LOG="$LOG" HERDR_SESSION=ws "$ROOT/scripts/herdr-new-agent")"
 [[ "$out" == 'Started H4 as a fresh Hermes session (right).' ]]
 grep -Fx -- '--session ws agent start H4 --split right --focus -- hermes-pane H4' "$LOG"
+
+: >"$LOG"
+out="$(HOME="$TMP/home" PATH="$TMP/bin:$PATH" HERDR_TEST_LOG="$LOG" HERDR_NEW_API=1 HERDR_PANE_ID=pane-1 HERDR_SESSION=ws "$ROOT/scripts/herdr-new-agent")"
+[[ "$out" == 'Started H4 as a fresh Hermes session (right).' ]]
+grep -Fx -- '--session ws pane split pane-1 --direction right --no-focus' "$LOG"
+grep -Fx -- '--session ws pane rename w1:p2 H4' "$LOG"
+grep -Fx -- '--session ws pane run w1:p2 hermes-pane H4' "$LOG"
+grep -Fx -- '--session ws agent focus w1:p2' "$LOG"
 
 printf 'PASS: herdr-new-agent selects a fresh H-slot and preserves pane placement context\n'
