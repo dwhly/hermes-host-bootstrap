@@ -196,6 +196,13 @@ EOF
 
 cat >"$FAKE_BIN/herdr" <<'EOF'
 #!/usr/bin/env bash
+if [ "${1:-}" = --session ] && [ "${3:-}" = agent ] && [ "${4:-}" = start ] && [ "${5:-}" = --help ]; then
+  if [ "${HERDR_NEW_API:-0}" = 1 ]; then
+    printf '%s\n' 'Usage: herdr agent start <NAME> --kind <KIND> --pane <ID>'
+    exit 0
+  fi
+  exit 2
+fi
 printf 'herdr' >>"$HMW_STUB_LOG"
 for arg in "$@"; do printf '\t%s' "$arg" >>"$HMW_STUB_LOG"; done
 printf '\n' >>"$HMW_STUB_LOG"
@@ -249,6 +256,21 @@ case "$1 $2" in
         "$HERDR_UNNAMED_LABEL" "${HERDR_UNNAMED_PANE_ID:-w1:pB}"
     fi
     printf '],"type":"pane_list"}}\n'
+    ;;
+  'workspace create')
+    printf '%s\n' '{"id":"cli:workspace:create","result":{"root_pane":{"pane_id":"w1:p1"},"type":"workspace_created"}}'
+    ;;
+  'pane split')
+    printf '%s\n' '{"id":"cli:pane:split","result":{"pane":{"pane_id":"w1:p2"},"type":"pane_info"}}'
+    ;;
+  'pane rename')
+    ;;
+  'pane run')
+    label=${4#hermes-pane }
+    printf '%s\n' "$label" >>"$HERDR_NAMES_FILE"
+    ;;
+  'pane get')
+    printf '%s\n' '{"id":"cli:pane:get","result":{"pane":{"agent":"hermes"},"type":"pane_info"}}'
     ;;
   'agent start')
     label=$3
@@ -728,6 +750,22 @@ EOF
   run_core env HMW_BACKEND=herdr HMW_REMOTE=1 HMW_VERIFY=0 HMW_HERDR_VERIFY=1 "$CORE" 1 || return 1
   assert_not_contains "$STDOUT_FILE" 'HMW_VERIFY' 'HMW_VERIFY wins over legacy compatibility variable' || return 1
   assert_exact_line_count 1 "$LOG" $'herdr\t--session\tws' 'nonverify Herdr attaches with scoped prefix only' || return 1
+
+  reset_state
+  run_core env HMW_BACKEND=herdr HMW_REMOTE=1 HMW_VERIFY=1 HERDR_NEW_API=1 "$CORE" 2 || {
+    printf '  new API stderr:\n' >&2
+    cat "$STDERR_FILE" >&2
+    printf '  new API calls:\n' >&2
+    cat "$LOG" >&2
+    return 1
+  }
+  assert_contains "$LOG" $'workspace\tcreate\t--cwd\t' 'new Herdr API creates the initial workspace pane' || return 1
+  assert_contains "$LOG" $'pane\trename\tw1:p1\tH1' 'new Herdr API labels H1 explicitly' || return 1
+  assert_contains "$LOG" $'pane\trun\tw1:p1\thermes-pane H1' 'new Herdr API starts Hermes in H1' || return 1
+  assert_contains "$LOG" $'pane\tsplit\tw1:p1\t--direction\tright\t--no-focus' 'new Herdr API splits subsequent panes from H1' || return 1
+  assert_contains "$LOG" $'pane\trename\tw1:p2\tH2' 'new Herdr API labels H2 explicitly' || return 1
+  assert_contains "$LOG" $'pane\trun\tw1:p2\thermes-pane H2' 'new Herdr API starts Hermes in H2' || return 1
+  assert_not_contains "$LOG" $'agent\tstart\tH1\t--split' 'new Herdr API avoids removed create-and-split grammar' || return 1
   pass 'Herdr exact-label add-only behavior, JSON safety, and verify compatibility'
 }
 

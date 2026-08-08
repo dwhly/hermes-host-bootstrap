@@ -480,8 +480,72 @@ herdr_focus_label() {
   fi
 }
 
+herdr_uses_existing_pane_start() {
+  "${HERDR[@]}" agent start --help >/dev/null 2>&1
+}
+
+herdr_json_pane_id() {
+  python3 -c 'import json, sys
+try:
+    value = json.load(sys.stdin)
+    result = value["result"]
+    pane = result.get("pane") or result.get("root_pane")
+    pane_id = pane["pane_id"]
+    if not isinstance(pane_id, str) or not pane_id:
+        raise TypeError
+except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError, AttributeError):
+    raise SystemExit(1)
+sys.stdout.write(pane_id)'
+}
+
+herdr_wait_for_agent_pane() {
+  local pane_id=$1 attempt pane_json
+
+  attempt=1
+  while [ "$attempt" -le 30 ]; do
+    pane_json="$("${HERDR[@]}" pane get "$pane_id" 2>/dev/null || true)"
+    if printf '%s' "$pane_json" | python3 -c 'import json, sys
+try:
+    pane = json.load(sys.stdin)["result"]["pane"]
+except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError):
+    raise SystemExit(1)
+raise SystemExit(0 if pane.get("agent") == "hermes" else 1)' 2>/dev/null; then
+      return 0
+    fi
+    [ "$attempt" -eq 30 ] || sleep 0.1
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+start_herdr_agent_in_new_pane() {
+  local label=$1 anchor pane_json pane_id
+
+  anchor="$(herdr_target_for_label H1 2>/dev/null || true)"
+  if [ -n "$anchor" ]; then
+    pane_json="$("${HERDR[@]}" pane split "$anchor" --direction right --no-focus)" || return
+  else
+    pane_json="$("${HERDR[@]}" workspace create --cwd "$HOME" --label ws --no-focus)" || return
+  fi
+  pane_id="$(printf '%s' "$pane_json" | herdr_json_pane_id)" || return
+  "${HERDR[@]}" pane rename "$pane_id" "$label" >/dev/null || return
+  "${HERDR[@]}" pane run "$pane_id" "hermes-pane $label" >/dev/null || return
+  if ! herdr_wait_for_agent_pane "$pane_id"; then
+    printf "hermes-workspace: Hermes did not become ready in pane %s for %s in session '%s'\n" "$pane_id" "$label" "$SESSION" >&2
+    return 1
+  fi
+  if [ -n "$HERDR_NAMES" ]; then
+    HERDR_NAMES+=$'\n'
+  fi
+  HERDR_NAMES+="$label"
+  if [ -n "$HERDR_LABEL_TARGETS" ]; then
+    HERDR_LABEL_TARGETS+=$'\n'
+  fi
+  HERDR_LABEL_TARGETS+="$label"$'\t'"$pane_id"
+}
+
 ensure_herdr_workspace() {
-  local number label added
+  local number label added legacy_start
 
   if ! command -v python3 >/dev/null 2>&1; then
     printf 'hermes-workspace: Python 3 is required for the Herdr backend; install python3 and retry.\n' >&2
@@ -499,13 +563,19 @@ ensure_herdr_workspace() {
   HERDR=(herdr --session "$SESSION")
   ensure_herdr_server || return
   herdr_slot_inventory || return
+  legacy_start=1
+  if herdr_uses_existing_pane_start; then
+    legacy_start=0
+  fi
 
   added=0
   number=1
   while [ "$number" -le "$REQUEST_COUNT" ]; do
     label="$(label_for "$number")"
     if ! herdr_has_label "$label"; then
-      if ! "${HERDR[@]}" agent start "$label" --split right --no-focus -- hermes-pane "$label" >/dev/null; then
+      if [ "$legacy_start" -eq 0 ]; then
+        start_herdr_agent_in_new_pane "$label" || return
+      elif ! "${HERDR[@]}" agent start "$label" --split right --no-focus -- hermes-pane "$label" >/dev/null; then
         if ! herdr_slot_inventory; then
           printf "hermes-workspace: Herdr agent start failed for %s in session '%s', and inventory refresh could not confirm a competing launch; inspect Herdr server output and retry\n" "$label" "$SESSION" >&2
           return 1
