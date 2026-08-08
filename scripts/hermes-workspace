@@ -327,7 +327,9 @@ attach_tmux_workspace() {
 }
 
 HERDR_INVENTORY=""
+HERDR_PANE_INVENTORY=""
 HERDR_NAMES=""
+HERDR_LABEL_TARGETS=""
 
 herdr_status_running() {
   local status_json
@@ -364,27 +366,64 @@ ensure_herdr_server() {
 }
 
 parse_herdr_inventory() {
-  local parsed
+  local parsed record name target
 
-  if ! parsed="$(printf '%s' "$HERDR_INVENTORY" | python3 -c 'import json, sys
+  if ! parsed="$(HERDR_AGENT_INVENTORY="$HERDR_INVENTORY" HERDR_PANE_INVENTORY="$HERDR_PANE_INVENTORY" python3 -c 'import json, os, sys
 try:
-    value = json.load(sys.stdin)
-    agents = value["result"]["agents"]
-    if not isinstance(agents, list):
+    agent_value = json.loads(os.environ["HERDR_AGENT_INVENTORY"])
+    pane_value = json.loads(os.environ["HERDR_PANE_INVENTORY"])
+    agents = agent_value["result"]["agents"]
+    panes = pane_value["result"]["panes"]
+    if not isinstance(agents, list) or not isinstance(panes, list):
         raise TypeError
-    names = []
+    records = []
     for agent in agents:
-        name = agent["name"]
-        if not isinstance(name, str):
+        if not isinstance(agent, dict):
             raise TypeError
-        names.append(name)
+        name = agent.get("name")
+        if name is not None:
+            if not isinstance(name, str) or not name:
+                raise TypeError
+            records.append((name, ""))
+    for pane in panes:
+        if not isinstance(pane, dict):
+            raise TypeError
+        agent_kind = pane.get("agent")
+        if agent_kind is None:
+            continue
+        if not isinstance(agent_kind, str) or not agent_kind:
+            raise TypeError
+        label = pane.get("label")
+        if label is None:
+            continue
+        pane_id = pane.get("pane_id")
+        if not isinstance(label, str) or not label or not isinstance(pane_id, str) or not pane_id:
+            raise TypeError
+        records.append((label, pane_id))
 except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError):
     raise SystemExit(1)
-sys.stdout.write("\n".join(names))')"; then
+sys.stdout.write("\n".join(name + "\t" + target for name, target in records))')"; then
     printf "hermes-workspace: malformed agent inventory for Herdr session '%s'; refusing to create agents\n" "$SESSION" >&2
     return 1
   fi
-  HERDR_NAMES="$parsed"
+
+  HERDR_NAMES=""
+  HERDR_LABEL_TARGETS=""
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    name=${record%%$'\t'*}
+    target=${record#*$'\t'}
+    if [ -n "$HERDR_NAMES" ]; then
+      HERDR_NAMES+=$'\n'
+    fi
+    HERDR_NAMES+="$name"
+    if [ -n "$target" ]; then
+      if [ -n "$HERDR_LABEL_TARGETS" ]; then
+        HERDR_LABEL_TARGETS+=$'\n'
+      fi
+      HERDR_LABEL_TARGETS+="$name"$'\t'"$target"
+    fi
+  done <<< "$parsed"
 }
 
 herdr_slot_inventory() {
@@ -392,7 +431,8 @@ herdr_slot_inventory() {
 
   attempt=1
   while [ "$attempt" -le 3 ]; do
-    if HERDR_INVENTORY="$("${HERDR[@]}" agent list)"; then
+    if HERDR_INVENTORY="$("${HERDR[@]}" agent list)" && \
+       HERDR_PANE_INVENTORY="$("${HERDR[@]}" pane list)"; then
       parse_herdr_inventory
       return
     fi
@@ -414,15 +454,41 @@ herdr_has_label() {
   return 1
 }
 
+herdr_target_for_label() {
+  local wanted=$1 record name target
+
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    name=${record%%$'\t'*}
+    target=${record#*$'\t'}
+    if [ "$name" = "$wanted" ] && [ -n "$target" ]; then
+      printf '%s\n' "$target"
+      return 0
+    fi
+  done <<< "$HERDR_LABEL_TARGETS"
+  return 1
+}
+
+herdr_focus_label() {
+  local label=$1 target
+
+  target="$(herdr_target_for_label "$label" 2>/dev/null || true)"
+  if [ -n "$target" ]; then
+    "${HERDR[@]}" agent focus "$target" >/dev/null
+  else
+    "${HERDR[@]}" agent focus "$label" >/dev/null
+  fi
+}
+
 ensure_herdr_workspace() {
   local number label added
 
-  if ! command -v herdr >/dev/null 2>&1; then
-    printf "hermes-workspace: 'herdr' not on PATH — install Herdr before using the Herdr backend.\n" >&2
-    return 1
-  fi
   if ! command -v python3 >/dev/null 2>&1; then
     printf 'hermes-workspace: Python 3 is required for the Herdr backend; install python3 and retry.\n' >&2
+    return 1
+  fi
+  if ! command -v herdr >/dev/null 2>&1; then
+    printf "hermes-workspace: 'herdr' not on PATH — install Herdr before using the Herdr backend.\n" >&2
     return 1
   fi
   if ! command -v hermes-pane >/dev/null 2>&1; then
@@ -466,7 +532,7 @@ ensure_herdr_workspace() {
     fi
     number=$((number + 1))
   done
-  "${HERDR[@]}" agent focus H1 >/dev/null || return
+  herdr_focus_label H1 || return
 }
 
 verify_herdr_workspace() {

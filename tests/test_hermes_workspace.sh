@@ -104,6 +104,7 @@ reset_state() {
   export TMUX_EXISTS=0
   export HERDR_READY_AT=1
   export HERDR_MALFORMED=0
+  unset HERDR_UNNAMED_LABEL HERDR_UNNAMED_PANE_ID
   export SSH_EXECUTE=0
   export SSH_REMOTE_HOST=target
   unset TMUX HMW_VERIFY HMW_HERDR_VERIFY HMW_BACKEND HMW_REMOTE HMW_DEFAULT_HOST HERDR_SESSION
@@ -228,6 +229,10 @@ case "$1 $2" in
     fi
     printf '{"id":"cli:agent:list","result":{"agents":['
     first=1
+    if [ -n "${HERDR_UNNAMED_LABEL:-}" ]; then
+      printf '{"agent":"hermes","pane_id":"%s"}' "${HERDR_UNNAMED_PANE_ID:-w1:pB}"
+      first=0
+    fi
     while IFS= read -r name; do
       [ -n "$name" ] || continue
       [ "$first" -eq 1 ] || printf ','
@@ -235,6 +240,14 @@ case "$1 $2" in
       first=0
     done <"$HERDR_NAMES_FILE"
     printf '],"type":"agent_list"}}\n'
+    ;;
+  'pane list')
+    printf '{"id":"cli:pane:list","result":{"panes":['
+    if [ -n "${HERDR_UNNAMED_LABEL:-}" ]; then
+      printf '{"agent":"hermes","label":"%s","pane_id":"%s"}' \
+        "$HERDR_UNNAMED_LABEL" "${HERDR_UNNAMED_PANE_ID:-w1:pB}"
+    fi
+    printf '],"type":"pane_list"}}\n'
     ;;
   'agent start')
     label=$3
@@ -450,7 +463,7 @@ test_tmux_legacy_adoption() {
     "sh -c 'hermes-pane' 'H2'" \
     '"hermes-pane" "H2" extra' \
     '"hermes-pane"  "H2"' \
-    '"hermes-pane" '\''H2'\'''; do
+    "\"hermes-pane\" 'H2'"; do
     reset_state
     printf '%%1__HMW_SEP__H1__HMW_SEP__hermes-pane H1\n%%2__HMW_SEP____HMW_SEP__%s\n' "$command" >"$TMUX_STATE"
     run_core env HMW_REMOTE=1 HMW_VERIFY=1 TMUX_EXISTS=1 "$CORE" 2 || return 1
@@ -582,12 +595,12 @@ test_herdr_prerequisite_scoping_and_readiness() {
   reset_state
   fake_missing="$TEST_TMP/missing-python"
   mkdir -p "$fake_missing"
-  ln -s /usr/bin/bash "$fake_missing/bash"
+  ln -s /bin/bash "$fake_missing/bash"
   ln -s "$FAKE_BIN/herdr" "$fake_missing/herdr"
   set +e
   HOME="$HOME_DIR" PATH="$fake_missing" HMW_STUB_LOG="$LOG" HERDR_NAMES_FILE="$HERDR_NAMES_FILE" \
     STATUS_COUNT="$STATUS_COUNT" HMW_BACKEND=herdr HMW_REMOTE=1 \
-    /usr/bin/bash "$CORE" 1 >"$STDOUT_FILE" 2>"$STDERR_FILE"
+    /bin/bash "$CORE" 1 >"$STDOUT_FILE" 2>"$STDERR_FILE"
   status=$?
   set -e
   assert_eq 1 "$status" 'missing python3 fails Herdr backend' || return 1
@@ -597,13 +610,13 @@ test_herdr_prerequisite_scoping_and_readiness() {
   reset_state
   fake_missing_pane="$TEST_TMP/missing-hermes-pane"
   mkdir -p "$fake_missing_pane"
-  ln -s /usr/bin/bash "$fake_missing_pane/bash"
+  ln -s /bin/bash "$fake_missing_pane/bash"
   ln -s "$FAKE_BIN/herdr" "$fake_missing_pane/herdr"
   ln -s "$(command -v python3)" "$fake_missing_pane/python3"
   set +e
   HOME="$HOME_DIR" PATH="$fake_missing_pane" HMW_STUB_LOG="$LOG" HERDR_NAMES_FILE="$HERDR_NAMES_FILE" \
     STATUS_COUNT="$STATUS_COUNT" HERDR_LIST_COUNT="$HERDR_LIST_COUNT" HMW_BACKEND=herdr HMW_REMOTE=1 \
-    /usr/bin/bash "$CORE" 1 >"$STDOUT_FILE" 2>"$STDERR_FILE"
+    /bin/bash "$CORE" 1 >"$STDOUT_FILE" 2>"$STDERR_FILE"
   status=$?
   set -e
   assert_eq 1 "$status" 'missing hermes-pane fails Herdr backend' || return 1
@@ -680,6 +693,15 @@ EOF
   assert_eq "$expected" "$(cat "$STDOUT_FILE")" 'Herdr verify grammar and final native inventory are exact' || return 1
 
   reset_state
+  printf 'H2\n' >"$HERDR_NAMES_FILE"
+  run_core env HMW_BACKEND=herdr HMW_REMOTE=1 HMW_VERIFY=1 \
+    HERDR_UNNAMED_LABEL=H1 HERDR_UNNAMED_PANE_ID=w1:pB "$CORE" 2 || return 1
+  assert_not_contains "$LOG" $'agent\tstart\tH1' 'pane label reuses an unnamed detected H1 agent' || return 1
+  assert_not_contains "$LOG" $'agent\tstart\tH2' 'named H2 remains reusable beside unnamed H1' || return 1
+  assert_contains "$LOG" $'agent\tfocus\tw1:pB' 'pane-label fallback focuses unnamed H1 by pane id' || return 1
+  assert_contains "$STDOUT_FILE" '"pane_id":"w1:pB"' 'native verify inventory preserves the unnamed agent evidence' || return 1
+
+  reset_state
   set +e
   run_core env HMW_BACKEND=herdr HMW_REMOTE=1 HMW_VERIFY=1 HERDR_MALFORMED=1 "$CORE" 2
   status=$?
@@ -746,14 +768,14 @@ EOF
   set +e
   # Literal metacharacters verify argv preservation.
   # shellcheck disable=SC2016
-  HERDR_SESSION="s ' ; space" HMW_BACKEND=tmux PATH="$wrapper_bin:/usr/local/bin:/usr/bin:/bin" \
+  HERDR_SESSION="s \"quote\" ; space" HMW_BACKEND=tmux PATH="$wrapper_bin:/usr/local/bin:/usr/bin:/bin" \
     "$WRAPPER" 'host name;$(touch nope)' '3 & * ? [x]' >"$STDOUT_FILE" 2>"$STDERR_FILE"
   status=$?
   set -e
   assert_eq 37 "$status" 'wrapper returns core exit status' || return 1
   expected=$(cat <<'EOF'
 backend=<herdr>
-session=<s ' ; space>
+session=<s "quote" ; space>
 arg=<host name;$(touch nope)>
 arg=<3 & * ? [x]>
 EOF
