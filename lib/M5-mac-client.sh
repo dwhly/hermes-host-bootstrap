@@ -126,11 +126,11 @@ if [[ -n "${HERMES_MAC_HOSTNAME:-}" ]] && ! is_skipped mac-hostname; then
   fi
 fi
 
-# Workspace launcher: now unified + cross-platform (scripts/hermes-workspace,
-# pure bash+tmux), installed on ALL hosts by lib/99-register-host.sh. The old
+# Workspace launcher: now unified + cross-platform (scripts/hermes-workspace),
+# installed on ALL hosts by lib/99-register-host.sh. The old
 # macOS-only Ghostty AppleScript launcher was retired 2026-06 — `hmw` now
-# behaves identically on macOS and Linux (tmux draws the two-pane split; for a
-# remote host it ssh-dispatches to the same script). Nothing macOS-specific to
+# behaves identically on macOS and Linux (Herdr is the default multiplexer;
+# `hmw-tmux` preserves the tmux path). Nothing macOS-specific to
 # install here anymore.
 
 ok "macOS client setup complete"

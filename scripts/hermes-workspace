@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# hermes-workspace (alias: hmw) — persistent H1..HN workspaces via tmux or Herdr.
+# hermes-workspace (alias: hmw) — persistent H1..HN workspaces via Herdr or tmux.
 
 set -uo pipefail
 
 DEFAULT_COUNT=2
 DEFAULT_HOST="${HMW_DEFAULT_HOST:-h-do1}"
-BACKEND="${HMW_BACKEND:-tmux}"
+BACKEND="${HMW_BACKEND:-herdr}"
 if [ -n "${HMW_VERIFY+x}" ]; then
   VERIFY=$HMW_VERIFY
 elif [ "$BACKEND" = "herdr" ] && [ "${HMW_HERDR_VERIFY:-0}" = "1" ]; then

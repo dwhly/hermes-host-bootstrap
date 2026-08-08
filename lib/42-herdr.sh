@@ -74,11 +74,16 @@ else
   fi
 fi
 
-# ── Symlink the hmw-herdr backend wrapper onto PATH (like hmw) ─────────────
+# ── Symlink explicit workspace backend wrappers onto PATH ──────────────────
 if [[ -f "$REPO_ROOT/scripts/hmw-herdr.sh" ]]; then
   chmod +x "$REPO_ROOT/scripts/hmw-herdr.sh" 2>/dev/null || true
   ln -sf "$REPO_ROOT/scripts/hmw-herdr.sh" "$install_dir/hmw-herdr"
-  ok "linked hmw-herdr → $install_dir/hmw-herdr (shared Herdr workspace backend)"
+  ok "linked hmw-herdr → $install_dir/hmw-herdr (explicit Herdr workspace backend)"
+fi
+if [[ -f "$REPO_ROOT/scripts/hmw-tmux.sh" ]]; then
+  chmod +x "$REPO_ROOT/scripts/hmw-tmux.sh" 2>/dev/null || true
+  ln -sf "$REPO_ROOT/scripts/hmw-tmux.sh" "$install_dir/hmw-tmux"
+  ok "linked hmw-tmux → $install_dir/hmw-tmux (explicit tmux workspace backend)"
 fi
 
 if [[ -f "$REPO_ROOT/scripts/herdr-new-agent" ]]; then

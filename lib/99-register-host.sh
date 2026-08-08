@@ -355,9 +355,9 @@ if [[ -f "$REPO_ROOT/scripts/hermes-pane" ]]; then
 fi
 
 # ── Install hermes-workspace on PATH ───────────────────────────────────
-# Unified tmux/Herdr workspace core (alias: hmw remains tmux-default). One
+# Unified Herdr/tmux workspace core (alias: hmw is Herdr-default). One
 # implementation owns parsing, remote dispatch, exact H1..HN slots, and verify
-# output across the fleet; `hmw <host>` re-enters this script on the remote.
+# output across the fleet; `hmw-tmux` preserves the explicit legacy backend.
 if [[ -f "$REPO_ROOT/scripts/hermes-workspace" ]]; then
   mkdir -p "$HOME/.local/bin"
   TARGET_LINK="$HOME/.local/bin/hermes-workspace"

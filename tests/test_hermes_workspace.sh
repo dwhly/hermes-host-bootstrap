@@ -4,6 +4,7 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CORE="$ROOT/scripts/hermes-workspace"
 WRAPPER="$ROOT/scripts/hmw-herdr.sh"
+TMUX_WRAPPER="$ROOT/scripts/hmw-tmux.sh"
 TEST_TMP=$(mktemp -d)
 FAKE_BIN="$TEST_TMP/bin"
 HOME_DIR="$TEST_TMP/home"
@@ -309,6 +310,11 @@ test_argument_and_default_parity() {
   run_core env HMW_VERIFY=1 HMW_DEFAULT_HOST=alias STUB_HOSTNAME=node RESOLVED_TARGET=root@node "$CORE" || return 1
   assert_contains "$LOG" $'resolver\talias' 'alias mismatch resolves before dispatch' || return 1
   assert_contains "$LOG" $'ssh\troot@node\t' 'alias resolving local still self-SSHs' || return 1
+
+  reset_state
+  run_core env HMW_REMOTE=1 HMW_VERIFY=1 "$CORE" 1 || return 1
+  assert_contains "$STDOUT_FILE" 'HMW_VERIFY backend=herdr' 'hmw defaults to the Herdr backend' || return 1
+  assert_not_contains "$LOG" $'tmux\t' 'default hmw does not invoke tmux' || return 1
   pass 'argument order and default-target parity'
 }
 
@@ -392,7 +398,7 @@ test_remote_dispatch_and_reentry() {
 test_tmux_preservation_and_verify() {
   local expected
   reset_state
-  run_core env HMW_REMOTE=1 HMW_VERIFY=1 TMUX_EXISTS=0 STUB_HOSTNAME=local "$CORE" 3 || return 1
+  run_core env HMW_BACKEND=tmux HMW_REMOTE=1 HMW_VERIFY=1 TMUX_EXISTS=0 STUB_HOSTNAME=local "$CORE" 3 || return 1
   assert_contains "$LOG" $'tmux\tnew-session\t-d\t-P\t-F\t#{pane_id}\t-s\tws\t-n\tws\thermes-pane H1' 'fresh tmux creates ws:ws with H1' || return 1
   assert_contains "$LOG" $'tmux\tsplit-window\t-h\t-P\t-F\t#{pane_id}\t-t\tws:ws\thermes-pane H2' 'fresh tmux adds H2 horizontally' || return 1
   assert_contains "$LOG" $'tmux\tsplit-window\t-h\t-P\t-F\t#{pane_id}\t-t\tws:ws\thermes-pane H3' 'fresh tmux adds H3 horizontally' || return 1
@@ -419,23 +425,23 @@ EOF
   reset_state
   export TMUX_EXISTS=1
   printf '%%7__HMW_SEP__H1__HMW_SEP__hermes-pane H1\n%%8__HMW_SEP____HMW_SEP__other-command\n%%9__HMW_SEP__H2__HMW_SEP__hermes-pane H2\n' >"$TMUX_STATE"
-  run_core env HMW_REMOTE=1 HMW_VERIFY=1 TMUX_EXISTS=1 "$CORE" 3 || return 1
+  run_core env HMW_BACKEND=tmux HMW_REMOTE=1 HMW_VERIFY=1 TMUX_EXISTS=1 "$CORE" 3 || return 1
   assert_contains "$LOG" $'split-window\t-h\t-P\t-F\t#{pane_id}\t-t\tws:ws\thermes-pane H3' 'missing exact slot is added despite unrelated pane' || return 1
   assert_contains "$LOG" $'select-pane\t-t\t%7' 'existing H1 pane id is focused' || return 1
 
   : >"$LOG"
-  run_core env HMW_REMOTE=1 HMW_VERIFY=1 TMUX_EXISTS=1 "$CORE" 1 || return 1
+  run_core env HMW_BACKEND=tmux HMW_REMOTE=1 HMW_VERIFY=1 TMUX_EXISTS=1 "$CORE" 1 || return 1
   assert_not_contains "$LOG" 'split-window' 'lower tmux count does not add or shrink' || return 1
   assert_not_contains "$LOG" 'kill-' 'lower tmux count never destroys panes' || return 1
   assert_not_contains "$LOG" 'rename' 'tmux never renames existing objects' || return 1
 
   reset_state
   printf '%%1__HMW_SEP__H1__HMW_SEP__hermes-pane H1\n' >"$TMUX_STATE"
-  run_core env HMW_REMOTE=1 TMUX_EXISTS=1 TMUX=inside "$CORE" 1 || return 1
+  run_core env HMW_BACKEND=tmux HMW_REMOTE=1 TMUX_EXISTS=1 TMUX=inside "$CORE" 1 || return 1
   assert_contains "$LOG" $'tmux\tswitch-client\t-t\tws' 'inside tmux switches client' || return 1
   reset_state
   printf '%%1__HMW_SEP__H1__HMW_SEP__hermes-pane H1\n' >"$TMUX_STATE"
-  run_core env HMW_REMOTE=1 TMUX_EXISTS=1 "$CORE" 1 || return 1
+  run_core env HMW_BACKEND=tmux HMW_REMOTE=1 TMUX_EXISTS=1 "$CORE" 1 || return 1
   assert_contains "$LOG" $'tmux\tattach-session\t-t\tws' 'outside tmux attaches session' || return 1
   pass 'tmux creation, add-only preservation, focus, attach, and verify'
 }
@@ -445,7 +451,7 @@ test_tmux_legacy_adoption() {
   for command in 'hermes-pane H2' "'hermes-pane H2'" '"hermes-pane H2"' "'hermes-pane' 'H2'" '"hermes-pane" "H2"'; do
     reset_state
     printf '%%1__HMW_SEP__H1__HMW_SEP__hermes-pane H1\n%%2__HMW_SEP____HMW_SEP__%s\n' "$command" >"$TMUX_STATE"
-    run_core env HMW_REMOTE=1 HMW_VERIFY=1 TMUX_EXISTS=1 "$CORE" 2 || return 1
+    run_core env HMW_BACKEND=tmux HMW_REMOTE=1 HMW_VERIFY=1 TMUX_EXISTS=1 "$CORE" 2 || return 1
     assert_contains "$LOG" $'tmux\tset-option\t-p\t-t\t%2\t@hmw_label\tH2' "legacy command $command is adopted" || return 1
     assert_not_contains "$LOG" 'split-window' "legacy command $command avoids duplicate" || return 1
   done
@@ -466,7 +472,7 @@ test_tmux_legacy_adoption() {
     "\"hermes-pane\" 'H2'"; do
     reset_state
     printf '%%1__HMW_SEP__H1__HMW_SEP__hermes-pane H1\n%%2__HMW_SEP____HMW_SEP__%s\n' "$command" >"$TMUX_STATE"
-    run_core env HMW_REMOTE=1 HMW_VERIFY=1 TMUX_EXISTS=1 "$CORE" 2 || return 1
+    run_core env HMW_BACKEND=tmux HMW_REMOTE=1 HMW_VERIFY=1 TMUX_EXISTS=1 "$CORE" 2 || return 1
     assert_not_contains "$LOG" $'set-option\t-p\t-t\t%2\t@hmw_label\tH2' "near-miss command $command is not adopted" || return 1
     assert_contains "$LOG" $'split-window\t-h\t-P\t-F\t#{pane_id}\t-t\tws:ws\thermes-pane H2' "near-miss command $command causes safe addition" || return 1
   done
@@ -476,13 +482,13 @@ test_tmux_legacy_adoption() {
 test_tmux_literal_backslash_tab_fixture() {
   reset_state
   printf '%s\n' '%7\tH1\thermes-pane H1' >"$TMUX_STATE"
-  run_core env HMW_REMOTE=1 HMW_VERIFY=1 TMUX_EXISTS=1 "$CORE" 1 || return 1
+  run_core env HMW_BACKEND=tmux HMW_REMOTE=1 HMW_VERIFY=1 TMUX_EXISTS=1 "$CORE" 1 || return 1
   assert_contains "$LOG" $'tmux\tlist-panes\t-t\tws:ws\t-F\t#{pane_id}__HMW_SEP__#{@hmw_label}__HMW_SEP__#{pane_start_command}' 'tmux inventory requests a literal separator string' || return 1
   assert_contains "$LOG" $'split-window\t-h\t-P\t-F\t#{pane_id}\t-t\tws:ws\thermes-pane H1' 'literal backslash-t output is not mistaken for delimited inventory' || return 1
 
   reset_state
   printf '%%7__HMW_SEP__H1__HMW_SEP__command__HMW_SEP__remainder\n' >"$TMUX_STATE"
-  run_core env HMW_REMOTE=1 HMW_VERIFY=1 TMUX_EXISTS=1 "$CORE" 1 || return 1
+  run_core env HMW_BACKEND=tmux HMW_REMOTE=1 HMW_VERIFY=1 TMUX_EXISTS=1 "$CORE" 1 || return 1
   assert_not_contains "$LOG" 'split-window' 'parser accepts the first two separators and preserves command remainder' || return 1
   assert_contains "$STDOUT_FILE" '%7__HMW_SEP__H1__HMW_SEP__command__HMW_SEP__remainder' 'verify preserves the native command remainder' || return 1
   pass 'tmux separator parsing rejects literal backslash-t fixtures'
@@ -497,7 +503,7 @@ test_bash32_compatibility() {
     -e '\$\{[^}]*,,[^}]*\}' \
     -e '\$\{[^}]*\^\^[^}]*\}' \
     -e '\[\[[[:space:]]+-v([[:space:]]|\])' \
-    "$CORE" "$WRAPPER" || :)
+    "$CORE" "$WRAPPER" "$TMUX_WRAPPER" || :)
   assert_eq '' "$forbidden" 'runtime scripts statically reject Bash 4-only constructs' || return 1
 
   reset_state
@@ -507,7 +513,7 @@ test_bash32_compatibility() {
     HOME="$HOME_DIR" PATH="$FAKE_BIN:/usr/local/bin:/usr/bin:/bin" \
       HMW_STUB_LOG="$LOG" TMUX_STATE="$TMUX_STATE" HERDR_NAMES_FILE="$HERDR_NAMES_FILE" \
       STATUS_COUNT="$STATUS_COUNT" HERDR_LIST_COUNT="$HERDR_LIST_COUNT" SLEEP_LOG="$SLEEP_LOG" \
-      HMW_REMOTE=1 HMW_VERIFY=1 TMUX_EXISTS=0 \
+      HMW_BACKEND=tmux HMW_REMOTE=1 HMW_VERIFY=1 TMUX_EXISTS=0 \
       bash3.2 "$CORE" 1 >"$STDOUT_FILE" 2>"$STDERR_FILE"
     status=$?
     set -e
@@ -520,7 +526,7 @@ test_bash32_compatibility() {
       -e HOME="$HOME_DIR" -e PATH="$FAKE_BIN:/usr/local/bin:/usr/bin:/bin" \
       -e HMW_STUB_LOG="$LOG" -e TMUX_STATE="$TMUX_STATE" -e HERDR_NAMES_FILE="$HERDR_NAMES_FILE" \
       -e STATUS_COUNT="$STATUS_COUNT" -e HERDR_LIST_COUNT="$HERDR_LIST_COUNT" -e SLEEP_LOG="$SLEEP_LOG" \
-      -e HMW_REMOTE=1 -e HMW_VERIFY=1 -e TMUX_EXISTS=0 \
+      -e HMW_BACKEND=tmux -e HMW_REMOTE=1 -e HMW_VERIFY=1 -e TMUX_EXISTS=0 \
       bash:3.2 bash /work/scripts/hermes-workspace 1 >"$STDOUT_FILE" 2>"$STDERR_FILE"
     status=$?
     set -e
@@ -530,7 +536,7 @@ test_bash32_compatibility() {
     HOME="$HOME_DIR" PATH="$FAKE_BIN:/usr/local/bin:/usr/bin:/bin" \
       HMW_STUB_LOG="$LOG" TMUX_STATE="$TMUX_STATE" HERDR_NAMES_FILE="$HERDR_NAMES_FILE" \
       STATUS_COUNT="$STATUS_COUNT" HERDR_LIST_COUNT="$HERDR_LIST_COUNT" SLEEP_LOG="$SLEEP_LOG" \
-      HMW_REMOTE=1 HMW_VERIFY=1 TMUX_EXISTS=0 BASH_COMPAT=3.2 \
+      HMW_BACKEND=tmux HMW_REMOTE=1 HMW_VERIFY=1 TMUX_EXISTS=0 BASH_COMPAT=3.2 \
       /bin/bash "$CORE" 1 >"$STDOUT_FILE" 2>"$STDERR_FILE"
     status=$?
     set -e
@@ -564,7 +570,7 @@ EOF
 
   set +e
   HOME="$HOME_DIR" PATH="$real_bin:/usr/local/bin:/usr/bin:/bin" \
-    HMW_REMOTE=1 HMW_VERIFY=1 /bin/bash "$CORE" 2 >"$STDOUT_FILE" 2>"$STDERR_FILE"
+    HMW_BACKEND=tmux HMW_REMOTE=1 HMW_VERIFY=1 /bin/bash "$CORE" 2 >"$STDOUT_FILE" 2>"$STDERR_FILE"
   status=$?
   set -e
   if [ "$status" -ne 0 ]; then
@@ -581,7 +587,7 @@ EOF
   assert_eq 2 "$(printf '%s\n' "$inventory" | wc -l | tr -d ' ')" 'isolated real tmux session has exactly two panes' || return 1
 
   HOME="$HOME_DIR" PATH="$real_bin:/usr/local/bin:/usr/bin:/bin" \
-    HMW_REMOTE=1 HMW_VERIFY=1 /bin/bash "$CORE" 2 >"$STDOUT_FILE" 2>"$STDERR_FILE" || return 1
+    HMW_BACKEND=tmux HMW_REMOTE=1 HMW_VERIFY=1 /bin/bash "$CORE" 2 >"$STDOUT_FILE" 2>"$STDERR_FILE" || return 1
   inventory=$("$REAL_TMUX" -L "$socket" list-panes -t ws:ws -F '#{@hmw_label}')
   assert_eq 'H1
 H2' "$inventory" 'second real invocation reuses exact labeled panes' || return 1
@@ -781,7 +787,24 @@ arg=<3 & * ? [x]>
 EOF
 )
   assert_eq "$expected" "$(cat "$STDOUT_FILE")" 'wrapper preserves argv and session while forcing Herdr' || return 1
-  pass 'hmw-herdr is a transparent backend-selecting wrapper'
+
+  set +e
+  # Literal metacharacters verify argv preservation.
+  # shellcheck disable=SC2016
+  HMW_BACKEND=herdr PATH="$wrapper_bin:/usr/local/bin:/usr/bin:/bin" \
+    "$TMUX_WRAPPER" 'host name;$(touch nope)' '3 & * ? [x]' >"$STDOUT_FILE" 2>"$STDERR_FILE"
+  status=$?
+  set -e
+  assert_eq 37 "$status" 'tmux wrapper returns core exit status' || return 1
+  expected=$(cat <<'EOF'
+backend=<tmux>
+session=<>
+arg=<host name;$(touch nope)>
+arg=<3 & * ? [x]>
+EOF
+)
+  assert_eq "$expected" "$(cat "$STDOUT_FILE")" 'tmux wrapper preserves argv while forcing tmux' || return 1
+  pass 'backend-selecting wrappers are transparent'
 }
 
 main() {
