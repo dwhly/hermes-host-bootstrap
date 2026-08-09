@@ -13,8 +13,18 @@ if [[ "$OS" != "macos" ]]; then
   skip "desktop power policy is macOS-only"
   return 0 2>/dev/null || exit 0
 fi
+
+label="com.hermes.keepawake"
+plist="$HOME/Library/LaunchAgents/$label.plist"
+domain="gui/$(id -u)"
 if [[ "${HERMES_MAC_DESKTOP_ALWAYS_ON:-0}" != "1" ]]; then
-  skip "desktop power policy not requested"
+  if [[ -f "$plist" ]]; then
+    launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
+    rm -f "$plist"
+    ok "removed desktop keepawake policy"
+  else
+    skip "desktop power policy not requested"
+  fi
   return 0 2>/dev/null || exit 0
 fi
 
@@ -29,8 +39,6 @@ if ! printf '%s\n' "$effective" | grep -qE "^[[:space:]]*displaysleep[[:space:]]
   warn "set it once locally: sudo pmset -c displaysleep $display_minutes"
 fi
 
-label="com.hermes.keepawake"
-plist="$HOME/Library/LaunchAgents/$label.plist"
 mkdir -p "$HOME/Library/LaunchAgents"
 cat >"$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -48,7 +56,6 @@ cat >"$plist" <<PLIST
 PLIST
 plutil -lint "$plist" >/dev/null
 
-domain="gui/$(id -u)"
 if launchctl print "$domain/$label" >/dev/null 2>&1; then
   launchctl kickstart -k "$domain/$label"
 else
