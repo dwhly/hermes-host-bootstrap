@@ -98,7 +98,7 @@ shell_quote() {
 }
 
 dispatch_remote() {
-  local payload remote_command
+  local payload remote_command ssh_status
 
   # shellcheck disable=SC2016
   payload='PATH="$HOME/.local/bin:$PATH"'
@@ -114,7 +114,21 @@ dispatch_remote() {
   if [ "$VERIFY" = "1" ]; then
     exec ssh "$SSH_TARGET" "$remote_command"
   else
-    exec ssh -t "$SSH_TARGET" "$remote_command"
+    ssh -t "$SSH_TARGET" "$remote_command"
+    ssh_status=$?
+    # Herdr/Hermes enable Kitty keyboard + modifyOtherKeys on the OUTER local
+    # terminal. A Broken pipe/SIGHUP skips their normal teardown, leaving the
+    # local shell to receive raw CSI-u key reports. Heal locally after every
+    # interactive Herdr SSH return while preserving ssh's real exit status.
+    if [ "$BACKEND" = "herdr" ]; then
+      if command -v hermes-terminal-reset >/dev/null 2>&1; then
+        hermes-terminal-reset --no-clear
+      else
+        printf '\033[?1016l\033[?1015l\033[?1006l\033[?1003l\033[?1002l\033[?1000l\033[?9l\033[?1004l\033[<u\033[>4m\033[0m\033[?25h'
+        stty sane 2>/dev/null || true
+      fi
+    fi
+    return "$ssh_status"
   fi
 }
 
@@ -633,6 +647,7 @@ if [ "${HMW_REMOTE:-0}" != "1" ]; then
   if [ -n "$REQUEST_HOST" ]; then
     resolve_ssh_target
     dispatch_remote
+    exit $?
   fi
 fi
 

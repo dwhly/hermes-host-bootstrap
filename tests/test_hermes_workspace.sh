@@ -144,6 +144,7 @@ if [ "${SSH_EXECUTE:-0}" = 1 ]; then
   fi
   exec /bin/sh -c "$1"
 fi
+exit "${SSH_EXIT_STATUS:-0}"
 EOF
 
 cat >"$FAKE_BIN/hermes-pane" <<'EOF'
@@ -408,6 +409,16 @@ test_remote_dispatch_and_reentry() {
   assert_line_count 1 "$LOG" $'ssh\t' 'zsh-login harness still uses one SSH hop' || return 1
   assert_contains "$LOG" $'herdr\t--session\tws\tstatus\tserver\t--json' 'zsh-login harness reaches remote backend' || return 1
   assert_line_count 1 "$LOG" $'resolver\tunknown' 'remote marker prevents recursive resolution' || return 1
+
+  reset_state
+  set +e
+  run_core env HMW_BACKEND=herdr STUB_HOSTNAME=origin SSH_EXIT_STATUS=255 "$CORE" remote 1
+  status=$?
+  set -e
+  assert_eq 255 "$status" 'broken Herdr SSH preserves the ssh failure status' || return 1
+  assert_contains "$STDOUT_FILE" $'\033[<u' 'broken Herdr SSH pops Kitty keyboard mode locally' || return 1
+  assert_contains "$STDOUT_FILE" $'\033[>4m' 'broken Herdr SSH disables modifyOtherKeys locally' || return 1
+  assert_not_contains "$STDOUT_FILE" $'\033[H\033[2J' 'post-SSH heal does not clear the user shell screen' || return 1
 
   if rg -n 'printf +%q' "$CORE" >/dev/null 2>&1; then
     fail 'core contains no printf %q quoting path'

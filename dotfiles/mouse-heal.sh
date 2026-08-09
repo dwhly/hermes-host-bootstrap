@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # ── hermes-host-bootstrap mouse-heal snippet ──
 # Sourced from .bashrc and .zshrc (POSIX-ish; bash + zsh aware).
 #
@@ -16,19 +17,24 @@
 #   tmux pane, so it can't fight tmux's own mouse mode (scroll/selection inside
 #   panes keeps working).
 #
-#   The disable battery is intentionally minimal: just the mouse-tracking modes
-#   (1000/1002/1003/1006/1015/1016/9) plus focus reporting (1004). It does NOT
-#   touch alt-screen, cursor, or bracketed paste — those are handled by the
-#   heavier `hmreset` (hermes-terminal-reset) when you explicitly ask for a full
-#   repair, and we don't want a per-prompt hook disabling bracketed paste.
+#   The disable battery includes mouse/focus reporting plus the extended-key
+#   modes (Kitty keyboard stack and xterm modifyOtherKeys). A dropped Herdr SSH
+#   client can leave Ghostty reporting keys as CSI-u (`107;1:3u`) at the shell;
+#   popping/disabling these modes at prompt time is safe when outside tmux.
+#   It still does NOT touch alt-screen, cursor, or bracketed paste — those are
+#   handled by the heavier `hmreset` helper.
 #
 #   Disable globally for a session with: export HERMES_NO_MOUSE_HEAL=1
+
+__hermes_terminal_heal_bytes() {
+  printf '\033[?1016l\033[?1015l\033[?1006l\033[?1003l\033[?1002l\033[?1000l\033[?9l\033[?1004l\033[<u\033[>4m'
+}
 
 __hermes_mouse_heal() {
   [ -n "${HERMES_NO_MOUSE_HEAL:-}" ] && return 0
   [ -n "${TMUX:-}" ] && return 0          # inside tmux → leave mouse mode alone
   case "$-" in *i*) ;; *) return 0 ;; esac # interactive shells only
-  printf '\033[?1016l\033[?1015l\033[?1006l\033[?1003l\033[?1002l\033[?1000l\033[?9l\033[?1004l'
+  __hermes_terminal_heal_bytes
 }
 
 if [ -n "${ZSH_VERSION:-}" ]; then
