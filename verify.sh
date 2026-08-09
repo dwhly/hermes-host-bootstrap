@@ -54,7 +54,12 @@ verify_mac_keepawake() {
     return 0
   fi
   launchctl print "gui/$(id -u)/com.hermes.keepawake" >/dev/null 2>&1 || return 1
-  pmset -g assertions | grep -q 'caffeinate command-line tool' || return 1
+  local assertions
+  assertions="$(pmset -g assertions)" || return 1
+  case "$assertions" in
+    *'caffeinate command-line tool'*) ;;
+    *) return 1 ;;
+  esac
   printf '%s\n' active
 }
 
