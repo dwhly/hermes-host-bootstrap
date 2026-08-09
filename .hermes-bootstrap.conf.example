@@ -81,6 +81,14 @@
 # remote access unless explicitly requested.
 # export HERMES_MAC_REMOTE_LOGIN=0
 
+# macOS desktop/primary-workstation power policy. Opt in on a Mac that should
+# keep SSH/Herdr/agent work alive indefinitely while plugged in, while allowing
+# attached displays to turn off after the requested idle interval. The always-on
+# assertion is a per-user launchd service and does not require administrator access.
+# If the display timeout differs, bootstrap prints the one-time pmset command.
+# export HERMES_MAC_DESKTOP_ALWAYS_ON=0
+# export HERMES_MAC_DISPLAY_SLEEP_MINUTES=30
+
 # Lockout-risk features — both default to OFF in the repo. Set to 1 here if
 # you ALWAYS want these enabled on machines you bootstrap. Make sure you have
 # working SSH key access before enabling on a remote box.

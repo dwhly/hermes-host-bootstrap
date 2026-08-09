@@ -99,6 +99,7 @@ shell_quote() {
 
 dispatch_remote() {
   local payload remote_command ssh_status
+  local ssh_keepalive_interval ssh_keepalive_count
 
   # shellcheck disable=SC2016
   payload='PATH="$HOME/.local/bin:$PATH"'
@@ -110,11 +111,15 @@ dispatch_remote() {
   fi
   payload+=" hermes-workspace $(shell_quote "$REQUEST_COUNT")"
   remote_command="sh -c $(shell_quote "$payload")"
+  ssh_keepalive_interval="${HMW_SERVER_ALIVE_INTERVAL:-60}"
+  ssh_keepalive_count="${HMW_SERVER_ALIVE_COUNT_MAX:-3}"
+  case "$ssh_keepalive_interval" in ''|*[!0-9]*) usage_error 'HMW_SERVER_ALIVE_INTERVAL must be a non-negative decimal' ;; esac
+  case "$ssh_keepalive_count" in ''|*[!0-9]*) usage_error 'HMW_SERVER_ALIVE_COUNT_MAX must be a non-negative decimal' ;; esac
 
   if [ "$VERIFY" = "1" ]; then
-    exec ssh "$SSH_TARGET" "$remote_command"
+    exec ssh -o "ServerAliveInterval=$ssh_keepalive_interval" -o "ServerAliveCountMax=$ssh_keepalive_count" "$SSH_TARGET" "$remote_command"
   else
-    ssh -t "$SSH_TARGET" "$remote_command"
+    ssh -o "ServerAliveInterval=$ssh_keepalive_interval" -o "ServerAliveCountMax=$ssh_keepalive_count" -t "$SSH_TARGET" "$remote_command"
     ssh_status=$?
     # Herdr/Hermes enable Kitty keyboard + modifyOtherKeys on the OUTER local
     # terminal. A Broken pipe/SIGHUP skips their normal teardown, leaving the

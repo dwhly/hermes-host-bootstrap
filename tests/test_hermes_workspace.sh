@@ -129,7 +129,13 @@ printf 'ssh' >>"$HMW_STUB_LOG"
 for arg in "$@"; do printf '\t%s' "$arg" >>"$HMW_STUB_LOG"; done
 printf '\n' >>"$HMW_STUB_LOG"
 if [ "${SSH_EXECUTE:-0}" = 1 ]; then
-  if [ "$1" = -t ]; then shift; fi
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -t) shift ;;
+      -o) shift 2 ;;
+      *) break ;;
+    esac
+  done
   target=$1
   shift
   [ "$#" -eq 1 ] || exit 91
@@ -320,7 +326,7 @@ test_argument_and_default_parity() {
   reset_state
   run_core env HMW_VERIFY=1 "$CORE" user@literal 2 || return 1
   assert_not_contains "$LOG" 'resolver' 'explicit user@host bypasses resolver' || return 1
-  assert_contains "$LOG" $'ssh\tuser@literal\t' 'explicit user@host remains verbatim' || return 1
+  assert_contains "$LOG" $'\tuser@literal\t' 'explicit user@host remains verbatim' || return 1
 
   for default in node user@node node.example; do
     reset_state
@@ -332,7 +338,7 @@ test_argument_and_default_parity() {
   reset_state
   run_core env HMW_VERIFY=1 HMW_DEFAULT_HOST=alias STUB_HOSTNAME=node RESOLVED_TARGET=root@node "$CORE" || return 1
   assert_contains "$LOG" $'resolver\talias' 'alias mismatch resolves before dispatch' || return 1
-  assert_contains "$LOG" $'ssh\troot@node\t' 'alias resolving local still self-SSHs' || return 1
+  assert_contains "$LOG" $'\troot@node\t' 'alias resolving local still self-SSHs' || return 1
 
   reset_state
   run_core env HMW_REMOTE=1 HMW_VERIFY=1 "$CORE" 1 || return 1
@@ -399,13 +405,14 @@ test_remote_dispatch_and_reentry() {
     *$'\tsh -c '*) ;;
     *) fail 'remote command explicitly invokes sh -c'; return 1 ;;
   esac
-  assert_not_contains "$LOG" $'ssh\t-t\t' 'verify mode omits ssh -t' || return 1
+  assert_not_contains "$LOG" $'\t-t\t' 'verify mode omits ssh -t' || return 1
+  assert_contains "$LOG" $'ssh\t-o\tServerAliveInterval=60\t-o\tServerAliveCountMax=3\t' 'remote dispatch enables application keepalives' || return 1
 
   reset_state
   printf 'H1\n' >"$HERDR_NAMES_FILE"
   run_core env HMW_BACKEND=herdr HMW_VERIFY='' HERDR_SESSION=ws STUB_HOSTNAME=origin \
     SSH_EXECUTE=1 SSH_LOGIN_SHELL=zsh SSH_REMOTE_HOST=remote-zsh "$CORE" unknown 1 || return 1
-  assert_contains "$LOG" $'ssh\t-t\troot@resolved\tsh -c ' 'interactive mode uses ssh -t' || return 1
+  assert_contains "$LOG" $'\t-t\troot@resolved\tsh -c ' 'interactive mode uses ssh -t' || return 1
   assert_line_count 1 "$LOG" $'ssh\t' 'zsh-login harness still uses one SSH hop' || return 1
   assert_contains "$LOG" $'herdr\t--session\tws\tstatus\tserver\t--json' 'zsh-login harness reaches remote backend' || return 1
   assert_line_count 1 "$LOG" $'resolver\tunknown' 'remote marker prevents recursive resolution' || return 1
