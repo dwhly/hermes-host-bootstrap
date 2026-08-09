@@ -43,6 +43,21 @@ verify_fluidvoice_login_item() {
   printf '%s\n' enabled
 }
 
+verify_mac_keepawake() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    printf '%s\n' not-applicable
+    return 0
+  fi
+  local plist="$HOME/Library/LaunchAgents/com.hermes.keepawake.plist"
+  if [[ ! -f "$plist" ]]; then
+    printf '%s\n' not-configured
+    return 0
+  fi
+  launchctl print "gui/$(id -u)/com.hermes.keepawake" >/dev/null 2>&1 || return 1
+  pmset -g assertions | grep -q 'caffeinate command-line tool' || return 1
+  printf '%s\n' active
+}
+
 verify_check "git"        "true"  "system" "git --version"
 verify_check "tmux"       "true"  "system" "tmux -V"
 verify_check "tmux-autoattach" "false" "harness" "test -f '$HOME/.hermes-host-bootstrap.tmux-autoattach.sh' && echo present"
@@ -66,6 +81,7 @@ verify_check "gh"         "false" "system" "gh --version"
 verify_check "fabric"     "false" "harness" "fabric --version 2>&1 | sed -n '1p'"
 verify_check "herdr"      "false" "harness" "herdr --version 2>&1 | sed -n '1p'"
 verify_check "hermes-workspace" "false" "harness" "test -x '$HOME/.local/bin/hermes-workspace' && test -x '$HOME/.local/bin/hmw-tmux' && grep -q 'HMW_BACKEND:-herdr' '$HOME/.local/bin/hermes-workspace' && echo herdr-default"
+verify_check "mac-keepawake" "false" "system" "verify_mac_keepawake"
 verify_check "herdr-new-agent" "false" "harness" "test -x '$HOME/.local/bin/herdr-new-agent' && grep -q 'command = \"herdr-new-agent right\"' '$HOME/.config/herdr/config.toml' && echo present"
 verify_check "fluidvoice" "false" "system" "verify_fluidvoice_app"
 verify_check "fluidvoice-login-item" "false" "system" "verify_fluidvoice_login_item"
