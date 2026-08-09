@@ -237,10 +237,12 @@ if isinstance(model_cfg, str):
 elif not isinstance(model_cfg, dict):
     model_cfg = {}
 
-model_cfg["provider"] = provider
-model_cfg["default"] = model
-model_cfg["base_url"] = base_url
-model_cfg["api_mode"] = api_mode
+# Seed only missing values. When the synced config repo already declares fleet
+# routing, bootstrap must not overwrite it with the bootstrap fallback model.
+model_cfg.setdefault("provider", provider)
+model_cfg.setdefault("default", model)
+model_cfg.setdefault("base_url", base_url)
+model_cfg.setdefault("api_mode", api_mode)
 data["model"] = model_cfg
 
 # Safer TUI default: avoid DECSET 1003 any-motion/hover mouse tracking.
