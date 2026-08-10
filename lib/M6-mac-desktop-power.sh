@@ -17,13 +17,19 @@ fi
 label="com.hermes.keepawake"
 plist="$HOME/Library/LaunchAgents/$label.plist"
 domain="gui/$(id -u)"
-if [[ "${HERMES_MAC_DESKTOP_ALWAYS_ON:-0}" != "1" ]]; then
+host_short="${HERMES_HOSTNAME:-$(hostname -s 2>/dev/null || hostname)}"
+case "$host_short" in
+  h-mini|h-mini2) mini_host=1 ;;
+  *) mini_host=0 ;;
+esac
+
+if [[ "$mini_host" != "1" || "${HERMES_MAC_DESKTOP_ALWAYS_ON:-0}" != "1" ]]; then
   if [[ -f "$plist" ]]; then
     launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
     rm -f "$plist"
-    ok "removed desktop keepawake policy"
+    ok "removed Mini-only keepawake policy from $host_short"
   else
-    skip "desktop power policy not requested"
+    skip "Mini-only keepawake policy not requested for $host_short"
   fi
   return 0 2>/dev/null || exit 0
 fi
