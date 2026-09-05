@@ -542,9 +542,12 @@ start_herdr_agent_in_new_pane() {
 
   anchor="$(herdr_target_for_label H1 2>/dev/null || true)"
   if [ -n "$anchor" ]; then
-    pane_json="$("${HERDR[@]}" pane split "$anchor" --direction right --no-focus)" || return
+    # Herdr inherits SSH_CONNECTION from the remote hmw process. Without this
+    # pane-local opt-out, the new interactive shell's rc immediately attaches
+    # tmux main; pane run would then type `hermes-pane HN` into that shared TUI.
+    pane_json="$("${HERDR[@]}" pane split "$anchor" --direction right --no-focus --env NO_TMUX=1)" || return
   else
-    pane_json="$("${HERDR[@]}" workspace create --cwd "$HOME" --label ws --no-focus)" || return
+    pane_json="$("${HERDR[@]}" workspace create --cwd "$HOME" --label ws --no-focus --env NO_TMUX=1)" || return
   fi
   pane_id="$(printf '%s' "$pane_json" | herdr_json_pane_id)" || return
   "${HERDR[@]}" pane rename "$pane_id" "$label" >/dev/null || return

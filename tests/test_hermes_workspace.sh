@@ -265,9 +265,11 @@ case "$1 $2" in
     printf '],"type":"pane_list"}}\n'
     ;;
   'workspace create')
+    case "$*" in *'--env NO_TMUX=1'*) ;; *) exit 98 ;; esac
     printf '%s\n' '{"id":"cli:workspace:create","result":{"root_pane":{"pane_id":"w1:p1"},"type":"workspace_created"}}'
     ;;
   'pane split')
+    case "$*" in *'--env NO_TMUX=1'*) ;; *) exit 98 ;; esac
     printf '%s\n' '{"id":"cli:pane:split","result":{"pane":{"pane_id":"w1:p2"},"type":"pane_info"}}'
     ;;
   'pane rename')
@@ -778,9 +780,10 @@ EOF
     return 1
   }
   assert_contains "$LOG" $'workspace\tcreate\t--cwd\t' 'new Herdr API creates the initial workspace pane' || return 1
+  assert_contains "$LOG" $'workspace\tcreate\t--cwd\t'"$HOME_DIR"$'\t--label\tws\t--no-focus\t--env\tNO_TMUX=1' 'initial Herdr pane disables inherited SSH tmux auto-attach' || return 1
   assert_contains "$LOG" $'pane\trename\tw1:p1\tH1' 'new Herdr API labels H1 explicitly' || return 1
   assert_contains "$LOG" $'pane\trun\tw1:p1\thermes-pane H1' 'new Herdr API starts Hermes in H1' || return 1
-  assert_contains "$LOG" $'pane\tsplit\tw1:p1\t--direction\tright\t--no-focus' 'new Herdr API splits subsequent panes from H1' || return 1
+  assert_contains "$LOG" $'pane\tsplit\tw1:p1\t--direction\tright\t--no-focus\t--env\tNO_TMUX=1' 'subsequent Herdr pane disables inherited SSH tmux auto-attach' || return 1
   assert_contains "$LOG" $'pane\trename\tw1:p2\tH2' 'new Herdr API labels H2 explicitly' || return 1
   assert_contains "$LOG" $'pane\trun\tw1:p2\thermes-pane H2' 'new Herdr API starts Hermes in H2' || return 1
   assert_not_contains "$LOG" $'agent\tstart\tH1\t--split' 'new Herdr API avoids removed create-and-split grammar' || return 1
