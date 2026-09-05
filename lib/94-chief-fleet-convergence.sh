@@ -215,4 +215,4 @@ install_launchd_plists
 
 ok "Chief fleet convergence installed"
 ok "Next (on the control hub): register-node-key ${node_id}   # pulls the key into core"
-[[ "$OS" == "macos" ]] && ok "Node plist must set HERMES_RUNTIME_STAMP_DIR=/var/run/chief/runtime (see com.chief.node.plist)"
+[[ "$OS" == "macos" ]] && ok "Node plist must set HERMES_RUNTIME_STAMP_DIR=/var/run/chief/runtime (see com.chief.node.plist)" || true
