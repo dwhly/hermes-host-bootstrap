@@ -251,7 +251,7 @@ data["model"] = model_cfg
 display_cfg = data.get("display")
 if not isinstance(display_cfg, dict):
     display_cfg = {}
-display_cfg.setdefault("mouse_tracking", "wheel")
+display_cfg.setdefault("mouse_tracking", "buttons")
 # Work-preserving TUI default: queue input typed while the agent is busy as
 # the next prompt instead of interrupting the running turn. The framework
 # default (CLI / messaging adapters) is "interrupt", and an explicit value in
