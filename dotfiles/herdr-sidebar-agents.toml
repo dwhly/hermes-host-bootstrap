@@ -1,0 +1,10 @@
+# Optional Herdr sidebar display configuration (Herdr 0.8.2+).
+# Merge this table into ~/.config/herdr/config.toml, preserving other settings.
+# If [ui.sidebar.agents] already exists, update its rows key; do not duplicate it.
+# Apply to the intended running session: herdr --session ws server reload-config
+# Keep H1/H2/... pane labels: hermes-workspace uses them as stable launcher slots.
+# Set the task title inside Hermes with /title <task>; the terminal title updates
+# live and supplies the second sidebar row. Workspace names may be changed freely.
+# This snippet is opt-in; it does not rename sessions or change fleet defaults.
+[ui.sidebar.agents]
+rows = [["state_icon", "pane"], ["terminal_title_stripped"]]
