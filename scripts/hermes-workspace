@@ -518,7 +518,7 @@ sys.stdout.write(pane_id)'
 }
 
 herdr_wait_for_agent_pane() {
-  local pane_id=$1 attempt pane_json max_attempts poll_seconds
+  local pane_id=$1 attempt pane_json pane_text max_attempts poll_seconds
 
   max_attempts="${HERDR_AGENT_WAIT:-120}"
   poll_seconds="${HERDR_AGENT_POLL:-0.25}"
@@ -535,6 +535,15 @@ except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError, Attribute
 raise SystemExit(0 if legacy == "hermes" or current == "hermes" else 1)' 2>/dev/null; then
       return 0
     fi
+
+    # Hermes 0.21 can render its idle composer before the Herdr session hook
+    # publishes agent_session. Require real pane output, not a process title.
+    pane_text="$("${HERDR[@]}" pane read "$pane_id" --lines 16 --source recent 2>/dev/null || true)"
+    if printf '%s' "$pane_text" | grep -Fq 'Welcome to Hermes Agent!' &&
+       printf '%s' "$pane_text" | grep -Eq 'Ask anything|type / for commands'; then
+      return 0
+    fi
+
     [ "$attempt" -eq "$max_attempts" ] || sleep "$poll_seconds"
     attempt=$((attempt + 1))
   done
