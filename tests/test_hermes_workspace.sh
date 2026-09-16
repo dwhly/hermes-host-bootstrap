@@ -282,7 +282,13 @@ case "$1 $2" in
   'pane get')
     focused=false
     [ "$(cat "$STATUS_COUNT.focus")" != "$3" ] || focused=true
-    printf '{"result":{"pane":{"pane_id":"%s","agent":"hermes","focused":%s}}}\n' "$3" "$focused"
+    printf '{"result":{"pane":{"pane_id":"%s","agent":"hermes","focused":%s' "$3" "$focused"
+    # Current pane evidence must retain the label advertised by pane list.
+    # Legacy name-only agents intentionally remain unlabeled here.
+    if [ -n "${HERDR_UNNAMED_LABEL:-}" ] && [ "$3" = "${HERDR_UNNAMED_PANE_ID:-w1:pB}" ]; then
+      printf ',"label":"%s"' "$HERDR_UNNAMED_LABEL"
+    fi
+    printf '}}}\n'
     ;;
   'pane read')
     printf 'Hermes Agent\nType your message or /help for commands.\n'

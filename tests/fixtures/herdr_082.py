@@ -62,7 +62,8 @@ elif cmd == ["pane", "process-info"]:
     emit("process_info", dict(state.get("process", {}), pane_id=args[3]))
     sys.exit(state.get("process_status", 0))
 elif cmd == ["agent", "get"]:
-    emit("agent", next(a for a in state["agents"] if a.get("name") == args[2]))
+    emit("agent", state.get("agent_get", {}).get(args[2]) or
+         next(a for a in state["agents"] if a.get("name") == args[2]))
 elif cmd == ["agent", "focus"]:
     target = pane(args[2])
     if target.get("agent") is None:
