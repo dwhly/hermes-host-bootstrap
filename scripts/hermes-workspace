@@ -408,14 +408,18 @@ try:
         if not isinstance(pane, dict):
             raise TypeError
         agent_kind = pane.get("agent")
-        if agent_kind is None:
-            continue
-        if not isinstance(agent_kind, str) or not agent_kind:
-            raise TypeError
+        current_kind = (pane.get("agent_session") or {}).get("agent")
         label = pane.get("label")
-        if label is None:
-            continue
         pane_id = pane.get("pane_id")
+        # Current Herdr may not publish agent_session until Hermes submits its
+        # first prompt. A labeled pane whose rendered composer passed the
+        # readiness gate is still a valid slot, so retain it in inventory.
+        if agent_kind is None and current_kind is None and label is None:
+            continue
+        if agent_kind is not None and (not isinstance(agent_kind, str) or not agent_kind):
+            raise TypeError
+        if current_kind is not None and (not isinstance(current_kind, str) or not current_kind):
+            raise TypeError
         if not isinstance(label, str) or not label or not isinstance(pane_id, str) or not pane_id:
             raise TypeError
         records.append((label, pane_id))
