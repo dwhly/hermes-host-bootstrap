@@ -408,6 +408,60 @@ class Herdr082Tests(unittest.TestCase):
                 self.assert_failed(self.run_core())
                 self.assert_no_launch()
 
+    def test_grouped_top_level_short_options_are_ready(self):
+        # Exact argparse-valid equivalents: -w is a switch, -c owns its suffix.
+        for args in (["-wctest"], ["-w", "-ctest"], ["-wctest", "chat"],
+                     ["-wc"], ["-wc", "test"], ["-wc=test"], ["-wwctest"],
+                     ["-ww"], ["-wmfoo"], ["-wm", "foo", "chat"],
+                     ["-wrtest"], ["-wtweb"], ["-wsresearch"],
+                     ["-wmwzhello"], ["-wczhello"], ["chat", "-wctest"]):
+            with self.subTest(args=args):
+                self.write(panes=[self.pane("H1")], process=self.with_argv(["hermes"] + args))
+                result = self.run_core()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("inventory-end", result.stdout)
+                self.assert_no_launch()
+                self.assertEqual([p["pane_id"] for p in self.state()["panes"] if p["focused"]], ["w1:p1"])
+
+    def test_grouped_top_level_short_options_reject_malformed_forms(self):
+        for args in (["-w=1"], ["-w--tui"], ["-w-tui"], ["-wunknown"],
+                     ["-wpwork"], ["-wvc"], ["-wm"], ["-wm", "--tui"],
+                     ["-wm="], ["-wc="], ["-wctest", "chat", "extra"]):
+            with self.subTest(args=args):
+                self.write(panes=[self.pane("H1", agent="hermes")],
+                           process=self.with_argv(["hermes"] + args))
+                self.assert_failed(self.run_core())
+                self.assert_no_launch()
+
+    def test_grouped_top_level_short_options_reject_unsafe_and_non_chat(self):
+        for args in (["-wctest", "update"], ["-wctest", "setup"],
+                     ["-wmfoo", "logs", "-f"], ["-wzhello"], ["-wwzhello"],
+                     ["-wqhello"], ["-wh"], ["-wV"], ["-wctest", "--help"],
+                     ["-wctest", "chat", "-qhello"]):
+            with self.subTest(args=args):
+                self.write(panes=[self.pane("H1", agent="hermes")],
+                           process=self.with_argv(["hermes"] + args))
+                self.assert_failed(self.run_core())
+                self.assert_no_launch()
+
+    def test_grouped_top_level_short_options_preserve_python_inspect_guard(self):
+        for prefix in (["python3", "-i", "/venv/bin/hermes"],
+                       ["python3", "-uimhermes_cli.main"]):
+            for kind in (None, "hermes"):
+                with self.subTest(prefix=prefix, kind=kind):
+                    self.write(panes=[self.pane("H1", agent=kind)], visible=COMPOSER + ">>> ",
+                               process=self.with_argv(prefix + ["-wctest"], shell_pid=20))
+                    self.assert_failed(self.run_core())
+                    self.assert_no_launch()
+
+    def test_grouped_top_level_short_options_preserve_identity_guards(self):
+        for override in ({"agent": "codex"}, {"label": "H2"}, {"label": None}):
+            with self.subTest(override=override):
+                self.write(panes=[self.pane("H1", agent="hermes")], get_override=override,
+                           process=self.with_argv(["hermes", "-wctest"]))
+                self.assert_failed(self.run_core())
+                self.assert_no_launch()
+
     def test_attached_hermes_model_option_is_ready(self):
         self.write(panes=[self.pane("H1")], process=self.with_argv(["hermes", "chat", "-mfoo"]))
         result = self.run_core()

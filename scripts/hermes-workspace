@@ -766,6 +766,13 @@ try:
                 chat = True
                 i += 1
                 continue
+            # Only -w may lead a group of safe top-level short options.
+            # Peel switches; the first value option owns the remaining suffix.
+            # Profile -p is a launcher shortcut, not a parser group member.
+            while arg.startswith("-w") and len(arg) > 2:
+                if arg[2] not in "wcmrst":
+                    return False
+                arg = "-" + arg[2:]
             option, equal, value = arg.partition("=")
             # Only known single-letter value options may consume a suffix.
             # Do not interpret arbitrary substrings or one-shot -q/-z as chat.
