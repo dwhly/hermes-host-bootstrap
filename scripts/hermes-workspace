@@ -540,7 +540,7 @@ raise SystemExit(0 if legacy == "hermes" or current == "hermes" else 1)' 2>/dev/
     # publishes agent_session. Require real pane output, not a process title.
     pane_text="$("${HERDR[@]}" pane read "$pane_id" --lines 16 --source recent 2>/dev/null || true)"
     if printf '%s' "$pane_text" | grep -Fq 'Welcome to Hermes Agent!' &&
-       printf '%s' "$pane_text" | grep -Eq 'Ask anything|type / for commands'; then
+       printf '%s' "$pane_text" | grep -Eq '❯ |/ for commands'; then
       return 0
     fi
 
