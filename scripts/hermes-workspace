@@ -395,37 +395,70 @@ try:
     panes = pane_value["result"]["panes"]
     if not isinstance(agents, list) or not isinstance(panes, list):
         raise TypeError
-    records = []
+    records = {}
+    kinds = {}
+    def text(value):
+        if not isinstance(value, str) or not value or any(ord(c) < 32 for c in value):
+            raise TypeError
+        return value
+    def slot(name):
+        return name.startswith("H") and name[1:].isdigit()
+    def record(name, pane_id, kind):
+        # Unmanaged display names may repeat; only H-slots reserve targets.
+        if not slot(name):
+            return
+        if kind not in (None, "hermes"):
+            raise TypeError
+        old = records.get(name)
+        if old and pane_id and old != pane_id:
+            raise TypeError
+        records[name] = pane_id or old or ""
     for agent in agents:
         if not isinstance(agent, dict):
             raise TypeError
         name = agent.get("name")
-        if name is not None:
-            if not isinstance(name, str) or not name:
-                raise TypeError
-            records.append((name, ""))
+        pane_id = agent.get("pane_id")
+        kind = agent.get("agent")
+        if kind is not None:
+            text(kind)
+        if pane_id is not None:
+            text(pane_id)
+            kinds.setdefault(pane_id, []).append(kind)
+        # Detected agents need not have a managed name (0.8.2).
+        if name not in (None, ""):
+            record(text(name), pane_id, kind)
+        else:
+            # An unnamed detection still needs both identity and location.
+            text(pane_id)
+            text(kind)
+    seen_panes = set()
     for pane in panes:
         if not isinstance(pane, dict):
             raise TypeError
-        agent_kind = pane.get("agent")
-        current_kind = (pane.get("agent_session") or {}).get("agent")
+        pane_id = text(pane.get("pane_id"))
+        if pane_id in seen_panes:
+            raise TypeError
+        seen_panes.add(pane_id)
+        kind = pane.get("agent")
+        if kind is not None:
+            text(kind)
+        kinds.setdefault(pane_id, []).append(kind)
         label = pane.get("label")
-        pane_id = pane.get("pane_id")
-        # Current Herdr may not publish agent_session until Hermes submits its
-        # first prompt. A labeled pane whose rendered composer passed the
-        # readiness gate is still a valid slot, so retain it in inventory.
-        if agent_kind is None and current_kind is None and label is None:
+        if label in (None, ""):
             continue
-        if agent_kind is not None and (not isinstance(agent_kind, str) or not agent_kind):
+        label = text(label)
+        # A label reserves a slot, but is never proof of readiness.
+        record(label, pane_id, kind)
+    targets = set()
+    for name, pane_id in records.items():
+        if not slot(name) or not pane_id:
+            continue
+        if pane_id in targets or any(k not in (None, "hermes") for k in kinds.get(pane_id, [])):
             raise TypeError
-        if current_kind is not None and (not isinstance(current_kind, str) or not current_kind):
-            raise TypeError
-        if not isinstance(label, str) or not label or not isinstance(pane_id, str) or not pane_id:
-            raise TypeError
-        records.append((label, pane_id))
+        targets.add(pane_id)
 except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError):
     raise SystemExit(1)
-sys.stdout.write("\n".join(name + "\t" + target for name, target in records))')"; then
+sys.stdout.write("\n".join(name + "\t" + target for name, target in records.items()))')"; then
     printf "hermes-workspace: malformed agent inventory for Herdr session '%s'; refusing to create agents\n" "$SESSION" >&2
     return 1
   fi
@@ -492,21 +525,131 @@ herdr_target_for_label() {
   return 1
 }
 
-herdr_focus_label() {
-  local label=$1 target workspace_id
+herdr_resolve_label() {
+  local label=$1 target agent_json
 
   target="$(herdr_target_for_label "$label" 2>/dev/null || true)"
   if [ -n "$target" ]; then
-    if "${HERDR[@]}" agent focus "$target" >/dev/null 2>&1; then
-      return 0
+    printf '%s\n' "$target"
+    return 0
+  fi
+  # Older managed-agent inventories may expose only the name.
+  agent_json="$("${HERDR[@]}" agent get "$label")" || return
+  printf '%s' "$agent_json" | python3 -c 'import json, sys
+try:
+    agent = json.load(sys.stdin)["result"]["agent"]
+    target = agent["pane_id"]
+    if agent.get("name") != sys.argv[1] or agent.get("agent") not in (None, "hermes"):
+        raise ValueError
+    if not isinstance(target, str) or not target or any(ord(c) < 32 for c in target):
+        raise ValueError
+except (ValueError, KeyError, TypeError, AttributeError):
+    raise SystemExit(1)
+print(target)' "$label"
+}
+
+herdr_resolve_requested_slots() {
+  local number label target resolved record old_target
+
+  resolved=""
+  number=1
+  while [ "$number" -le "$REQUEST_COUNT" ]; do
+    label="$(label_for "$number")"
+    if ! herdr_has_label "$label"; then
+      printf "hermes-workspace: Herdr session '%s' is missing expected agent %s after creation\n" "$SESSION" "$label" >&2
+      return 1
     fi
-    # An idle Hermes composer can be ready before Herdr publishes an agent
-    # record. Each hmw slot is a one-pane workspace, so focusing its workspace
-    # focuses the intended pane without requiring an agent record.
-    workspace_id=${target%%:*}
-    "${HERDR[@]}" workspace focus "$workspace_id" >/dev/null
-  else
-    "${HERDR[@]}" agent focus "$label" >/dev/null
+    target="$(herdr_resolve_label "$label")" || return
+    while IFS= read -r record; do
+      old_target=${record#*$'\t'}
+      if [ "$old_target" = "$target" ]; then
+        printf "hermes-workspace: duplicate resolved target %s for %s in session '%s'\n" "$target" "$label" "$SESSION" >&2
+        return 1
+      fi
+    done <<< "$resolved"
+    resolved+="$label"$'\t'"$target"$'\n'
+    number=$((number + 1))
+  done
+  # Name-only legacy records had no target during inventory parsing. Reconcile
+  # every resolved target with ALL detections, including unmanaged/unnamed ones.
+  if ! HMW_RESOLVED="$resolved" HERDR_AGENT_INVENTORY="$HERDR_INVENTORY" HERDR_PANE_INVENTORY="$HERDR_PANE_INVENTORY" python3 -c 'import json, os
+try:
+    targets = {record.split("\t")[1] for record in os.environ["HMW_RESOLVED"].splitlines()}
+    agents = json.loads(os.environ["HERDR_AGENT_INVENTORY"])["result"]["agents"]
+    panes = json.loads(os.environ["HERDR_PANE_INVENTORY"])["result"]["panes"]
+    if any(item.get("pane_id") in targets and item.get("agent") not in (None, "hermes")
+           for item in agents + panes):
+        raise ValueError
+except (ValueError, KeyError, TypeError, AttributeError, IndexError):
+    raise SystemExit(1)'; then
+    printf "hermes-workspace: conflicting inventory identity for resolved slots in Herdr session '%s'; refusing to reuse panes\n" "$SESSION" >&2
+    return 1
+  fi
+  # Cache the complete checked mapping, including legacy agent-get results.
+  # Readiness and focus must use these targets, not resolve them again.
+  HERDR_LABEL_TARGETS="$resolved"
+}
+
+herdr_pane_matches_slot() {
+  local pane_id=$1 label=$2 focused=${3:-0}
+
+  HMW_PANE_INVENTORY="$HERDR_PANE_INVENTORY" python3 -c 'import json, os, sys
+try:
+    pane = json.load(sys.stdin)["result"]["pane"]
+    pane_id, label, focused = sys.argv[1:]
+    if pane["pane_id"] != pane_id or pane.get("agent") not in (None, "hermes"):
+        raise ValueError
+    current_label = pane.get("label")
+    if current_label not in (None, "", label):
+        raise ValueError
+    # Legacy managed names can lack pane labels. A pane that reserved a slot
+    # by label must still carry it, even if it was cleared since inventory.
+    panes = json.loads(os.environ["HMW_PANE_INVENTORY"])["result"]["panes"]
+    if any(p["pane_id"] == pane_id and p.get("label") == label for p in panes):
+        if current_label != label:
+            raise ValueError
+    if focused == "1" and pane.get("focused") is not True:
+        raise ValueError
+except (ValueError, KeyError, TypeError, AttributeError):
+    raise SystemExit(1)' "$pane_id" "$label" "$focused"
+}
+
+herdr_focus_label() {
+  local label=$1 target status_json pane_json
+
+  target="$(herdr_target_for_label "$label")" || return
+  if ! "${HERDR[@]}" agent focus "$target" >/dev/null 2>&1; then
+    # 0.8.2 agent focus rejects label-only panes; pane focus CLI is directional.
+    # Use the exact-pane RPC, never workspace focus (which can leave H2 active).
+    status_json="$("${HERDR[@]}" status server --json)" || return
+    if ! printf '%s' "$status_json" | python3 -c 'import json, socket, sys
+try:
+    status = json.load(sys.stdin)
+    if status.get("running") is not True or status.get("status") != "running":
+        raise ValueError
+    request = {"id": "hmw:focus", "method": "pane.focus", "params": {"pane_id": sys.argv[1]}}
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.settimeout(2)
+        sock.connect(status["socket"])
+        sock.sendall((json.dumps(request) + "\n").encode())
+        with sock.makefile("rb") as stream:
+            response = json.loads(stream.readline(1048576))
+    if response.get("id") != request["id"] or "error" in response or "result" not in response:
+        raise ValueError
+    result = response["result"]
+    pane = result["pane"]
+    if result.get("type") != "pane_info" or pane["pane_id"] != sys.argv[1] or pane.get("focused") is not True:
+        raise ValueError
+except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    raise SystemExit(1)' "$target"; then
+      printf "hermes-workspace: unable to focus exact pane %s for %s in session '%s'\n" "$target" "$label" "$SESSION" >&2
+      return 1
+    fi
+  fi
+  pane_json="$("${HERDR[@]}" pane get "$target")" || return
+  if ! printf '%s' "$pane_json" | herdr_pane_matches_slot "$target" "$label" 1; then
+    printf "hermes-workspace: exact focus of %s (%s) was not confirmed in session '%s'\n" "$label" "$target" "$SESSION" >&2
+    return 1
   fi
 }
 
@@ -528,34 +671,166 @@ except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError, Attribute
 sys.stdout.write(pane_id)'
 }
 
-herdr_wait_for_agent_pane() {
-  local pane_id=$1 attempt pane_json pane_text max_attempts poll_seconds
+herdr_agent_pane_ready() {
+  local pane_id=$1 label=$2 pane_json visible process_json
 
-  max_attempts="${HERDR_AGENT_WAIT:-120}"
-  poll_seconds="${HERDR_AGENT_POLL:-0.25}"
-  attempt=1
-  while [ "$attempt" -le "$max_attempts" ]; do
-    pane_json="$("${HERDR[@]}" pane get "$pane_id" 2>/dev/null || true)"
-    if printf '%s' "$pane_json" | python3 -c 'import json, sys
+  # Read only the current viewport, then check the live foreground job. A
+  # retained composer in scrollback (or on screen after exit) is not liveness.
+  visible="$("${HERDR[@]}" pane read "$pane_id" --source visible --format text 2>/dev/null)" || return
+  process_json="$("${HERDR[@]}" pane process-info --pane "$pane_id" 2>/dev/null)" || return
+  pane_json="$("${HERDR[@]}" pane get "$pane_id" 2>/dev/null)" || return
+  printf '%s' "$pane_json" | herdr_pane_matches_slot "$pane_id" "$label" || return
+  HMW_PANE_JSON="$pane_json" HMW_PROCESS_JSON="$process_json" HMW_VISIBLE="$visible" python3 -c 'import json, os, re, sys
 try:
-    pane = json.load(sys.stdin)["result"]["pane"]
-    legacy = pane.get("agent")
-    current = (pane.get("agent_session") or {}).get("agent")
-except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError, AttributeError):
-    raise SystemExit(1)
-raise SystemExit(0 if legacy == "hermes" or current == "hermes" else 1)' 2>/dev/null; then
+    pane = json.loads(os.environ["HMW_PANE_JSON"])["result"]["pane"]
+    process = json.loads(os.environ["HMW_PROCESS_JSON"])["result"]["process_info"]
+    if pane["pane_id"] != sys.argv[1] or process["pane_id"] != sys.argv[1]:
+        raise ValueError
+    kind = pane.get("agent")
+    if kind not in (None, "hermes"):
+        raise ValueError
+    def pid(value):
+        return type(value) is int and value > 0
+    shell = process["shell_pid"]
+    group = process["foreground_process_group_id"]
+    jobs = process["foreground_processes"]
+    if not pid(shell) or not pid(group) or not isinstance(jobs, list) or not jobs:
+        raise ValueError
+    def hermes_args(argv):
+        executable = os.path.basename(argv[0])
+        if executable == "hermes":
+            return argv[1:]
+        if not re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?", executable):
+            return None
+        # Parse interpreter options, not arbitrary later tokens that happen
+        # to say hermes. In particular, -c code and other scripts are not it.
+        i = 1
+        while i < len(argv):
+            arg = argv[i]
+            if arg == "--":
+                i += 1
+                break
+            if not arg.startswith("-"):
+                break
+            if arg == "--check-hash-based-pycs":
+                if argv[i + 1:i + 2] not in (["default"], ["always"], ["never"]):
+                    return None
+                i += 2
+                continue
+            if arg == "-" or arg.startswith("--"):
+                return None
+            # Python groups short flags and allows attached m/W/X operands.
+            # An operand consumes the rest of this token, never more flags.
+            j = 1
+            while j < len(arg):
+                option = arg[j]
+                if option in "mWX":
+                    value = arg[j + 1:]
+                    if not value:
+                        i += 1
+                        if i >= len(argv) or not argv[i]:
+                            return None
+                        value = argv[i]
+                    if option == "m":
+                        return argv[i + 1:] if value == "hermes_cli.main" else None
+                    break
+                # -i keeps Python alive at its REPL after Hermes exits. It
+                # cannot prove live Hermes even when PID/identity are retained.
+                if option not in "bBdEIOPqsSuvx":
+                    return None
+                j += 1
+            i += 1
+        if i < len(argv) and os.path.basename(argv[i]) == "hermes":
+            return argv[i + 1:]
+        return None
+
+    def interactive_chat(args):
+        if args is None:
+            return False
+        # Bare hermes defaults to chat, as do its profile/resume shortcuts.
+        # Use known option arities, so values like --resume setup are not
+        # confused with subcommands. Unknown modes fail closed. Query/oneshot
+        # invocations are deliberately excluded (behavior varies by version).
+        values = {"--profile", "-p", "--model", "-m", "--provider", "--reasoning",
+                  "--toolsets", "-t", "--skills", "-s", "--resume", "-r", "--in"}
+        switches = {"--tui", "--cli", "--dev", "--worktree", "-w", "--yolo",
+                    "--pass-session-id", "--ignore-user-config", "--ignore-rules",
+                    "--safe-mode", "--accept-hooks", "--no-restore-cwd"}
+        chat_values = {"--source", "--max-turns", "--run-budget"}
+        chat_switches = {"--checkpoints", "--create-if-missing", "--verbose", "-v"}
+        chat = False
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "chat" and not chat:
+                chat = True
+                i += 1
+                continue
+            # -w can lead a group; -v is safe only after explicit chat.
+            # Peel switches; the first value option owns the remaining suffix.
+            # Profile -p is a launcher shortcut, not a parser group member.
+            group_switches = "wv" if chat else "w"
+            while len(arg) > 2 and arg[0] == "-" and arg[1] in group_switches:
+                if arg[2] not in group_switches + "cmrst":
+                    return False
+                arg = "-" + arg[2:]
+            option, equal, value = arg.partition("=")
+            # Only known single-letter value options may consume a suffix.
+            # Do not interpret arbitrary substrings or one-shot -q/-z as chat.
+            if len(arg) > 2 and (arg[:2] in values or arg[:2] == "-c"):
+                option, equal, value = arg[:2], "=", arg[2:]
+                if value.startswith("="):
+                    value = value[1:]
+            if option in values or (chat and option in chat_values):
+                if equal:
+                    if not value:
+                        return False
+                else:
+                    i += 1
+                    if i >= len(args) or not args[i] or args[i].startswith("-"):
+                        return False
+            elif option in ("--continue", "-c"):
+                if equal and not value:
+                    return False
+                if not equal and i + 1 < len(args) and not args[i + 1].startswith("-"):
+                    i += 1
+            elif not equal and (option in switches or (chat and option in chat_switches)):
+                pass
+            else:
+                return False
+            i += 1
+        return True
+
+    live = False
+    for job in jobs:
+        if not isinstance(job, dict) or not pid(job.get("pid")):
+            raise ValueError
+        argv = job.get("argv")
+        if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+            continue
+        if interactive_chat(hermes_args(argv)):
+            live = True
+    if not live:
+        raise ValueError
+    # Semantic detection remains authoritative when present. For 0.8.2 panes
+    # with no identity, require BOTH a live Hermes executable and its composer.
+    visible = os.environ["HMW_VISIBLE"].lower()
+    composer = "hermes" in visible and ("ask me anything" in visible or "type your message" in visible)
+    if kind != "hermes" and not composer:
+        raise ValueError
+except (ValueError, KeyError, TypeError, AttributeError):
+    raise SystemExit(1)' "$pane_id"
+}
+
+herdr_wait_for_agent_pane() {
+  local pane_id=$1 label=$2 attempt
+
+  attempt=1
+  while [ "$attempt" -le 30 ]; do
+    if herdr_agent_pane_ready "$pane_id" "$label"; then
       return 0
     fi
-
-    # Hermes 0.21 can render its idle composer before the Herdr session hook
-    # publishes agent_session. Require real pane output, not a process title.
-    pane_text="$("${HERDR[@]}" pane read "$pane_id" --lines 16 --source recent 2>/dev/null || true)"
-    if printf '%s' "$pane_text" | grep -Fq 'Welcome to Hermes Agent!' &&
-       printf '%s' "$pane_text" | grep -Eq '❯ |/ for commands'; then
-      return 0
-    fi
-
-    [ "$attempt" -eq "$max_attempts" ] || sleep "$poll_seconds"
+    [ "$attempt" -eq 30 ] || sleep 0.1
     attempt=$((attempt + 1))
   done
   return 1
@@ -576,7 +851,7 @@ start_herdr_agent_in_new_pane() {
   pane_id="$(printf '%s' "$pane_json" | herdr_json_pane_id)" || return
   "${HERDR[@]}" pane rename "$pane_id" "$label" >/dev/null || return
   "${HERDR[@]}" pane run "$pane_id" "hermes-pane $label" >/dev/null || return
-  if ! herdr_wait_for_agent_pane "$pane_id"; then
+  if ! herdr_wait_for_agent_pane "$pane_id" "$label"; then
     printf "hermes-workspace: Hermes did not become ready in pane %s for %s in session '%s'\n" "$pane_id" "$label" "$SESSION" >&2
     return 1
   fi
@@ -591,7 +866,7 @@ start_herdr_agent_in_new_pane() {
 }
 
 ensure_herdr_workspace() {
-  local number label added legacy_start
+  local number label added legacy_start target
 
   if ! command -v python3 >/dev/null 2>&1; then
     printf 'hermes-workspace: Python 3 is required for the Herdr backend; install python3 and retry.\n' >&2
@@ -639,11 +914,13 @@ ensure_herdr_workspace() {
   if [ "$added" -eq 1 ]; then
     herdr_slot_inventory || return
   fi
+  herdr_resolve_requested_slots || return
   number=1
   while [ "$number" -le "$REQUEST_COUNT" ]; do
     label="$(label_for "$number")"
-    if ! herdr_has_label "$label"; then
-      printf "hermes-workspace: Herdr session '%s' is missing expected agent %s after creation\n" "$SESSION" "$label" >&2
+    target="$(herdr_target_for_label "$label")" || return
+    if ! herdr_wait_for_agent_pane "$target" "$label"; then
+      printf "hermes-workspace: Hermes is not ready in existing pane %s for %s in session '%s'; inspect the pane and relaunch Hermes there (no duplicate was created)\n" "$target" "$label" "$SESSION" >&2
       return 1
     fi
     number=$((number + 1))

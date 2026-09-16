@@ -99,6 +99,7 @@ reset_state() {
   : >"$HERDR_NAMES_FILE"
   : >"$SLEEP_LOG"
   printf '0\n' >"$STATUS_COUNT"
+  : >"$STATUS_COUNT.focus"
   printf '0\n' >"$HERDR_LIST_COUNT"
   export STUB_HOSTNAME=origin
   export RESOLVED_TARGET=root@resolved
@@ -279,7 +280,24 @@ case "$1 $2" in
     printf '%s\n' "$label" >>"$HERDR_NAMES_FILE"
     ;;
   'pane get')
-    printf '%s\n' '{"id":"cli:pane:get","result":{"pane":{"agent":"hermes"},"type":"pane_info"}}'
+    focused=false
+    [ "$(cat "$STATUS_COUNT.focus")" != "$3" ] || focused=true
+    printf '{"result":{"pane":{"pane_id":"%s","agent":"hermes","focused":%s' "$3" "$focused"
+    # Current pane evidence must retain the label advertised by pane list.
+    # Legacy name-only agents intentionally remain unlabeled here.
+    if [ -n "${HERDR_UNNAMED_LABEL:-}" ] && [ "$3" = "${HERDR_UNNAMED_PANE_ID:-w1:pB}" ]; then
+      printf ',"label":"%s"' "$HERDR_UNNAMED_LABEL"
+    fi
+    printf '}}}\n'
+    ;;
+  'pane read')
+    printf 'Hermes Agent\nType your message or /help for commands.\n'
+    ;;
+  'pane process-info')
+    printf '{"result":{"process_info":{"pane_id":"%s","shell_pid":10,"foreground_process_group_id":20,"foreground_processes":[{"pid":20,"argv":["hermes"]}]}}}\n' "$4"
+    ;;
+  'agent get')
+    printf '{"result":{"agent":{"name":"%s","pane_id":"w1:p%s","agent":"hermes"}}}\n' "$3" "${3#H}"
     ;;
   'agent start')
     label=$3
@@ -293,6 +311,7 @@ case "$1 $2" in
     if [ "${HERDR_CHATTER:-0}" = 1 ]; then printf 'started %s\n' "$label"; fi
     ;;
   'agent focus')
+    printf '%s\n' "$3" >"$STATUS_COUNT.focus"
     if [ "${HERDR_CHATTER:-0}" = 1 ]; then printf 'focused %s\n' "$3"; fi
     ;;
   'server ')
@@ -681,7 +700,7 @@ test_herdr_prerequisite_scoping_and_readiness() {
     return 1
   fi
   assert_contains "$LOG" $'herdr\t--session\tcustom\tagent\tlist' 'scoped inventory grammar is used' || return 1
-  assert_contains "$LOG" $'herdr\t--session\tcustom\tagent\tfocus\tH1' 'scoped focus grammar is used' || return 1
+  assert_contains "$LOG" $'herdr\t--session\tcustom\tagent\tfocus\tw1:p1' 'scoped exact-pane focus grammar is used' || return 1
   assert_exact_line_count 0 "$LOG" $'herdr\t--session\tcustom' 'verify mode does not attach Herdr' || return 1
 
   reset_state
@@ -798,7 +817,7 @@ test_herdr_concurrent_start_reconciliation() {
     HERDR_START_FAIL_LABEL=H1 HERDR_START_FAIL_ADD=1 "$CORE" 1 || return 1
   assert_contains "$LOG" $'agent\tstart\tH1\t--split\tright\t--no-focus\t--\thermes-pane\tH1' 'competing launch still attempts the exact start grammar' || return 1
   assert_eq 3 "$(cat "$HERDR_LIST_COUNT")" 'failed start re-inventories immediately and once after additions' || return 1
-  assert_contains "$LOG" $'agent\tfocus\tH1' 'competing launcher result continues to focus H1' || return 1
+  assert_contains "$LOG" $'agent\tfocus\tw1:p1' 'competing launcher result continues to focus the exact H1 pane' || return 1
   assert_contains "$STDOUT_FILE" '{"name":"H1"}' 'competing launcher result appears in final verify inventory' || return 1
 
   reset_state
