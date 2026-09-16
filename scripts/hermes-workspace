@@ -493,7 +493,7 @@ herdr_target_for_label() {
 }
 
 herdr_focus_label() {
-  local label=$1 target
+  local label=$1 target workspace_id
 
   target="$(herdr_target_for_label "$label" 2>/dev/null || true)"
   if [ -n "$target" ]; then
@@ -501,8 +501,10 @@ herdr_focus_label() {
       return 0
     fi
     # An idle Hermes composer can be ready before Herdr publishes an agent
-    # record. The pane itself is already identified by inventory, so focus it.
-    "${HERDR[@]}" pane focus "$target" >/dev/null
+    # record. Each hmw slot is a one-pane workspace, so focusing its workspace
+    # focuses the intended pane without requiring an agent record.
+    workspace_id=${target%%:*}
+    "${HERDR[@]}" workspace focus "$workspace_id" >/dev/null
   else
     "${HERDR[@]}" agent focus "$label" >/dev/null
   fi
