@@ -570,6 +570,21 @@ herdr_resolve_requested_slots() {
     resolved+="$label"$'\t'"$target"$'\n'
     number=$((number + 1))
   done
+  # Name-only legacy records had no target during inventory parsing. Reconcile
+  # every resolved target with ALL detections, including unmanaged/unnamed ones.
+  if ! HMW_RESOLVED="$resolved" HERDR_AGENT_INVENTORY="$HERDR_INVENTORY" HERDR_PANE_INVENTORY="$HERDR_PANE_INVENTORY" python3 -c 'import json, os
+try:
+    targets = {record.split("\t")[1] for record in os.environ["HMW_RESOLVED"].splitlines()}
+    agents = json.loads(os.environ["HERDR_AGENT_INVENTORY"])["result"]["agents"]
+    panes = json.loads(os.environ["HERDR_PANE_INVENTORY"])["result"]["panes"]
+    if any(item.get("pane_id") in targets and item.get("agent") not in (None, "hermes")
+           for item in agents + panes):
+        raise ValueError
+except (ValueError, KeyError, TypeError, AttributeError, IndexError):
+    raise SystemExit(1)'; then
+    printf "hermes-workspace: conflicting inventory identity for resolved slots in Herdr session '%s'; refusing to reuse panes\n" "$SESSION" >&2
+    return 1
+  fi
   # Cache the complete checked mapping, including legacy agent-get results.
   # Readiness and focus must use these targets, not resolve them again.
   HERDR_LABEL_TARGETS="$resolved"
@@ -692,21 +707,39 @@ try:
         i = 1
         while i < len(argv):
             arg = argv[i]
-            if arg == "-m":
-                return argv[i + 2:] if argv[i + 1:i + 2] == ["hermes_cli.main"] else None
             if arg == "--":
                 i += 1
                 break
             if not arg.startswith("-"):
                 break
-            if arg in ("-W", "-X", "--check-hash-based-pycs"):
-                if i + 1 >= len(argv):
+            if arg == "--check-hash-based-pycs":
+                if argv[i + 1:i + 2] not in (["default"], ["always"], ["never"]):
                     return None
                 i += 2
-            elif re.fullmatch(r"-[bBdEIOPqsSuvxi]+", arg) or arg.startswith(("-W", "-X")):
-                i += 1
-            else:
+                continue
+            if arg == "-" or arg.startswith("--"):
                 return None
+            # Python groups short flags and allows attached m/W/X operands.
+            # An operand consumes the rest of this token, never more flags.
+            j = 1
+            while j < len(arg):
+                option = arg[j]
+                if option in "mWX":
+                    value = arg[j + 1:]
+                    if not value:
+                        i += 1
+                        if i >= len(argv) or not argv[i]:
+                            return None
+                        value = argv[i]
+                    if option == "m":
+                        return argv[i + 1:] if value == "hermes_cli.main" else None
+                    break
+                # -i keeps Python alive at its REPL after Hermes exits. It
+                # cannot prove live Hermes even when PID/identity are retained.
+                if option not in "bBdEIOPqsSuvx":
+                    return None
+                j += 1
+            i += 1
         if i < len(argv) and os.path.basename(argv[i]) == "hermes":
             return argv[i + 1:]
         return None
@@ -734,6 +767,12 @@ try:
                 i += 1
                 continue
             option, equal, value = arg.partition("=")
+            # Only known single-letter value options may consume a suffix.
+            # Do not interpret arbitrary substrings or one-shot -q/-z as chat.
+            if len(arg) > 2 and (arg[:2] in values or arg[:2] == "-c"):
+                option, equal, value = arg[:2], "=", arg[2:]
+                if value.startswith("="):
+                    value = value[1:]
             if option in values or (chat and option in chat_values):
                 if equal:
                     if not value:
@@ -743,6 +782,8 @@ try:
                     if i >= len(args) or not args[i] or args[i].startswith("-"):
                         return False
             elif option in ("--continue", "-c"):
+                if equal and not value:
+                    return False
                 if not equal and i + 1 < len(args) and not args[i + 1].startswith("-"):
                     i += 1
             elif not equal and (option in switches or (chat and option in chat_switches)):

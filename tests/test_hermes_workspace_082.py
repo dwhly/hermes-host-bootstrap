@@ -344,6 +344,130 @@ class Herdr082Tests(unittest.TestCase):
         self.assertIn(["pane", "get", "w1:p2"], calls)
         self.assertEqual([p["pane_id"] for p in self.state()["panes"] if p["focused"]], ["w1:pB"])
 
+    def test_legacy_target_reconciles_all_inventory_agent_kinds(self):
+        for name in ("logs", None, ""):
+            with self.subTest(name=name):
+                self.write(panes=[self.pane(None, agent="hermes")],
+                           agents=[{"name": "H1"},
+                                   {"name": name, "pane_id": "w1:p1", "agent": "codex"}],
+                           agent_get={"H1": {"name": "H1", "pane_id": "w1:p1", "agent": "hermes"}})
+                self.assert_failed(self.run_core())
+                self.assert_no_launch()
+                self.assertNotIn(["agent", "focus", "w1:p1"], self.calls())
+
+    def test_legacy_target_reconciles_inventory_pane_kind(self):
+        # A later pane-get cannot erase a conflicting inventory detection.
+        self.write(panes=[self.pane(None, agent="codex")], agents=[{"name": "H1"}],
+                   agent_get={"H1": {"name": "H1", "pane_id": "w1:p1", "agent": "hermes"}},
+                   get_override={"agent": "hermes"})
+        self.assert_failed(self.run_core())
+        self.assert_no_launch()
+        self.assertNotIn(["agent", "focus", "w1:p1"], self.calls())
+
+    def test_second_legacy_target_reconciles_inventory_before_focus(self):
+        self.write(panes=[self.pane("H1"), self.pane(None, "w1:p2", agent="hermes")],
+                   agents=[{"name": "H2"}, {"agent": "codex", "pane_id": "w1:p2"}],
+                   agent_get={"H2": {"name": "H2", "pane_id": "w1:p2", "agent": "hermes"}})
+        self.assert_failed(self.run_core(2))
+        self.assert_no_launch()
+        self.assertNotIn(["agent", "focus", "w1:p1"], self.calls())
+
+    def test_legacy_target_tolerates_compatible_and_unmanaged_duplicates(self):
+        self.write(panes=[self.pane(None), self.pane("logs", "w1:p2", agent="codex"),
+                          self.pane("logs", "w1:p3", agent="codex")],
+                   agents=[{"name": "H1"}, {"name": "observer", "pane_id": "w1:p1", "agent": None},
+                           {"pane_id": "w1:p1", "agent": "hermes"},
+                           {"name": "logs", "pane_id": "w1:p2", "agent": "codex"},
+                           {"name": "logs", "pane_id": "w1:p3", "agent": "codex"}],
+                   agent_get={"H1": {"name": "H1", "pane_id": "w1:p1", "agent": "hermes"}})
+        result = self.run_core()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_no_launch()
+        self.assertEqual(self.calls().count(["agent", "get", "H1"]), 1)
+        self.assertEqual([p["pane_id"] for p in self.state()["panes"] if p["focused"]], ["w1:p1"])
+
+    def test_python_inspect_after_exit_rejects_stale_composer(self):
+        self.write(panes=[self.pane("H1")], visible=COMPOSER + ">>> ",
+                   process=self.with_argv(["python3", "-i", "/venv/bin/hermes", "chat"]))
+        self.assert_failed(self.run_core())
+        self.assert_no_launch()
+
+    def test_python_inspect_after_exit_rejects_retained_identity(self):
+        self.write(panes=[self.pane("H1", agent="hermes")], visible=">>> ",
+                   process=self.with_argv(["python3", "-i", "/venv/bin/hermes", "chat"], shell_pid=20))
+        self.assert_failed(self.run_core())
+        self.assert_no_launch()
+
+    def test_python_grouped_inspect_flags_are_not_live_hermes(self):
+        for flags in (["-ui"], ["-iuB"], ["-Bi", "-m", "hermes_cli.main"],
+                      ["-imhermes_cli.main"], ["-uim", "hermes_cli.main"]):
+            with self.subTest(flags=flags):
+                script = [] if any("m" in flag for flag in flags) else ["/venv/bin/hermes"]
+                self.write(panes=[self.pane("H1", agent="hermes")], visible=COMPOSER + ">>> ",
+                           process=self.with_argv(["python3"] + flags + script + ["chat"]))
+                self.assert_failed(self.run_core())
+                self.assert_no_launch()
+
+    def test_attached_hermes_model_option_is_ready(self):
+        self.write(panes=[self.pane("H1")], process=self.with_argv(["hermes", "chat", "-mfoo"]))
+        result = self.run_core()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_no_launch()
+
+    def test_attached_python_module_is_ready(self):
+        self.write(panes=[self.pane("H1")], process=self.with_argv(["python3", "-mhermes_cli.main", "chat"]))
+        result = self.run_core()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_no_launch()
+
+    def test_grouped_python_module_is_ready(self):
+        self.write(panes=[self.pane("H1")], process=self.with_argv(["python3", "-um", "hermes_cli.main", "chat"]))
+        result = self.run_core()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_no_launch()
+
+    def test_attached_short_values_and_python_module_controls(self):
+        for argv in (["hermes", "chat", "-m=foo"], ["hermes", "-pwork", "chat", "-rsetup"],
+                     ["hermes", "chat", "-tweb", "-sresearch", "-csetup"],
+                     ["hermes", "-mupdate", "chat"],
+                     ["python3", "-uBmhermes_cli.main", "chat", "-mfoo"],
+                     ["python3", "-Wignore", "-Xutf8", "-mhermes_cli.main", "chat"],
+                     ["python3", "-uWignore", "-Bmhermes_cli.main", "chat"],
+                     ["python3", "-uX", "utf8", "-mhermes_cli.main", "chat"],
+                     ["python3", "--check-hash-based-pycs", "always", "-mhermes_cli.main", "chat"]):
+            with self.subTest(argv=argv):
+                self.write(panes=[self.pane("H1")], process=self.with_argv(argv, shell_pid=20))
+                result = self.run_core()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assert_no_launch()
+
+    def test_attached_options_do_not_permit_non_chat(self):
+        for argv in (["hermes", "-mfoo", "update"], ["hermes", "-pwork", "setup"],
+                     ["hermes", "chat", "-qhello"], ["hermes", "-zhello"],
+                     ["python3", "-mhermes_cli.main", "update"],
+                     ["python3", "-um", "hermes_cli.main", "setup"],
+                     ["python3", "-umhermes_cli.main", "chat", "--help"]):
+            with self.subTest(argv=argv):
+                self.write(panes=[self.pane("H1", agent="hermes")], process=self.with_argv(argv))
+                self.assert_failed(self.run_core())
+                self.assert_no_launch()
+
+    def test_malformed_attached_or_grouped_options_fail_closed(self):
+        for argv in (["hermes", "chat", "-m"], ["hermes", "chat", "-m="],
+                     ["hermes", "chat", "-mfoo", "extra"], ["hermes", "chat", "-unknown"],
+                     ["python3", "-m"], ["python3", "-um"],
+                     ["python3", "-m=hermes_cli.main", "chat"],
+                     ["python3", "-umhermes_cli.main.extra", "chat"],
+                     ["python3", "-Zmhermes_cli.main", "chat"],
+                     ["python3", "-uc", "hermes_cli.main", "chat"],
+                     ["python3", "-uW"], ["python3", "-uX"],
+                     ["python3", "--", "-mhermes_cli.main", "chat"],
+                     ["python3", "--check-hash-based-pycs", "bogus", "-mhermes_cli.main", "chat"]):
+            with self.subTest(argv=argv):
+                self.write(panes=[self.pane("H1", agent="hermes")], process=self.with_argv(argv))
+                self.assert_failed(self.run_core())
+                self.assert_no_launch()
+
     def test_current_label_must_preserve_inventory_slot(self):
         for label in ("H2", "logs", None, ""):
             with self.subTest(label=label):
