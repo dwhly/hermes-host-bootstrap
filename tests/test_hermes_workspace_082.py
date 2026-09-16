@@ -408,6 +408,55 @@ class Herdr082Tests(unittest.TestCase):
                 self.assert_failed(self.run_core())
                 self.assert_no_launch()
 
+    def test_grouped_chat_switches_match_separated_forms(self):
+        for grouped, separated in ((["-wv"], ["-w", "-v"]),
+                                   (["-vw"], ["-v", "-w"]),
+                                   (["-vv"], ["-v", "-v"]),
+                                   (["-vwcfoo"], ["-v", "-w", "-c", "foo"])):
+            for args in (grouped, separated):
+                with self.subTest(grouped=grouped, args=args):
+                    self.write(panes=[self.pane("H1")],
+                               process=self.with_argv(["hermes", "chat"] + args))
+                    result = self.run_core()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("inventory-end", result.stdout)
+                    self.assert_no_launch()
+                    self.assertEqual([p["pane_id"] for p in self.state()["panes"] if p["focused"]], ["w1:p1"])
+
+    def test_grouped_chat_switches_preserve_operand_ownership(self):
+        # Once a value option is reached, its suffix is data, even -v/-w/-q/-z.
+        for option in ("c", "m", "r", "t", "s"):
+            for args in (["-vw" + option + "wzq"], ["-v", "-w", "-" + option, "wzq"],
+                         ["-wv" + option, "setup"], ["-w", "-v", "-" + option, "setup"]):
+                with self.subTest(option=option, args=args):
+                    self.write(panes=[self.pane("H1")],
+                               process=self.with_argv(["hermes", "chat"] + args))
+                    result = self.run_core()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assert_no_launch()
+
+    def test_grouped_chat_switches_reject_unsafe_and_malformed_forms(self):
+        for args in (["-vwh"], ["-vwV"], ["-vwzhello"], ["-vwqhello"],
+                     ["-wv", "--help"], ["-vw", "--version"], ["-vw", "--oneshot"],
+                     ["-v="], ["-vw=1"], ["-vw-tui"], ["-vwunknown"], ["-vwpwork"],
+                     ["-vwm"], ["-vwm", "--tui"], ["-vwm="], ["-vwc="],
+                     ["-vwcfoo", "extra"], ["-wv", "update"], ["-vw", "setup"]):
+            with self.subTest(args=args):
+                self.write(panes=[self.pane("H1", agent="hermes")],
+                           process=self.with_argv(["hermes", "chat"] + args))
+                self.assert_failed(self.run_core())
+                self.assert_no_launch()
+
+    def test_grouped_chat_switches_remain_chat_only(self):
+        for args in (["-wv"], ["-vw"], ["-vv"], ["-vwcfoo"],
+                     ["-wv", "chat"], ["-vw", "chat"], ["-vv", "chat"], ["-vwcfoo", "chat"],
+                     ["update", "-wv"], ["setup", "-vw"], ["logs", "-vv"]):
+            with self.subTest(args=args):
+                self.write(panes=[self.pane("H1", agent="hermes")],
+                           process=self.with_argv(["hermes"] + args))
+                self.assert_failed(self.run_core())
+                self.assert_no_launch()
+
     def test_grouped_top_level_short_options_are_ready(self):
         # Exact argparse-valid equivalents: -w is a switch, -c owns its suffix.
         for args in (["-wctest"], ["-w", "-ctest"], ["-wctest", "chat"],

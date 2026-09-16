@@ -766,11 +766,12 @@ try:
                 chat = True
                 i += 1
                 continue
-            # Only -w may lead a group of safe top-level short options.
+            # -w can lead a group; -v is safe only after explicit chat.
             # Peel switches; the first value option owns the remaining suffix.
             # Profile -p is a launcher shortcut, not a parser group member.
-            while arg.startswith("-w") and len(arg) > 2:
-                if arg[2] not in "wcmrst":
+            group_switches = "wv" if chat else "w"
+            while len(arg) > 2 and arg[0] == "-" and arg[1] in group_switches:
+                if arg[2] not in group_switches + "cmrst":
                     return False
                 arg = "-" + arg[2:]
             option, equal, value = arg.partition("=")
