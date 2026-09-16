@@ -497,7 +497,12 @@ herdr_focus_label() {
 
   target="$(herdr_target_for_label "$label" 2>/dev/null || true)"
   if [ -n "$target" ]; then
-    "${HERDR[@]}" agent focus "$target" >/dev/null
+    if "${HERDR[@]}" agent focus "$target" >/dev/null 2>&1; then
+      return 0
+    fi
+    # An idle Hermes composer can be ready before Herdr publishes an agent
+    # record. The pane itself is already identified by inventory, so focus it.
+    "${HERDR[@]}" pane focus "$target" >/dev/null
   else
     "${HERDR[@]}" agent focus "$label" >/dev/null
   fi
