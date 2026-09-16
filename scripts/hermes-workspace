@@ -518,20 +518,24 @@ sys.stdout.write(pane_id)'
 }
 
 herdr_wait_for_agent_pane() {
-  local pane_id=$1 attempt pane_json
+  local pane_id=$1 attempt pane_json max_attempts poll_seconds
 
+  max_attempts="${HERDR_AGENT_WAIT:-120}"
+  poll_seconds="${HERDR_AGENT_POLL:-0.25}"
   attempt=1
-  while [ "$attempt" -le 30 ]; do
+  while [ "$attempt" -le "$max_attempts" ]; do
     pane_json="$("${HERDR[@]}" pane get "$pane_id" 2>/dev/null || true)"
     if printf '%s' "$pane_json" | python3 -c 'import json, sys
 try:
     pane = json.load(sys.stdin)["result"]["pane"]
-except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError):
+    legacy = pane.get("agent")
+    current = (pane.get("agent_session") or {}).get("agent")
+except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError, AttributeError):
     raise SystemExit(1)
-raise SystemExit(0 if pane.get("agent") == "hermes" else 1)' 2>/dev/null; then
+raise SystemExit(0 if legacy == "hermes" or current == "hermes" else 1)' 2>/dev/null; then
       return 0
     fi
-    [ "$attempt" -eq 30 ] || sleep 0.1
+    [ "$attempt" -eq "$max_attempts" ] || sleep "$poll_seconds"
     attempt=$((attempt + 1))
   done
   return 1
