@@ -81,7 +81,7 @@ assert resp == {
     "name": "btp-responsibility",
     "required": False,
     "status": "ok",
-    "detail": "BTP environment work; not a build host; not fleet boss",
+    "detail": "BTP development/integrations; not shared fleet build host or fleet boss",
     "category": "harness",
 }
 assert "version" not in resp

@@ -177,7 +177,7 @@ verify_hbtp_json_notes() {
       parsed="$(python3 - "$metadata" <<'PY' 2>/dev/null || true
 import sys
 
-RESP_OK = "BTP environment work; not a build host; not fleet boss"
+RESP_OK = "BTP development/integrations; not shared fleet build host or fleet boss"
 META_INVALID = "approved h-btp metadata invalid"
 PARSER_UNAVAILABLE = "approved h-btp metadata parser unavailable"
 CRED_INVALID = "approved h-btp credential metadata invalid"
