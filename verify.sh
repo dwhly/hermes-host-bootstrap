@@ -155,6 +155,121 @@ verify_run_check() {
   fi
 }
 
+verify_hbtp_json_note() {
+  local name="$1" status="$2" detail="$3"
+  printf ',{"name":"%s","required":false,"status":"%s","detail":"%s","category":"harness"}' \
+    "$(verify_json_escape "$name")" "$(verify_json_escape "$status")" "$(verify_json_escape "$detail")"
+}
+
+verify_hbtp_json_notes() {
+  local short_host metadata parsed responsibility_status responsibility_detail credential_status credential_detail
+  short_host="$(hostname -s 2>/dev/null || true)"
+  [[ "$short_host" == "h-btp" ]] || return 0
+
+  metadata="/opt/hermes-config-baseline/fleet/hosts.yaml"
+  responsibility_status="error"
+  responsibility_detail="approved h-btp metadata missing"
+  credential_status="error"
+  credential_detail="approved h-btp metadata missing"
+
+  if [[ -r "$metadata" ]]; then
+    if command -v python3 >/dev/null 2>&1; then
+      parsed="$(python3 - "$metadata" <<'PY' 2>/dev/null || true
+import sys
+
+RESP_OK = "BTP environment work; not a build host; not fleet boss"
+META_INVALID = "approved h-btp metadata invalid"
+PARSER_UNAVAILABLE = "approved h-btp metadata parser unavailable"
+CRED_INVALID = "approved h-btp credential metadata invalid"
+
+def emit(resp_status, resp_detail, cred_status, cred_detail):
+    print("\t".join((resp_status, resp_detail, cred_status, cred_detail)))
+
+try:
+    import yaml
+except Exception:
+    emit("error", PARSER_UNAVAILABLE, "error", PARSER_UNAVAILABLE)
+    raise SystemExit(0)
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+except Exception:
+    emit("error", META_INVALID, "error", META_INVALID)
+    raise SystemExit(0)
+
+if not isinstance(data, dict):
+    emit("error", META_INVALID, "error", META_INVALID)
+    raise SystemExit(0)
+
+hosts = data.get("hosts")
+if not isinstance(hosts, list):
+    emit("error", META_INVALID, "error", META_INVALID)
+    raise SystemExit(0)
+
+records = [item for item in hosts if isinstance(item, dict) and item.get("hostname") == "h-btp"]
+if len(records) != 1:
+    emit("error", META_INVALID, "error", META_INVALID)
+    raise SystemExit(0)
+
+record = records[0]
+responsibility_status = "error"
+responsibility_detail = "approved h-btp responsibility metadata invalid"
+resource_policy = record.get("resource_policy")
+if (
+    record.get("responsibilities") == ["btp-environment-work"]
+    and isinstance(resource_policy, dict)
+    and resource_policy.get("build_host") is False
+    and resource_policy.get("central_stack") is False
+):
+    responsibility_status = "ok"
+    responsibility_detail = RESP_OK
+
+credential_status = "error"
+credential_detail = CRED_INVALID
+scopes = record.get("credential_scopes")
+if isinstance(scopes, list) and len(scopes) == 1 and isinstance(scopes[0], dict):
+    scope = scopes[0]
+    if (
+        scope.get("provider") == "1password"
+        and scope.get("vault") == "agent"
+        and scope.get("mode") == "read-only"
+    ):
+        availability = scope.get("availability")
+        if availability == "pending":
+            credential_status = "missing"
+            credential_detail = "1Password agent read-only availability pending (operator-reported)"
+        elif availability == "unavailable":
+            credential_status = "error"
+            credential_detail = "1Password agent read-only availability unavailable (operator-reported)"
+        elif availability == "verified":
+            credential_status = "ok"
+            credential_detail = "1Password agent read-only availability verified (operator-reported)"
+
+emit(responsibility_status, responsibility_detail, credential_status, credential_detail)
+PY
+)"
+      if [[ -n "$parsed" ]]; then
+        responsibility_status="${parsed%%$'\t'*}"
+        parsed="${parsed#*$'\t'}"
+        responsibility_detail="${parsed%%$'\t'*}"
+        parsed="${parsed#*$'\t'}"
+        credential_status="${parsed%%$'\t'*}"
+        credential_detail="${parsed#*$'\t'}"
+      else
+        responsibility_detail="approved h-btp metadata invalid"
+        credential_detail="approved h-btp metadata invalid"
+      fi
+    else
+      responsibility_detail="approved h-btp metadata parser unavailable"
+      credential_detail="approved h-btp metadata parser unavailable"
+    fi
+  fi
+
+  verify_hbtp_json_note "btp-responsibility" "$responsibility_status" "$responsibility_detail"
+  verify_hbtp_json_note "btp-credential" "$credential_status" "$credential_detail"
+}
+
 verify_json() {
   local tier role first=1 entry name required category cmd result status version detail
   tier="$(verify_tier)"
@@ -182,6 +297,7 @@ verify_json() {
     fi
     printf ',"detail":"%s","category":"%s"}' "$(verify_json_escape "$detail")" "$(verify_json_escape "$category")"
   done
+  verify_hbtp_json_notes
   printf ']}\n'
 }
 
