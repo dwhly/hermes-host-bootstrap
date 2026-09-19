@@ -35,7 +35,8 @@ code upgrades and telemetry refresh separate; this environment fix does not need
 a new Chief application build or `deploy-node` code sync.
 
 Applied to existing h-mini2 and h-air2 telemetry services during the September
-2026 Hermes upgrade. Offline h-mini/h-air are not claimed repaired. Full rollout
-and pending-state source: Hermes automation wiki
+18 upgrade, then h-mini and h-air during their verified September 19 catch-up.
+The latter two use GUI UID 502; resolve the actual UID rather than copying 501.
+Full rollout and state source: Hermes automation wiki
 `operations/hermes-fleet-upgrade-2026-09.md`, config repo
 `fleet/rollouts/hermes-2026-09-18.json`.
