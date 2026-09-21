@@ -44,6 +44,10 @@ AGENT
     release-binary installer → ~/.local/bin; run `fabric --setup` per host for keys)
   + Herdr agent multiplexer (ogulcancelik/herdr; "tmux for AI agents"; per-host
     release binary → ~/.local/bin; also symlinks the experimental hmw-herdr launcher)
+  + Hermes native Bot API defaults (authenticated OpenAI-compatible native gateway API
+    on the host's Tailscale IPv4 only; preserves existing API_SERVER_KEY, writes
+    restart-pending evidence when config changes, and restarts only through explicit
+    hermes-native-bots apply-api / --restart-gateway)
   + FluidVoice (macOS client/both only; GPLv3 local-first system-wide dictation;
     official Homebrew cask; first launch needs Microphone + Accessibility grants)
   + playwright system deps + bundled chromium
@@ -64,3 +68,6 @@ MAC-CLIENT (macOS + client/both role only)
   + Microsoft Remote Desktop (Windows App)
   + Tailscale GUI cask
   + Ghostty config dotfile at ~/.config/ghostty/config
+  + Hermes Desktop LaunchAgent + packaged app
+    (builds with hermes desktop --build-only if needed on macOS client/both,
+    ~/Applications/Hermes.app symlink, /usr/bin/open, RunAtLoad, no KeepAlive)

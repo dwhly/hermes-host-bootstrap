@@ -63,6 +63,54 @@ verify_mac_keepawake() {
   printf '%s\n' active
 }
 
+verify_hermes_native_api() {
+  if ! command -v hermes-native-bots >/dev/null 2>&1; then
+    return 1
+  fi
+  local out
+  out="$(hermes-native-bots verify-api 2>/dev/null)" || return 1
+  python3 - "$out" <<'PY'
+import json, sys
+data = json.loads(sys.argv[1])
+api = data.get("api") or {}
+if data.get("ok") is not True or data.get("action") != "verify-api":
+    raise SystemExit(1)
+host = api.get("host") or ""
+port = api.get("port")
+if not host.startswith("100.") or int(port) != 8642:
+    raise SystemExit(1)
+checks = (
+    api.get("no_key_denied"),
+    api.get("wrong_key_denied"),
+    api.get("capabilities_authenticated"),
+    api.get("models_authenticated"),
+)
+if not all(checks):
+    raise SystemExit(1)
+print("verified")
+PY
+}
+
+verify_hermes_desktop_launchagent() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    printf '%s\n' not-applicable
+    return 0
+  fi
+  if ! command -v hermes-native-bots >/dev/null 2>&1; then
+    return 1
+  fi
+  local out
+  out="$(hermes-native-bots status-desktop 2>/dev/null)" || return 1
+  python3 - "$out" <<'PY'
+import json, sys
+data = json.loads(sys.argv[1])
+desktop = data.get("desktop") or {}
+if desktop.get("status") != "configured":
+    raise SystemExit(1)
+print("configured")
+PY
+}
+
 verify_check "git"        "true"  "system" "git --version"
 verify_check "tmux"       "true"  "system" "tmux -V"
 verify_check "tmux-autoattach" "false" "harness" "test -f '$HOME/.hermes-host-bootstrap.tmux-autoattach.sh' && echo present"
@@ -87,6 +135,8 @@ verify_check "fabric"     "false" "harness" "fabric --version 2>&1 | sed -n '1p'
 verify_check "herdr"      "false" "harness" "herdr --version 2>&1 | sed -n '1p'"
 verify_check "hermes-workspace" "false" "harness" "test -x '$HOME/.local/bin/hermes-workspace' && test -x '$HOME/.local/bin/hmw-tmux' && grep -q 'HMW_BACKEND:-herdr' '$HOME/.local/bin/hermes-workspace' && echo herdr-default"
 verify_check "mac-keepawake" "false" "system" "verify_mac_keepawake"
+verify_check "hermes-native-api" "false" "hermes" "verify_hermes_native_api"
+verify_check "hermes-desktop-launchagent" "false" "hermes" "verify_hermes_desktop_launchagent"
 verify_check "herdr-new-agent" "false" "harness" "test -x '$HOME/.local/bin/herdr-new-agent' && grep -q 'command = \"herdr-new-agent right\"' '$HOME/.config/herdr/config.toml' && echo present"
 verify_check "fluidvoice" "false" "system" "verify_fluidvoice_app"
 verify_check "fluidvoice-login-item" "false" "system" "verify_fluidvoice_login_item"

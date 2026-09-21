@@ -106,10 +106,16 @@ GIT_VER="$(get_ver 'git --version')"
 # version-tracked here — no exceptions. Add a *_VER line when you manifest a package.
 FABRIC_VER="$(get_ver 'fabric --version')"
 HERDR_VER="$(get_ver 'herdr --version')"
+HERMES_NATIVE_BOTS_VER="$(get_ver 'hermes-native-bots --version')"
 if [[ "$OS_KIND" == "macos" ]] && [[ -d /Applications/FluidVoice.app ]]; then
   FLUIDVOICE_VER="$(defaults read /Applications/FluidVoice.app/Contents/Info CFBundleShortVersionString 2>/dev/null || echo unknown)"
 else
   FLUIDVOICE_VER="not installed"
+fi
+if [[ "$OS_KIND" == "macos" ]] && [[ -e "$HOME/Applications/Hermes.app" ]]; then
+  HERMES_DESKTOP_VER="$(defaults read "$HOME/Applications/Hermes.app/Contents/Info" CFBundleShortVersionString 2>/dev/null || echo present)"
+else
+  HERMES_DESKTOP_VER="not installed"
 fi
 
 # Resource snapshot
@@ -197,6 +203,8 @@ versions:
   git: "$GIT_VER"
   fabric: "$FABRIC_VER"
   herdr: "$HERDR_VER"
+  hermes_native_bots: "$HERMES_NATIVE_BOTS_VER"
+  hermes_desktop: "$HERMES_DESKTOP_VER"
   fluidvoice: "$FLUIDVOICE_VER"
 YAML
 
