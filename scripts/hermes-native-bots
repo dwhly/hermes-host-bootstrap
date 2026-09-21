@@ -693,27 +693,42 @@ def request(path, token):
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, headers=headers, method="GET")
     timeout = float(os.environ.get("HERMES_NATIVE_BOTS_API_PROBE_TIMEOUT", "5"))
+    max_body = 1024 * 1024
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read(4096)
-            return resp.status, body
+            body = resp.read(max_body + 1)
+            return resp.status, body[:max_body], len(body) > max_body
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read(4096)
+        body = exc.read(max_body + 1)
+        return exc.code, body[:max_body], len(body) > max_body
     except (urllib.error.URLError, TimeoutError, OSError):
-        return 0, b""
+        return 0, b"", False
 
-no_key, _ = request("/v1/capabilities", None)
-wrong_key, _ = request("/v1/capabilities", "wrong-key")
-caps_status, caps_body = request("/v1/capabilities", key)
-models_status, models_body = request("/v1/models", key)
-ok = no_key == 401 and wrong_key == 401 and caps_status == 200 and models_status == 200
+no_key, _, no_key_overlength = request("/v1/capabilities", None)
+wrong_key, _, wrong_key_overlength = request("/v1/capabilities", "wrong-key")
+caps_status, caps_body, caps_overlength = request("/v1/capabilities", key)
+models_status, models_body, models_overlength = request("/v1/models", key)
+response_overlength = no_key_overlength or wrong_key_overlength or caps_overlength or models_overlength
+caps_ok = False
+models_ok = False
 try:
-    caps = json.loads(caps_body.decode("utf-8")) if caps_status == 200 else {}
-    models = json.loads(models_body.decode("utf-8")) if models_status == 200 else {}
+    caps = json.loads(caps_body.decode("utf-8")) if caps_status == 200 and not caps_overlength else {}
+    models = json.loads(models_body.decode("utf-8")) if models_status == 200 and not models_overlength else {}
+    caps_ok = isinstance(caps, dict) and caps.get("object") == "hermes.api_server.capabilities"
+    models_ok = isinstance(models, dict) and models.get("object") == "list"
 except Exception:
-    ok = False
     caps = {}
     models = {}
+ok = (
+    no_key == 401
+    and wrong_key == 401
+    and caps_status == 200
+    and models_status == 200
+    and not response_overlength
+    and caps_ok
+    and models_ok
+)
+error = "response_too_large" if response_overlength else None
 print(json.dumps({
     "schema_version": 1,
     "ok": ok,
@@ -723,8 +738,10 @@ print(json.dumps({
         "port": int(port),
         "no_key_denied": no_key == 401,
         "wrong_key_denied": wrong_key == 401,
-        "capabilities_authenticated": caps_status == 200 and caps.get("object") == "hermes.api_server.capabilities",
-        "models_authenticated": models_status == 200 and models.get("object") == "list",
+        "capabilities_authenticated": caps_ok,
+        "models_authenticated": models_ok,
+        "response_overlength": response_overlength,
+        **({"error": error} if error else {}),
     },
 }, separators=(",", ":")))
 raise SystemExit(0 if ok else 1)
@@ -763,9 +780,17 @@ wait_verify_api() {
 }
 
 desktop_release_app_candidates() {
-  local root="${HERMES_SOURCE_ROOT:-/usr/local/lib/hermes-agent}"
-  [[ -d "$root/apps/desktop/release" ]] || return 0
-  find "$root/apps/desktop/release" -maxdepth 4 -type d -name 'Hermes.app' 2>/dev/null | sort
+  local root runtime_source roots=()
+  if [[ -n "${HERMES_SOURCE_ROOT:-}" ]]; then
+    roots=("$HERMES_SOURCE_ROOT")
+  else
+    runtime_source="${RUNTIME_HOME:-${HERMES_HOME:-$HOME/.hermes}}/hermes-agent"
+    roots=("$runtime_source" "/usr/local/lib/hermes-agent")
+  fi
+  for root in "${roots[@]}"; do
+    [[ -d "$root/apps/desktop/release" ]] || continue
+    find "$root/apps/desktop/release" -maxdepth 4 -type d -name 'Hermes.app' 2>/dev/null
+  done | sort -u
 }
 
 app_info_value() {

@@ -6,7 +6,14 @@ HELPER="$ROOT/scripts/hermes-native-bots"
 MODULE="$ROOT/lib/98-hermes-native-bots.sh"
 VERIFY="$ROOT/verify.sh"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+VERIFY_API_FIXTURE_PIDS=()
+cleanup() {
+  if ((${#VERIFY_API_FIXTURE_PIDS[@]})); then
+    kill "${VERIFY_API_FIXTURE_PIDS[@]}" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 pass() { printf 'PASS: %s\n' "$*"; }
@@ -16,6 +23,68 @@ file_mode() {
   else
     stat -f '%Lp' "$1"
   fi
+}
+start_verify_api_fixture() {
+  local mode port_file pid
+  mode="$1"
+  port_file="$TMP/verify-api-${mode}.port"
+  rm -f "$port_file"
+  python3 - "$port_file" "$mode" <<'PY' &
+import json
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+port_file, mode = sys.argv[1:3]
+key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def _send(self, status, body):
+        if isinstance(body, dict):
+            body = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.headers.get("Authorization") != f"Bearer {key}":
+            self._send(401, {"error": "unauthorized"})
+            return
+        if self.path == "/v1/capabilities":
+            if mode == "large_caps":
+                self._send(200, {"object": "hermes.api_server.capabilities", "padding": "x" * 8192})
+            elif mode == "wrong_caps_object":
+                self._send(200, {"object": "not.hermes.capabilities"})
+            elif mode == "overlength_caps":
+                body = b'{"object":"hermes.api_server.capabilities","padding":"' + (b"x" * (1024 * 1024 + 1)) + b'"}'
+                self._send(200, body)
+            else:
+                self._send(200, {"object": "hermes.api_server.capabilities"})
+            return
+        if self.path == "/v1/models":
+            if mode == "wrong_models_object":
+                self._send(200, {"object": "not-a-list"})
+            else:
+                self._send(200, {"object": "list", "data": []})
+            return
+        self._send(404, {"error": "not_found"})
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+with open(port_file, "w", encoding="utf-8") as fh:
+    fh.write(str(server.server_port))
+server.serve_forever()
+PY
+  pid="$!"
+  VERIFY_API_FIXTURE_PIDS+=("$pid")
+  for _ in {1..50}; do
+    [[ -s "$port_file" ]] && return 0
+    sleep 0.1
+  done
+  fail "verify-api fixture did not start for $mode"
 }
 
 bash -n "$HELPER" "$MODULE" "$VERIFY" "$ROOT/lib/99-register-host.sh"
@@ -205,6 +274,59 @@ grep -q '"restart_pending":true' /tmp/native-bots-apply.out || fail "apply-api c
 grep -q '"status":"restart-requested"' /tmp/native-bots-apply.out || fail "apply-api claimed applied before live verification"
 grep -q '"restart_pending":true' "$apply_restart/home/.hermes/runtime/native-bots-api-state.json" || fail "apply-api persisted cleared pending before live verification"
 
+verify_live="$TMP/verify-live"
+mkdir -p "$verify_live/home/.hermes"
+start_verify_api_fixture large_caps
+cat >"$verify_live/home/.hermes/.env" <<ENV
+API_SERVER_HOST=127.0.0.1
+API_SERVER_PORT=$(cat "$TMP/verify-api-large_caps.port")
+API_SERVER_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ENV
+verify_large_out="$(HOME="$verify_live/home" HERMES_HOME="$verify_live/home/.hermes" HERMES_NATIVE_BOTS_API_PROBE_TIMEOUT=1 "$HELPER" verify-api)" \
+  || fail "verify-api rejected large valid capabilities response"
+grep -q '"ok":true' <<<"$verify_large_out" || fail "large capabilities verification was not ok"
+grep -q '"capabilities_authenticated":true' <<<"$verify_large_out" || fail "large capabilities contract was not accepted"
+grep -q '"models_authenticated":true' <<<"$verify_large_out" || fail "models contract was not accepted with large capabilities"
+
+start_verify_api_fixture wrong_caps_object
+cat >"$verify_live/home/.hermes/.env" <<ENV
+API_SERVER_HOST=127.0.0.1
+API_SERVER_PORT=$(cat "$TMP/verify-api-wrong_caps_object.port")
+API_SERVER_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ENV
+if wrong_caps_out="$(HOME="$verify_live/home" HERMES_HOME="$verify_live/home/.hermes" HERMES_NATIVE_BOTS_API_PROBE_TIMEOUT=1 "$HELPER" verify-api 2>/tmp/native-bots-wrong-caps.err)"; then
+  fail "verify-api accepted wrong capabilities object"
+fi
+grep -q '"ok":false' <<<"$wrong_caps_out" || fail "wrong capabilities object did not mark receipt failed"
+grep -q '"capabilities_authenticated":false' <<<"$wrong_caps_out" || fail "wrong capabilities object did not fail contract"
+grep -q '"models_authenticated":true' <<<"$wrong_caps_out" || fail "wrong capabilities fixture should keep models valid"
+
+start_verify_api_fixture wrong_models_object
+cat >"$verify_live/home/.hermes/.env" <<ENV
+API_SERVER_HOST=127.0.0.1
+API_SERVER_PORT=$(cat "$TMP/verify-api-wrong_models_object.port")
+API_SERVER_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ENV
+if wrong_models_out="$(HOME="$verify_live/home" HERMES_HOME="$verify_live/home/.hermes" HERMES_NATIVE_BOTS_API_PROBE_TIMEOUT=1 "$HELPER" verify-api 2>/tmp/native-bots-wrong-models.err)"; then
+  fail "verify-api accepted wrong models object"
+fi
+grep -q '"ok":false' <<<"$wrong_models_out" || fail "wrong models object did not mark receipt failed"
+grep -q '"capabilities_authenticated":true' <<<"$wrong_models_out" || fail "wrong models fixture should keep capabilities valid"
+grep -q '"models_authenticated":false' <<<"$wrong_models_out" || fail "wrong models object did not fail contract"
+
+start_verify_api_fixture overlength_caps
+cat >"$verify_live/home/.hermes/.env" <<ENV
+API_SERVER_HOST=127.0.0.1
+API_SERVER_PORT=$(cat "$TMP/verify-api-overlength_caps.port")
+API_SERVER_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ENV
+if overlength_out="$(HOME="$verify_live/home" HERMES_HOME="$verify_live/home/.hermes" HERMES_NATIVE_BOTS_API_PROBE_TIMEOUT=1 "$HELPER" verify-api 2>/tmp/native-bots-overlength.err)"; then
+  fail "verify-api accepted overlength capabilities response"
+fi
+grep -q '"ok":false' <<<"$overlength_out" || fail "overlength response did not mark receipt failed"
+grep -q '"response_overlength":true' <<<"$overlength_out" || fail "overlength response did not expose explicit overlength diagnostic"
+grep -q '"error":"response_too_large"' <<<"$overlength_out" || fail "overlength response did not expose response_too_large"
+
 module_home="$TMP/module-home"
 mkdir -p "$module_home" "$TMP/no-ts-bin"
 cat >"$TMP/no-ts-bin/tailscale" <<'SH'
@@ -261,6 +383,15 @@ with open(sys.argv[1], "wb") as fh:
 PY
 printf '#!/usr/bin/env bash\nexit 0\n' >"$desktop/source/apps/desktop/release/mac-arm64/Hermes.app/Contents/MacOS/Hermes"
 chmod +x "$desktop/source/apps/desktop/release/mac-arm64/Hermes.app/Contents/MacOS/Hermes"
+
+desktop_runtime="$TMP/desktop-runtime"
+mkdir -p "$desktop_runtime/home/.hermes"
+cp -R "$desktop/source" "$desktop_runtime/home/.hermes/hermes-agent"
+runtime_status="$(unset HERMES_SOURCE_ROOT; PATH="$desktop/bin:/usr/bin:/bin" HOME="$desktop_runtime/home" "$HELPER" status-desktop)"
+grep -q '"status":"source_missing"' <<<"$runtime_status" && fail "runtime source detection missed built app"
+grep -q "$desktop_runtime/home/.hermes/hermes-agent/apps/desktop/release/mac-arm64/Hermes.app" <<<"$runtime_status" \
+  || fail "runtime source path not reported without HERMES_SOURCE_ROOT override"
+
 status="$(PATH="$desktop/bin:/usr/bin:/bin" HOME="$desktop/home" HERMES_SOURCE_ROOT="$desktop/source" "$HELPER" status-desktop)"
 grep -q '"status":"source_missing"' <<<"$status" && fail "native source detection missed built app"
 grep -q "$desktop/source/apps/desktop/release/mac-arm64/Hermes.app" <<<"$status" || fail "native source path not reported"
