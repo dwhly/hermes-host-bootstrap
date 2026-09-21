@@ -395,6 +395,50 @@ grep -q "$desktop_runtime/home/.hermes/hermes-agent/apps/desktop/release/mac-arm
 status="$(PATH="$desktop/bin:/usr/bin:/bin" HOME="$desktop/home" HERMES_SOURCE_ROOT="$desktop/source" "$HELPER" status-desktop)"
 grep -q '"status":"source_missing"' <<<"$status" && fail "native source detection missed built app"
 grep -q "$desktop/source/apps/desktop/release/mac-arm64/Hermes.app" <<<"$status" || fail "native source path not reported"
+cat >"$desktop/bin/launchctl" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "print" && "${HERMES_TEST_LAUNCHCTL_LOADED:-1}" == "1" ]]; then
+  exit 0
+fi
+exit 1
+SH
+chmod +x "$desktop/bin/launchctl"
+mkdir -p "$desktop/home/Library/LaunchAgents"
+ln -s "$desktop/source/apps/desktop/release/mac-arm64/Hermes.app" "$desktop/home/Applications/Hermes.app"
+python3 - "$desktop/home/Library/LaunchAgents/com.hermes.desktop.plist" "$desktop/home/Applications/Hermes.app" "com.hermes.desktop" <<'PY'
+import plistlib, sys
+plist, target, label = sys.argv[1:4]
+data = {"Label": label, "ProgramArguments": ["/usr/bin/open", target], "RunAtLoad": True}
+with open(plist, "wb") as fh:
+    plistlib.dump(data, fh)
+PY
+configured_status="$(PATH="$desktop/bin:/usr/bin:/bin" HOME="$desktop/home" HERMES_SOURCE_ROOT="$desktop/source" "$HELPER" status-desktop)"
+grep -q '"status":"configured"' <<<"$configured_status" || fail "desktop status did not report configured when launchagent is loaded"
+grep -q '"version":"1.2.3"' <<<"$configured_status" || fail "desktop status did not populate app version"
+grep -q '"codesign":"not_checked"' <<<"$configured_status" || fail "desktop status did not populate codesign state"
+grep -Fq "\"executable\":\"$desktop/source/apps/desktop/release/mac-arm64/Hermes.app/Contents/MacOS/Hermes\"" <<<"$configured_status" \
+  || fail "desktop status did not populate executable path"
+python3 - "$desktop/home/Library/LaunchAgents/com.hermes.desktop.plist" "$desktop/home/Applications/Hermes.app" "com.hermes.wrong" <<'PY'
+import plistlib, sys
+plist, target, label = sys.argv[1:4]
+data = {"Label": label, "ProgramArguments": ["/usr/bin/open", target], "RunAtLoad": True}
+with open(plist, "wb") as fh:
+    plistlib.dump(data, fh)
+PY
+wrong_label_status="$(PATH="$desktop/bin:/usr/bin:/bin" HOME="$desktop/home" HERMES_SOURCE_ROOT="$desktop/source" "$HELPER" status-desktop)"
+! grep -q '"status":"configured"' <<<"$wrong_label_status" || fail "desktop status accepted wrong LaunchAgent label"
+grep -q '"plist_ok":false' <<<"$wrong_label_status" || fail "desktop status did not reject wrong LaunchAgent label"
+python3 - "$desktop/home/Library/LaunchAgents/com.hermes.desktop.plist" "$desktop/home/Applications/Hermes.app" "com.hermes.desktop" <<'PY'
+import plistlib, sys
+plist, target, label = sys.argv[1:4]
+data = {"Label": label, "ProgramArguments": ["/usr/bin/open", target], "RunAtLoad": True}
+with open(plist, "wb") as fh:
+    plistlib.dump(data, fh)
+PY
+not_loaded_status="$(HERMES_TEST_LAUNCHCTL_LOADED=0 PATH="$desktop/bin:/usr/bin:/bin" HOME="$desktop/home" HERMES_SOURCE_ROOT="$desktop/source" "$HELPER" status-desktop)"
+grep -q '"status":"not_loaded"' <<<"$not_loaded_status" || fail "desktop status configured despite unloaded LaunchAgent"
+grep -q '"loaded":false' <<<"$not_loaded_status" || fail "desktop status did not expose unloaded LaunchAgent"
+rm -f "$desktop/home/Applications/Hermes.app"
 mkdir -p "$desktop/home/Applications/Hermes.app"
 if PATH="$desktop/bin:/usr/bin:/bin" HOME="$desktop/home" HERMES_SOURCE_ROOT="$desktop/source" "$HELPER" configure-desktop >/tmp/native-bots-desktop.out 2>&1; then
   fail "conflicting existing Hermes.app was replaced"

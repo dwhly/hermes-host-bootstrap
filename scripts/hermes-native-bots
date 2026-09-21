@@ -976,10 +976,10 @@ cmd_status_desktop() {
   src="$(desktop_source_app | tail -n 1 || true)"
   target="$(desktop_target_app)"
   plist="$(desktop_plist)"
-  if [[ -n "$src" ]]; then source_verified=1; fi
+  if [[ -n "$src" ]] && verify_desktop_app "$src"; then source_verified=1; fi
   if [[ -L "$target" && -n "$src" && "$(readlink "$target")" == "$src" ]]; then link_ok=1; fi
   plist_json="$(plist_status_json "$plist")"
-  if [[ "$plist_json" == *'"program_ok":true'* && "$plist_json" == *'"run_at_load":true'* && "$plist_json" == *'"keep_alive":false'* ]]; then
+  if [[ "$plist_json" == *'"label_ok":true'* && "$plist_json" == *'"program_ok":true'* && "$plist_json" == *'"run_at_load":true'* && "$plist_json" == *'"keep_alive":false'* ]]; then
     plist_ok=1
   fi
   if launchagent_loaded; then loaded=1; fi
@@ -987,8 +987,10 @@ cmd_status_desktop() {
     status="conflict"
   elif [[ "$source_verified" -eq 0 ]]; then
     status="source_missing"
-  elif [[ "$link_ok" -eq 1 && "$plist_ok" -eq 1 ]]; then
+  elif [[ "$link_ok" -eq 1 && "$plist_ok" -eq 1 && "$loaded" -eq 1 ]]; then
     status="configured"
+  elif [[ "$link_ok" -eq 1 && "$plist_ok" -eq 1 ]]; then
+    status="not_loaded"
   fi
   printf '{"schema_version":1,"ok":true,"action":"status-desktop","desktop":{"status":"%s","app_link":"%s","source_app":"%s","launchagent":"%s","source_verified":%s,"link_ok":%s,"plist_ok":%s,"loaded":%s,"run_at_load":%s,"keep_alive":false,"program_path":"/usr/bin/open","bundle_id":"%s","version":"%s","arch":"%s","codesign":"%s","executable":"%s"}}\n' \
     "$(json_escape "$status")" "$(json_escape "$target")" "$(json_escape "$src")" "$(json_escape "$plist")" \
