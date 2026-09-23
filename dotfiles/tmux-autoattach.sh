@@ -9,7 +9,7 @@
 #
 # Guards (all must be true to fire):
 #   - tmux is on PATH
-#   - we're NOT already inside a tmux session ($TMUX unset)
+#   - we're NOT already inside tmux or a Herdr pane (including restored panes)
 #   - we ARE inside an SSH/mosh session ($SSH_CONNECTION or $SSH_TTY set)
 #   - the shell is interactive ($- contains 'i')
 #
@@ -21,6 +21,8 @@
 
 if command -v tmux >/dev/null 2>&1 \
    && [ -z "${TMUX:-}" ] \
+   && [ "${HERDR_ENV:-}" != "1" ] \
+   && [ -z "${HERDR_PANE_ID:-}" ] \
    && [ -z "${NO_TMUX:-}" ] \
    && { [ -n "${SSH_CONNECTION:-}" ] || [ -n "${SSH_TTY:-}" ]; } \
    && case "$-" in *i*) true ;; *) false ;; esac
