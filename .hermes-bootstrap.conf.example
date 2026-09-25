@@ -81,12 +81,15 @@
 # remote access unless explicitly requested.
 # export HERMES_MAC_REMOTE_LOGIN=0
 
-# macOS desktop/primary-workstation power policy. Opt in on a Mac that should
-# keep SSH/Herdr/agent work alive indefinitely while plugged in, while allowing
-# attached displays to turn off after the requested idle interval. The always-on
-# assertion is a per-user launchd service and does not require administrator access.
-# If the display timeout differs, bootstrap prints the one-time pmset command.
-# export HERMES_MAC_DESKTOP_ALWAYS_ON=0
+# macOS desktop-class power policy (M6). Applies AUTOMATICALLY to any Mac
+# without an internal battery (Mac mini / Studio / iMac / Pro — the fleet's
+# headless always-on Macs); laptops are never touched, even if set to 1.
+#   Layer 1: per-user launchd `caffeinate -i` (no sudo) blocks idle sleep.
+#   Layer 2: pmset on AC = sleep 0, womp 1, autorestart 1, displaysleep N.
+#            Applied only if passwordless sudo exists; otherwise bootstrap
+#            prints the one-time `sudo pmset -c ...` command to run locally.
+# Set HERMES_MAC_DESKTOP_ALWAYS_ON=0 on a desktop Mac that SHOULD sleep.
+# export HERMES_MAC_DESKTOP_ALWAYS_ON=auto
 # export HERMES_MAC_DISPLAY_SLEEP_MINUTES=30
 
 # Lockout-risk features — both default to OFF in the repo. Set to 1 here if

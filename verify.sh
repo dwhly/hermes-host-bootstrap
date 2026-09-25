@@ -43,16 +43,23 @@ verify_fluidvoice_login_item() {
   printf '%s\n' enabled
 }
 
+mac_power_class() {
+  # Prints: not-macos | laptop | desktop | desktop-opted-out
+  if [[ "$(uname -s)" != "Darwin" ]]; then printf '%s\n' not-macos; return 0; fi
+  if pmset -g batt 2>/dev/null | grep -q 'InternalBattery'; then printf '%s\n' laptop; return 0; fi
+  local want
+  want="$( [[ -f "$HOME/.hermes-bootstrap.conf" ]] && source "$HOME/.hermes-bootstrap.conf" >/dev/null 2>&1; printf '%s' "${HERMES_MAC_DESKTOP_ALWAYS_ON:-auto}" )"
+  if [[ "$want" == "0" ]]; then printf '%s\n' desktop-opted-out; else printf '%s\n' desktop; fi
+}
+
 verify_mac_keepawake() {
-  if [[ "$(uname -s)" != "Darwin" ]]; then
-    printf '%s\n' not-applicable
-    return 0
-  fi
+  local class
+  class="$(mac_power_class)"
+  case "$class" in
+    not-macos|laptop|desktop-opted-out) printf 'not-applicable (%s)\n' "$class"; return 0 ;;
+  esac
   local plist="$HOME/Library/LaunchAgents/com.hermes.keepawake.plist"
-  if [[ ! -f "$plist" ]]; then
-    printf '%s\n' not-configured
-    return 0
-  fi
+  [[ -f "$plist" ]] || return 1
   launchctl print "gui/$(id -u)/com.hermes.keepawake" >/dev/null 2>&1 || return 1
   local assertions
   assertions="$(pmset -g assertions)" || return 1
@@ -111,6 +118,26 @@ print("configured")
 PY
 }
 
+verify_mac_desktop_pmset() {
+  # Desktop Macs should not idle-sleep even without a user session, should
+  # answer Wake-on-LAN, and should reboot after a power loss.
+  local class
+  class="$(mac_power_class)"
+  case "$class" in
+    not-macos|laptop|desktop-opted-out) printf 'not-applicable (%s)\n' "$class"; return 0 ;;
+  esac
+  local ac kv drift=()
+  ac="$(pmset -g custom 2>/dev/null | awk '/^AC Power:/{f=1; next} /^[A-Za-z].*:$/{f=0} f')"
+  for kv in "sleep 0" "womp 1" "autorestart 1"; do
+    printf '%s\n' "$ac" | grep -qE "^[[:space:]]*${kv%% *}[[:space:]]+${kv#* }$" || drift+=("$kv")
+  done
+  if [[ ${#drift[@]} -gt 0 ]]; then
+    printf 'drift: want %s (run: sudo pmset -c %s)\n' "$(IFS=,; echo "${drift[*]}")" "${drift[*]}"
+    return 1
+  fi
+  printf '%s\n' "sleep 0, womp 1, autorestart 1"
+}
+
 verify_check "git"        "true"  "system" "git --version"
 verify_check "tmux"       "true"  "system" "tmux -V"
 verify_check "tmux-autoattach" "false" "harness" "test -f '$HOME/.hermes-host-bootstrap.tmux-autoattach.sh' && echo present"
@@ -137,6 +164,7 @@ verify_check "hermes-workspace" "false" "harness" "test -x '$HOME/.local/bin/her
 verify_check "mac-keepawake" "false" "system" "verify_mac_keepawake"
 verify_check "hermes-native-api" "false" "hermes" "verify_hermes_native_api"
 verify_check "hermes-desktop-launchagent" "false" "hermes" "verify_hermes_desktop_launchagent"
+verify_check "mac-desktop-pmset" "false" "system" "verify_mac_desktop_pmset"
 verify_check "herdr-new-agent" "false" "harness" "test -x '$HOME/.local/bin/herdr-new-agent' && grep -q 'command = \"herdr-new-agent right\"' '$HOME/.config/herdr/config.toml' && echo present"
 verify_check "fluidvoice" "false" "system" "verify_fluidvoice_app"
 verify_check "fluidvoice-login-item" "false" "system" "verify_fluidvoice_login_item"
