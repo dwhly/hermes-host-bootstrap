@@ -5,7 +5,7 @@
 # prompt), then creates a READ-ONLY service account and installs its token directly on h-af.
 set -euo pipefail
 ACCOUNT="${HAF_OP_ACCOUNT:-amforge.1password.com}"
-VAULT="${HAF_OP_VAULT:-AmForge-Agent}"
+VAULT="${HAF_OP_VAULT:-Hermes}"          # the AmForge account's "Hermes" vault (owner decision 2026-09-25)
 HAF="${HAF_SSH:-root@100.115.171.106}"
 SA_NAME="${HAF_SA_NAME:-hermes-h-af}"
 OPA=(op --account "$ACCOUNT")
@@ -19,7 +19,8 @@ create_item() {  # create_item <json> — secret values never touch argv or the 
   rm -f "$tmp"; return $rc
 }
 
-[[ -z "${SSH_CONNECTION:-}" ]] || { echo "Run this in a local terminal on h-mini2 (1Password unlock does not work over SSH)."; exit 1; }
+# Over SSH this works only while the 1Password app on this Mac is unlocked (HAF_ALLOW_SSH=1).
+[[ -z "${SSH_CONNECTION:-}" || -n "${HAF_ALLOW_SSH:-}" ]] || { echo "Run in a local terminal on h-mini2 (or HAF_ALLOW_SSH=1 while 1Password is unlocked)."; exit 1; }
 "${OPA[@]}" whoami >/dev/null 2>&1 || eval "$("${OPA[@]}" signin)"
 say "signed in: $("${OPA[@]}" whoami --format json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("email"), "@", d.get("url"))')"
 
@@ -36,7 +37,11 @@ ssh -o BatchMode=yes "$HAF" /root/.local/bin/haf-export-op-items | while IFS= re
 done
 
 # 3. GitHub token for the amforge org (optional, hidden prompt)
-if ! grep -qxF "GitHub - AmForge org (h-af)" <<<"$existing"; then
+if grep -qiE '^(github|gh) (pat|-)' <<<"$existing" && grep -qi 'github pat' <<<"$existing"; then
+  say "GitHub token already in $VAULT: $(grep -i 'github pat' <<<"$existing" | head -1)"
+elif [[ ! -t 0 ]]; then
+  say "no terminal for the hidden GitHub prompt — skipped (re-run locally to add it)"
+elif ! grep -qxF "GitHub - AmForge org (h-af)" <<<"$existing"; then
   printf 'Paste the fine-grained GitHub token for the amforge org (hidden), or press Return to skip: '
   IFS= read -rs gh_tok; echo
   if [[ -n "$gh_tok" ]]; then
@@ -48,7 +53,9 @@ if ! grep -qxF "GitHub - AmForge org (h-af)" <<<"$existing"; then
 fi
 
 # 4. read-only service account → token installed directly on h-af (never displayed)
-if ssh -o BatchMode=yes "$HAF" 'test -s /root/.config/amforge/op_sa_token'; then
+if [[ -n "${HAF_SKIP_SA:-}" ]]; then
+  say "service account step skipped (HAF_SKIP_SA set)"
+elif ssh -o BatchMode=yes "$HAF" 'test -s /root/.config/amforge/op_sa_token'; then
   say "service-account token already installed on h-af (delete /root/.config/amforge/op_sa_token there to re-issue)"
 else
   "${OPA[@]}" service-account create "$SA_NAME" --vault "$VAULT:read_items" --raw \
@@ -56,6 +63,6 @@ else
   say "service account $SA_NAME created (read-only on $VAULT); token installed on h-af"
 fi
 
-# 5. prove it from h-af
-ssh -o BatchMode=yes "$HAF" 'export OP_SERVICE_ACCOUNT_TOKEN="$(cat /root/.config/amforge/op_sa_token)"; echo "h-af sees vaults:"; op vault list; echo "items:"; op item list --vault '"$VAULT"' --format json | python3 -c "import json,sys; [print(\"  -\", i[\"title\"]) for i in json.load(sys.stdin)]"'
+# 5. prove it from h-af (only once the service-account token is installed)
+ssh -o BatchMode=yes "$HAF" 'test -s /root/.config/amforge/op_sa_token' && ssh -o BatchMode=yes "$HAF" 'export OP_SERVICE_ACCOUNT_TOKEN="$(cat /root/.config/amforge/op_sa_token)"; echo "h-af sees vaults:"; op vault list; echo "items:"; op item list --vault '"$VAULT"' --format json | python3 -c "import json,sys; [print(\"  -\", i[\"title\"]) for i in json.load(sys.stdin)]"'
 say "done"
