@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# haf-1p-setup — run by Dan in a LOCAL terminal on h-mini2 (1Password unlock/Touch ID needed).
+# Idempotent. Creates the AmForge-owned vault for h-af, loads h-af's existing credentials into it
+# (values stream h-af → op over a pipe; never shown), optionally adds the GitHub token (hidden
+# prompt), then creates a READ-ONLY service account and installs its token directly on h-af.
+set -euo pipefail
+ACCOUNT="${HAF_OP_ACCOUNT:-amforge.1password.com}"
+VAULT="${HAF_OP_VAULT:-AmForge-Agent}"
+HAF="${HAF_SSH:-root@100.115.171.106}"
+SA_NAME="${HAF_SA_NAME:-hermes-h-af}"
+OPA=(op --account "$ACCOUNT")
+say() { printf '\033[36m[haf-1p]\033[0m %s\n' "$*"; }
+create_item() {  # create_item <json> — secret values never touch argv or the terminal
+  local json="$1" tmp rc=0
+  if "${OPA[@]}" item create --vault "$VAULT" --template=<(printf '%s' "$json") >/dev/null 2>&1; then return 0; fi
+  tmp="$(umask 077; mktemp "${TMPDIR:-/tmp}/haf-item.XXXXXX")"
+  printf '%s' "$json" >"$tmp"
+  "${OPA[@]}" item create --vault "$VAULT" --template="$tmp" >/dev/null || rc=$?
+  rm -f "$tmp"; return $rc
+}
+
+[[ -z "${SSH_CONNECTION:-}" ]] || { echo "Run this in a local terminal on h-mini2 (1Password unlock does not work over SSH)."; exit 1; }
+"${OPA[@]}" whoami >/dev/null 2>&1 || eval "$("${OPA[@]}" signin)"
+say "signed in: $("${OPA[@]}" whoami --format json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("email"), "@", d.get("url"))')"
+
+# 1. vault
+if "${OPA[@]}" vault get "$VAULT" >/dev/null 2>&1; then say "vault $VAULT exists"
+else "${OPA[@]}" vault create "$VAULT" --description "Credentials for the h-af (AmForge) Hermes node. Service account: $SA_NAME (read-only)." >/dev/null; say "vault $VAULT created"; fi
+
+# 2. existing h-af credentials (streamed; skip ones already present)
+existing="$("${OPA[@]}" item list --vault "$VAULT" --format json | python3 -c 'import json,sys; [print(i["title"]) for i in json.load(sys.stdin)]')"
+ssh -o BatchMode=yes "$HAF" /root/.local/bin/haf-export-op-items | while IFS= read -r line; do
+  title="$(printf '%s' "$line" | python3 -c 'import json,sys; print(json.load(sys.stdin)["title"])')"
+  if grep -qxF "$title" <<<"$existing"; then say "exists: $title"; continue; fi
+  create_item "$line" </dev/null && say "added:  $title"
+done
+
+# 3. GitHub token for the amforge org (optional, hidden prompt)
+if ! grep -qxF "GitHub - AmForge org (h-af)" <<<"$existing"; then
+  printf 'Paste the fine-grained GitHub token for the amforge org (hidden), or press Return to skip: '
+  IFS= read -rs gh_tok; echo
+  if [[ -n "$gh_tok" ]]; then
+    gh_json="$(GH_TOK="$gh_tok" python3 -c 'import json,os; print(json.dumps({"title":"GitHub - AmForge org (h-af)","category":"API_CREDENTIAL","tags":["amforge","h-af","hermes"],"notesPlain":"Fine-grained token, resource owner amforge, used by gh on h-af.","fields":[{"id":"credential","type":"CONCEALED","label":"credential","value":os.environ["GH_TOK"]},{"type":"STRING","label":"resource_owner","value":"amforge"}]}))')"
+    create_item "$gh_json" && say "added:  GitHub - AmForge org (h-af)"
+    unset gh_json
+  else say "GitHub token skipped (re-run later to add it)"; fi
+  unset gh_tok
+fi
+
+# 4. read-only service account → token installed directly on h-af (never displayed)
+if ssh -o BatchMode=yes "$HAF" 'test -s /root/.config/amforge/op_sa_token'; then
+  say "service-account token already installed on h-af (delete /root/.config/amforge/op_sa_token there to re-issue)"
+else
+  "${OPA[@]}" service-account create "$SA_NAME" --vault "$VAULT:read_items" --raw \
+    | ssh -o BatchMode=yes "$HAF" 'umask 077; mkdir -p /root/.config/amforge; cat >/root/.config/amforge/op_sa_token.new && mv /root/.config/amforge/op_sa_token.new /root/.config/amforge/op_sa_token'
+  say "service account $SA_NAME created (read-only on $VAULT); token installed on h-af"
+fi
+
+# 5. prove it from h-af
+ssh -o BatchMode=yes "$HAF" 'export OP_SERVICE_ACCOUNT_TOKEN="$(cat /root/.config/amforge/op_sa_token)"; echo "h-af sees vaults:"; op vault list; echo "items:"; op item list --vault '"$VAULT"' --format json | python3 -c "import json,sys; [print(\"  -\", i[\"title\"]) for i in json.load(sys.stdin)]"'
+say "done"

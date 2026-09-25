@@ -17,6 +17,7 @@
 #   registry     hosts/<host>.yaml + fleet/hosts.yaml entry + fleet/access/<host>.* ; commit+push
 #   telemetry    Chief node daemon, telemetry only; verify the node reports to core
 #   hmw-target   herdr + workspace helpers so `hmw <host>` works
+#   cli-tools    (optional) 1Password CLI + GitHub CLI from official apt repos — no credentials
 #   client:<c>   authorize client <c>'s key, give it the registry entry + pinned host key, prove hmw
 #   verify       prove the node's pre-existing services survived untouched + smoke-ok
 #
@@ -214,6 +215,11 @@ step_telemetry() {
   evidence telemetry "\"$health\""
 }
 
+step_cli_tools() {  # op + gh from official apt repos (Linux targets); packages only, no credentials
+  run_remote_script "$REPO/scripts/fleet-enroll/remote-cli-tools.sh" | grep -E '^(op |gh )' | sed 's/^/    /' >&2
+  evidence cli_tools '"op+gh"'
+}
+
 step_hmw_target() {
   [[ -d "$STATE" ]] && remote 'test -d /opt/hermes-host-bootstrap-baseline/scripts' || sync_baseline
   run_remote_script "$REPO/scripts/fleet-enroll/remote-hmw-target.sh" | sed 's/^/    /' >&2
@@ -271,6 +277,7 @@ for STEP in "${STEPS[@]}"; do
   case "$STEP" in
     preflight) step_preflight ;; backup) step_backup ;; prep) step_prep ;;
     registry) step_registry ;; telemetry) step_telemetry ;; hmw-target) step_hmw_target ;;
+    cli-tools) step_cli_tools ;;
     client:*) step_client "${STEP#client:}" ;; verify) step_verify ;;
     *) die "unknown step" ;;
   esac

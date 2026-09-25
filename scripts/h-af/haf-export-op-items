@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""haf-export-op-items — runs ON h-af as root. Prints one 1Password item JSON template per line
+for the AmForge credentials this node already uses, so they can be piped straight into
+`op item create` on the operator's Mac. Values go only to stdout (a pipe); nothing is written
+to disk and nothing on h-af is modified.
+
+  haf-export-op-items            # all items
+  haf-export-op-items --titles   # just the titles (safe to display)
+"""
+import json, pathlib, sys
+
+H = pathlib.Path("/root/.hermes")
+env = {}
+for line in open(H / ".env"):
+    line = line.strip()
+    if "=" in line and not line.startswith("#"):
+        k, v = line.split("=", 1)
+        env[k] = v.strip().strip('"').strip("'")
+
+def item(title, secret, notes, **fields):
+    f = [{"id": "credential", "type": "CONCEALED", "label": "credential", "value": secret}]
+    for label, (kind, value) in fields.items():
+        f.append({"type": kind, "label": label, "value": value})
+    return {"title": title, "category": "API_CREDENTIAL", "tags": ["amforge", "h-af", "hermes"],
+            "notesPlain": notes, "fields": f}
+
+items = []
+if env.get("SLACK_BOT_TOKEN"):
+    items.append(item("Slack - AmForge Hermes bot", env["SLACK_BOT_TOKEN"],
+        "Hermes Slack bot (Socket Mode) in amforge.slack.com. Runtime copy lives in h-af /root/.hermes/.env "
+        "(SLACK_BOT_TOKEN / SLACK_APP_TOKEN). Created by Al Mendez.",
+        app_token=("CONCEALED", env.get("SLACK_APP_TOKEN", "")),
+        workspace=("STRING", "amforge.slack.com"), bot_user=("STRING", "hermes"),
+        home_channel=("STRING", env.get("SLACK_HOME_CHANNEL", "")),
+        allowed_users=("STRING", env.get("SLACK_ALLOWED_USERS", ""))))
+if env.get("NOTION_API_KEY"):
+    items.append(item("Notion - AmForge Hermes integration", env["NOTION_API_KEY"],
+        "Internal integration 'Hermes' owned by the AmForge Notion workspace. Sees pages/databases shared "
+        "with it. Runtime copy: h-af .env NOTION_API_KEY.", workspace=("STRING", "AmForge")))
+cs_path = H / "google_client_secret.json"
+if cs_path.exists():
+    raw = json.load(open(cs_path)); cs = raw.get("installed") or raw.get("web")
+    items.append(item("Google - AmForge Hermes OAuth client", cs["client_secret"],
+        "Desktop OAuth client used by the google-workspace skill on h-af (set up by Al Mendez). "
+        "Runtime copy: h-af /root/.hermes/google_client_secret.json.",
+        client_id=("STRING", cs["client_id"]), project_id=("STRING", cs.get("project_id", "")),
+        client_type=("STRING", "installed" if "installed" in raw else "web")))
+for tf in sorted((H / "google-workspace/tokens").rglob("*.json")):
+    t = json.load(open(tf))
+    if not t.get("refresh_token"):
+        continue
+    items.append(item(f"Google - OAuth grant {tf.stem}", t["refresh_token"],
+        f"Refresh token for {tf.stem}, authorized through Slack user {tf.parent.name} (enforce.py identity "
+        f"binding). Disaster-recovery copy; runtime copy: h-af {tf}.",
+        account=("STRING", tf.stem), slack_user=("STRING", tf.parent.name),
+        scopes=("STRING", " ".join(s.replace("https://www.googleapis.com/auth/", "") for s in t.get("scopes", [])))))
+
+if "--titles" in sys.argv:
+    for i in items:
+        print(i["title"])
+else:
+    for i in items:
+        print(json.dumps(i))
