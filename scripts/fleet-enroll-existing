@@ -159,7 +159,7 @@ YAML
   mkdir -p "$CFG/fleet/access"
   ssh-keyscan -t ed25519 "$IP" 2>/dev/null | sort -u >"$CFG/fleet/access/$HOST.known_hosts"
   [[ -s "$CFG/fleet/access/$HOST.known_hosts" ]] || die "could not read target host key"
-  { cat "$CFG/fleet/access/$HOST.authorized_keys" 2>/dev/null; remote 'grep -E "^(ssh|ecdsa)-" ~/.ssh/authorized_keys'; } \
+  { cat "$CFG/fleet/access/$HOST.authorized_keys" 2>/dev/null || true; remote 'grep -E "^(ssh|ecdsa)-" ~/.ssh/authorized_keys'; } \
     | awk '!seen[$0]++' >"$CFG/fleet/access/$HOST.authorized_keys.new"
   mv "$CFG/fleet/access/$HOST.authorized_keys.new" "$CFG/fleet/access/$HOST.authorized_keys"
   evidence host_key "\"$(ssh-keygen -lf "$CFG/fleet/access/$HOST.known_hosts" | awk '{print $2}')\""
