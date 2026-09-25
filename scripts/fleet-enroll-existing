@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# fleet-enroll-existing — enroll an EXISTING, already-working machine into the Hermes fleet
+# without disturbing what it already runs (its Hermes home, gateways, cron jobs, secrets).
+#
+# This is the scripted form of the h-btp / h-af baseline enrollment. It never runs the full
+# bootstrap, never syncs the common Hermes home over the node's own, never arms convergence,
+# never creates OS accounts, and never moves application secrets.
+#
+# Run on the fleet boss (h-do1), as root, from this repo checkout.
+#
+#   fleet-enroll-existing <host> <tailnet_ip> [steps...]
+#
+# Steps (default = all of: preflight backup prep registry telemetry hmw-target verify):
+#   preflight    reachability, identity, record running-service fingerprint (PIDs, cron jobs)
+#   backup       protected backup on the target (/var/backups/hermes-fleet/<host>-enrollment-*)
+#   prep         pin hostname against cloud-init, /etc/hosts, swap on small hosts
+#   registry     hosts/<host>.yaml + fleet/hosts.yaml entry + fleet/access/<host>.* ; commit+push
+#   telemetry    Chief node daemon, telemetry only; verify the node reports to core
+#   hmw-target   herdr + workspace helpers so `hmw <host>` works
+#   client:<c>   authorize client <c>'s key, give it the registry entry + pinned host key, prove hmw
+#   verify       prove the node's pre-existing services survived untouched + smoke-ok
+#
+# Env overrides: ENROLL_SSH_USER (root) ENROLL_PURPOSE ENROLL_RESPONSIBILITY ENROLL_REGION
+#                ENROLL_PROVIDER (digitalocean) CHIEF_CORE_URL (http://100.122.202.37:8088)
+set -euo pipefail
+
+HOST="${1:?usage: fleet-enroll-existing <host> <tailnet_ip> [steps...]}"
+IP="${2:?usage: fleet-enroll-existing <host> <tailnet_ip> [steps...]}"
+shift 2
+STEPS=("$@"); [[ ${#STEPS[@]} -eq 0 ]] && STEPS=(preflight backup prep registry telemetry hmw-target verify)
+
+USER_="${ENROLL_SSH_USER:-root}"
+TGT="${USER_}@${IP}"
+CORE="${CHIEF_CORE_URL:-http://100.122.202.37:8088}"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"                 # hermes-host-bootstrap checkout
+CFG="${HERMES_CONFIG_DIR:-/root/.hermes}"                 # hermes-config checkout (registry)
+SRC="${CHIEF_SRC_ROOT:-/root/code/chief}"
+EVID="$CFG/fleet/rollouts/${HOST}-enrollment.jsonl"
+STATE="/root/.local/state/fleet-enroll/$HOST"; mkdir -p "$STATE"
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15)
+
+log()  { printf '\033[36m[enroll %s:%s]\033[0m %s\n' "$HOST" "$STEP" "$*" >&2; }
+die()  { printf '\033[31m[enroll %s:%s] FAIL:\033[0m %s\n' "$HOST" "$STEP" "$*" >&2; exit 1; }
+evidence() {  # evidence <key> <json-value>
+  mkdir -p "$(dirname "$EVID")"
+  printf '{"ts":"%s","host":"%s","step":"%s","%s":%s}\n' "$(date -u +%FT%TZ)" "$HOST" "$STEP" "$1" "$2" >>"$EVID"
+}
+remote() { "${SSH[@]}" "$TGT" "$@"; }
+run_remote_script() {  # run_remote_script <local script> [args...] — copy then execute (no heredoc over SSH)
+  local s="$1"; shift
+  scp -q -o BatchMode=yes "$s" "$TGT:/tmp/fleet-enroll-$(basename "$s")"
+  remote "bash /tmp/fleet-enroll-$(basename "$s") $(printf '%q ' "$@"); rc=\$?; rm -f /tmp/fleet-enroll-$(basename "$s"); exit \$rc"
+}
+fingerprint() {  # stable view of what the node already runs
+  remote 'ps -eo pid,lstart,cmd | grep -E "hermes_cli.main gateway|hermes-webui|hermes-fleet-(collector|reporter)" | grep -v grep | awk "{\$1=\$1};1" | sort;
+          echo "--cron"; (hermes cron list 2>/dev/null || true) | grep -E "^\s+[0-9a-f]{12} \[" | awk "{print \$1, \$2}" | sort'
+}
+
+step_preflight() {
+  remote true || die "cannot SSH to $TGT (add the boss key to the target first)"
+  local hn; hn="$(remote 'hostname -s')"
+  log "reachable; hostname=$hn"
+  [[ "$hn" == "$HOST" ]] || log "hostname differs ($hn) — 'prep' will pin it to $HOST"
+  fingerprint >"$STATE/services.before"
+  if [[ "$(sed -n '/^--cron$/q;p' "$STATE/services.before" | grep -c .)" -eq 0 && -z "${ENROLL_ALLOW_EMPTY_FINGERPRINT:-}" ]]; then
+    die "no pre-existing Hermes service processes matched — refine fingerprint() for this node (or set ENROLL_ALLOW_EMPTY_FINGERPRINT=1 for a node with none)"
+  fi
+  log "running-service fingerprint:"; sed 's/^/    /' "$STATE/services.before" >&2
+  evidence preflight "$(python3 -c 'import json,sys; print(json.dumps(open(sys.argv[1]).read().splitlines()))' "$STATE/services.before")"
+}
+
+step_backup() {
+  local out; out="$(run_remote_script "$REPO/scripts/fleet-enroll/remote-backup.sh" "$HOST")"
+  printf '%s\n' "$out" | sed 's/^/    /' >&2
+  local dir; dir="$(printf '%s\n' "$out" | sed -n 's/^BACKUP_DIR=//p')"
+  [[ -n "$dir" ]] || die "backup did not report a directory"
+  evidence backup "\"$dir\""
+}
+
+step_prep() {
+  run_remote_script "$REPO/scripts/fleet-enroll/remote-host-prep.sh" "$HOST" | sed 's/^/    /' >&2
+  [[ "$(remote 'hostname -s')" == "$HOST" ]] || die "hostname pin failed"
+  evidence prep '"ok"'
+}
+
+step_registry() {
+  local facts; facts="$(remote 'set -e; . /etc/os-release; echo "pretty=$PRETTY_NAME"; echo "version=$VERSION_ID";
+     echo "arch=$(uname -m)"; echo "kernel=$(uname -r)"; echo "cpus=$(nproc)";
+     echo "mem=$(awk "/MemTotal/{print int(\$2/1024)}" /proc/meminfo)"; echo "disk=$(df -h / | awk "NR==2{print \$2}")";
+     echo "hermes=$(hermes --version 2>/dev/null | head -1)"; echo "fqdn=$(tailscale status --json 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin)[\"Self\"][\"DNSName\"].rstrip(\".\"))" 2>/dev/null)";
+     echo "public_ip=$(curl -s -m 5 https://api.ipify.org || true)"; echo "home=$HOME"')"
+  f() { printf '%s\n' "$facts" | sed -n "s/^$1=//p"; }
+  local purpose="${ENROLL_PURPOSE:-existing node enrolled with preserved services}"
+  local resp="${ENROLL_RESPONSIBILITY:-${HOST#h-}-work}"
+  local snap="$CFG/hosts/$HOST.yaml"
+  cat >"$snap" <<YAML
+# fleet registry snapshot — written by scripts/fleet-enroll-existing (baseline enrollment)
+hostname: $HOST
+fqdn: $(f fqdn)
+note: "$purpose; enrolled with preserved services; Chief telemetry only, convergence OFF"
+default_user: "$USER_"
+ssh_user: "$USER_"
+ssh_host: "$IP"
+tailscale_name: "$(f fqdn)"
+tailscale_ip: "$IP"
+public_ip: "$(f public_ip)"
+home: "$(f home)"
+
+os:
+  kind: ubuntu
+  pretty: "$(f pretty)"
+  version: "$(f version)"
+  arch: $(f arch)
+  kernel: "$(f kernel)"
+
+bootstrap:
+  tier: baseline-enrollment
+  role: server
+  installed_at: $(date -u +%FT%TZ)
+
+resources:
+  cpu_count: $(f cpus)
+  total_mem_mb: $(f mem)
+  total_disk: $(f disk)
+
+versions:
+  hermes: "$(f hermes)"
+YAML
+  if ! python3 -c 'import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); sys.exit(0 if any(h.get("hostname")==sys.argv[2] for h in d["hosts"]) else 1)' "$CFG/fleet/hosts.yaml" "$HOST"; then
+    cat >>"$CFG/fleet/hosts.yaml" <<YAML
+
+  - hostname: $HOST
+    role: server
+    form_factor: vps
+    provider: ${ENROLL_PROVIDER:-digitalocean}
+    region: ${ENROLL_REGION:-unknown}
+    public_ip: $(f public_ip)
+    tailscale_ip: $IP
+    tailscale_name: $HOST
+    purpose: "$purpose"
+    expected_online: true
+    ssh_user: $USER_
+    management:
+      mode: managed
+      runtime_user: $USER_
+      hermes_home: $(f home)/.hermes
+      interactive_access: direct
+      enrollment: baseline-existing        # preserved services; see fleet/rollouts/$HOST-enrollment.jsonl
+    responsibilities:
+      - $resp
+    resource_policy:
+      build_host: false
+      central_stack: false
+    # NOTE: Chief telemetry only; convergence OFF until explicitly armed.
+YAML
+  fi
+  python3 -c 'import yaml,sys; d=yaml.safe_load(open(sys.argv[1])); assert any(h.get("hostname")==sys.argv[2] for h in d["hosts"])' \
+    "$CFG/fleet/hosts.yaml" "$HOST" || die "fleet/hosts.yaml no longer parses or lacks $HOST"
+  mkdir -p "$CFG/fleet/access"
+  ssh-keyscan -t ed25519 "$IP" 2>/dev/null | sort -u >"$CFG/fleet/access/$HOST.known_hosts"
+  [[ -s "$CFG/fleet/access/$HOST.known_hosts" ]] || die "could not read target host key"
+  { cat "$CFG/fleet/access/$HOST.authorized_keys" 2>/dev/null; remote 'grep -E "^(ssh|ecdsa)-" ~/.ssh/authorized_keys'; } \
+    | awk '!seen[$0]++' >"$CFG/fleet/access/$HOST.authorized_keys.new"
+  mv "$CFG/fleet/access/$HOST.authorized_keys.new" "$CFG/fleet/access/$HOST.authorized_keys"
+  evidence host_key "\"$(ssh-keygen -lf "$CFG/fleet/access/$HOST.known_hosts" | awk '{print $2}')\""
+  commit_registry "fleet($HOST): register enrolled node (baseline, preserved services)"
+}
+
+commit_registry() {
+  ( cd "$CFG"
+    git add -- "hosts/$HOST.yaml" fleet/hosts.yaml "fleet/access/$HOST.known_hosts" \
+               "fleet/access/$HOST.authorized_keys" "fleet/rollouts/$HOST-enrollment.jsonl" 2>/dev/null || true
+    if git diff --cached --quiet; then log "registry unchanged"; else
+      git commit -q -m "$1" -- "hosts/$HOST.yaml" fleet/hosts.yaml "fleet/access/$HOST.known_hosts" \
+          "fleet/access/$HOST.authorized_keys" "fleet/rollouts/$HOST-enrollment.jsonl"
+      [[ "$(git rev-parse --abbrev-ref HEAD)" == main ]] || die "config repo not on main; refusing to push"
+      git push -q origin HEAD:refs/heads/main && log "registry committed + pushed ($(git rev-parse --short HEAD))"
+    fi )
+}
+
+sync_baseline() {
+  # Pinned, reviewed sources only: bootstrap at its committed HEAD (git archive, not the dirty tree),
+  # plus the Chief node package + SDK. Never the common Hermes home.
+  local rev; rev="$(git -C "$REPO" rev-parse HEAD)"
+  [[ -z "$(git -C "$REPO" status --porcelain -- scripts systemd verify.sh)" ]] \
+    || die "bootstrap repo has uncommitted/untracked files under scripts/ systemd/ verify.sh — commit them first (only committed, reviewed code is deployed)"
+  remote 'mkdir -p /opt/hermes-host-bootstrap-baseline.new && rm -rf /opt/hermes-host-bootstrap-baseline.new/*'
+  git -C "$REPO" archive --format=tar HEAD | remote 'tar -x -C /opt/hermes-host-bootstrap-baseline.new'
+  remote "printf 'repo=hermes-host-bootstrap\ncommit=$rev\nsynced=%s\n' \"\$(date -u +%FT%TZ)\" >/opt/hermes-host-bootstrap-baseline.new/PROVENANCE &&
+          rm -rf /opt/hermes-host-bootstrap-baseline.old && { [ ! -d /opt/hermes-host-bootstrap-baseline ] || mv /opt/hermes-host-bootstrap-baseline /opt/hermes-host-bootstrap-baseline.old; } &&
+          mv /opt/hermes-host-bootstrap-baseline.new /opt/hermes-host-bootstrap-baseline && rm -rf /opt/hermes-host-bootstrap-baseline.old"
+  remote 'mkdir -p /opt/hermes-config-baseline/fleet'
+  scp -q -o BatchMode=yes "$CFG/fleet/hosts.yaml" "$TGT:/opt/hermes-config-baseline/fleet/hosts.yaml"
+  local d; for d in hermes-node chief-spec/sdk; do
+    [[ -z "$(git -C "$SRC/$d" status --porcelain -- . ":!.local" 2>/dev/null)" ]] || die "$SRC/$d has uncommitted files — only committed code is deployed"
+  done
+  remote 'mkdir -p /root/code/chief/hermes-node /root/code/chief/chief-spec/sdk'
+  local RS=(rsync -a --delete --exclude .venv --exclude .git --exclude __pycache__ --exclude .local -e "ssh -o BatchMode=yes")
+  "${RS[@]}" "$SRC/hermes-node/" "$TGT:/root/code/chief/hermes-node/"
+  "${RS[@]}" "$SRC/chief-spec/sdk/" "$TGT:/root/code/chief/chief-spec/sdk/"
+  evidence baseline "{\"bootstrap\":\"$rev\",\"hermes_node\":\"$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)\"}"
+}
+
+step_telemetry() {
+  sync_baseline
+  run_remote_script "$REPO/scripts/fleet-enroll/remote-telemetry.sh" "$HOST" "$CORE" | sed 's/^/    /' >&2
+  local health=""
+  for _ in 1 2 3 4 5 6; do
+    health="$(curl -s "$CORE/v1/fleet/nodes/$HOST" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("health"), len((d.get("provisioning") or {}).get("checks") or []))' 2>/dev/null || true)"
+    [[ "$health" == healthy* ]] && break; sleep 10
+  done
+  [[ "$health" == healthy* ]] || die "core does not report $HOST healthy (got: ${health:-nothing})"
+  log "core reports: health/checks = $health"
+  evidence telemetry "\"$health\""
+}
+
+step_hmw_target() {
+  [[ -d "$STATE" ]] && remote 'test -d /opt/hermes-host-bootstrap-baseline/scripts' || sync_baseline
+  run_remote_script "$REPO/scripts/fleet-enroll/remote-hmw-target.sh" | sed 's/^/    /' >&2
+  evidence hmw_target '"ok"'
+}
+
+step_client() {  # client:<name>
+  local c="$1" cy="$CFG/hosts/$1.yaml"
+  [[ -f "$cy" ]] || die "no registry entry for client $c"
+  local cu ch; cu="$(sed -n 's/^ssh_user:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}.*/\1/p' "$cy" | head -1)"
+  ch="$(sed -n 's/^ssh_host:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}.*/\1/p' "$cy" | head -1)"
+  local CT="$cu@$ch" key="${ENROLL_CLIENT_KEY:-~/.ssh/id_ed25519.pub}"
+  "${SSH[@]}" "$CT" true || die "client $c ($CT) unreachable — it stays pending; re-run when online"
+  local pub; pub="$("${SSH[@]}" "$CT" "cat $key")"
+  [[ "$pub" == ssh-* ]] || die "client $c has no public key at $key"
+  log "client key: $(printf '%s\n' "$pub" | ssh-keygen -lf - | awk '{print $2, $3}')"
+  # 1. trust: client public key -> target root authorized_keys (idempotent)
+  printf '%s\n' "$pub" | remote 'k="$(cat)"; grep -qxF "$k" ~/.ssh/authorized_keys || printf "%s\n" "$k" >>~/.ssh/authorized_keys'
+  grep -qxF "$pub" "$CFG/fleet/access/$HOST.authorized_keys" 2>/dev/null || printf '%s\n' "$pub" >>"$CFG/fleet/access/$HOST.authorized_keys"
+  # 2. registry entry + pinned host key on the client
+  "${SSH[@]}" "$CT" 'mkdir -p ~/.hermes/hosts'
+  scp -q -o BatchMode=yes "$CFG/hosts/$HOST.yaml" "$CT:.hermes/hosts/$HOST.yaml"
+  "${SSH[@]}" "$CT" "mkdir -p ~/.ssh && touch ~/.ssh/known_hosts && ssh-keygen -R $IP >/dev/null 2>&1; cat >>~/.ssh/known_hosts" <"$CFG/fleet/access/$HOST.known_hosts"
+  # 3. prove it from the client: registry resolution, key-only SSH, hmw verify
+  local res; res="$("${SSH[@]}" "$CT" "PATH=\$HOME/.local/bin:\$PATH hermes-host-resolve $HOST")"
+  [[ "$res" == "$TGT" ]] || die "client resolves $HOST to '$res', expected $TGT"
+  "${SSH[@]}" "$CT" "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes $TGT hostname -s" | grep -qx "$HOST" \
+    || die "client $c cannot key-only SSH to $TGT"
+  local v; v="$("${SSH[@]}" "$CT" "PATH=\$HOME/.local/bin:/opt/homebrew/bin:\$PATH HMW_HERDR_VERIFY=1 hermes-workspace $HOST 1" 2>&1 | grep '^HMW_VERIFY' || true)"
+  printf '%s\n' "$v" | sed 's/^/    /' >&2
+  printf '%s\n' "$v" | grep -q "HMW_VERIFY target=$HOST" || die "hmw verify from $c did not reach $HOST"
+  log "client $c: resolve + key-only SSH + hmw verify passed"
+  evidence "client_$c" '"verified"'
+  commit_registry "fleet($HOST): authorize client $c (direct hmw access)"
+}
+
+step_verify() {
+  [[ -f "$STATE/services.before" ]] || die "no preflight fingerprint recorded; run preflight first"
+  fingerprint >"$STATE/services.after"
+  if diff -u "$STATE/services.before" "$STATE/services.after" >&2; then
+    log "pre-existing services unchanged (same PIDs/start times, same cron jobs)"
+  else
+    die "pre-existing services changed during enrollment — investigate before continuing"
+  fi
+  local smoke; smoke="$(remote 'timeout 180 hermes chat -q "Reply exactly: smoke-ok" --quiet 2>/dev/null | tail -1' || true)"
+  [[ "$smoke" == *smoke-ok* ]] || die "smoke test did not return smoke-ok (got: $smoke)"
+  log "smoke-ok from $HOST"
+  remote 'systemctl is-active --quiet chief-node.service' || die "chief-node.service is not active"
+  remote 'free -m | sed -n "2,3p"' | sed 's/^/    /' >&2
+  evidence verify '"services-unchanged+smoke-ok"'
+  commit_registry "fleet($HOST): enrollment verified"
+}
+
+for STEP in "${STEPS[@]}"; do
+  case "$STEP" in
+    preflight) step_preflight ;; backup) step_backup ;; prep) step_prep ;;
+    registry) step_registry ;; telemetry) step_telemetry ;; hmw-target) step_hmw_target ;;
+    client:*) step_client "${STEP#client:}" ;; verify) step_verify ;;
+    *) die "unknown step" ;;
+  esac
+done
+log "done: ${STEPS[*]}"

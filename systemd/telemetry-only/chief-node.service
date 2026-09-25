@@ -1,0 +1,23 @@
+[Unit]
+Description=Chief node daemon (telemetry only — convergence not armed)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# CHIEF_NODE_ID, CHIEF_CORE_URL, HERMES_BOOTSTRAP_DIR, HOME, PATH come from here.
+EnvironmentFile=/etc/chief/node.env
+WorkingDirectory=/root/code/chief/hermes-node
+ExecStart=/root/code/chief/hermes-node/.venv/bin/python -m hermes_node.daemon run --node-id ${CHIEF_NODE_ID} --core ${CHIEF_CORE_URL} --interval 60
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=75
+User=root
+Group=root
+# Small-node guard: telemetry must never be what pushes the host into OOM.
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
