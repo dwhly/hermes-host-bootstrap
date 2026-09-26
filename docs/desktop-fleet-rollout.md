@@ -54,6 +54,7 @@ build and review perform only fixture checks; they do not authorize host changes
    Confirm a
    Hermes venv with PyYAML (or `HERMES_FLEET_PYTHON`) on each host. This is an
    activation gate; legacy compatibility is not evidence that protection is armed.
+   `HERMES_FLEET_PYTHON` is strict: it must be executable and import PyYAML, with no fallback.
    On h-btp and h-af, record which candidates exist; any higher-precedence copy
    must be byte-identical to `/opt/hermes-config-baseline/fleet/hosts.yaml` or removed.
    Every candidate must be readable by the accounts running bootstrap or verify.

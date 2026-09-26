@@ -10,7 +10,7 @@ import subprocess
 import sys
 
 from desktop_fleet.common import (atomic_write, digest, json_bytes, load, load_rollout_intent,
-                                  resolve_intent, rollout_declared, IntentUnavailable)
+                                  resolve_intent, rollout_declared, IntentUnavailable, PythonOverrideError)
 from desktop_fleet.registry import checklist, manifest, read_only_report
 
 REPO = Path(__file__).resolve().parents[1]
@@ -170,6 +170,8 @@ def main():
                 raise ValueError('installed allowlist differs from generated manifest')
             report['plugin_version'] = version(a.hermes_home, compatibility_path=a.compatibility)
             report['app_pin'] = version(a.hermes_home, True, a.compatibility)
+        except PythonOverrideError:
+            raise
         except (OSError, ValueError, KeyError):
             report['sdk_compatibility'] = 'indeterminate: app pin unselected, unqualified or mismatched'
             report['status'] = 'indeterminate'
@@ -183,5 +185,7 @@ if __name__ == '__main__':
         sys.exit(main())
     except IntentUnavailable as exc:
         sys.exit('desktop-fleet: ' + str(exc) + '; enrollment disabled')
+    except PythonOverrideError as exc:
+        sys.exit('desktop-fleet: ' + str(exc))
     except (OSError, ValueError, KeyError, TypeError, ImportError, subprocess.SubprocessError):
         sys.exit('desktop-fleet: indeterminate inventory, settings, or artifact pin; stop enrollment; no removal advice')

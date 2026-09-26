@@ -15,6 +15,13 @@ class IntentUnavailable(ValueError):
     """Optional rollout input/dependency is absent, not malformed."""
 
 
+class PythonOverrideError(ValueError):
+    """An explicit interpreter choice is unusable, even for legacy Intent."""
+
+    def __init__(self):
+        super().__init__('HERMES_FLEET_PYTHON is not an executable Python with PyYAML')
+
+
 BASELINE_INTENT = Path('/opt/hermes-config-baseline/fleet/hosts.yaml')
 
 
@@ -88,6 +95,8 @@ def load_rollout_intent(registry, *, home=None, hermes_home=None):
                 continue  # load_intent already refuses raw declaration tokens.
             if rollout_declared(other):
                 raise ValueError('declared alternative Intent')
+    except PythonOverrideError:
+        raise
     except (OSError, ValueError) as exc:
         raise ValueError('Intent copies disagree on desktop rollout declaration') from exc
     if unavailable is not None:
@@ -96,27 +105,48 @@ def load_rollout_intent(registry, *, home=None, hermes_home=None):
 
 
 def yaml_load(text):
-    """Prefer the Hermes interpreter when the system Python lacks PyYAML."""
-    candidates = [os.environ.get('HERMES_FLEET_PYTHON', ''),
-                  str(Path.home() / 'hermes-agent/venv/bin/python3'),
-                  str(Path.home() / 'hermes-agent/.venv/bin/python3')]
-    hermes = shutil.which('hermes')
-    if hermes:
-        candidates.append(str(Path(hermes).resolve().parent / 'python3'))
-    candidates.append('/usr/local/lib/hermes-agent/venv/bin/python3')
-    if not os.environ.get('HERMES_FLEET_YAML_RETRY'):
+    """Use a strict override, otherwise discover PyYAML in the Hermes runtime."""
+    override = os.environ.get('HERMES_FLEET_PYTHON')
+    if override:
+        # This is a configuration error, never optional legacy unavailability.
+        try:
+            if not Path(override).is_file() or not os.access(override, os.X_OK):
+                raise PythonOverrideError()
+            probe = subprocess.run([override, '-c', 'import yaml'], capture_output=True)
+        except OSError as exc:
+            raise PythonOverrideError() from exc
+        if probe.returncode:
+            raise PythonOverrideError()
+        candidates = [override]
+    else:
+        candidates = [str(Path.home() / 'hermes-agent/venv/bin/python3'),
+                      str(Path.home() / 'hermes-agent/.venv/bin/python3')]
+        hermes = shutil.which('hermes')
+        if hermes:
+            candidates.append(str(Path(hermes).resolve().parent / 'python3'))
+        candidates.append('/usr/local/lib/hermes-agent/venv/bin/python3')
+    if override or not os.environ.get('HERMES_FLEET_YAML_RETRY'):
         for candidate in dict.fromkeys(candidates):
             if not candidate or not os.access(candidate, os.X_OK):
                 continue
             code = ('import sys,json; sys.path.insert(0,sys.argv[1]); '
                     'from desktop_fleet.common import parse; print(json.dumps(parse(sys.stdin.read())))')
-            proc = subprocess.run([candidate, '-c', code, str(Path(__file__).resolve().parents[1])],
-                                  input=text, text=True, capture_output=True,
-                                  env={**os.environ, 'HERMES_FLEET_YAML_RETRY': '1'})
+            try:
+                proc = subprocess.run([candidate, '-c', code, str(Path(__file__).resolve().parents[1])],
+                                      input=text, text=True, capture_output=True,
+                                      # Selection is complete; parse locally in this child.
+                                      env={**os.environ, 'HERMES_FLEET_PYTHON': '',
+                                           'HERMES_FLEET_YAML_RETRY': '1'})
+            except OSError as exc:
+                if override:
+                    raise PythonOverrideError() from exc
+                raise
             if proc.returncode == 0:
                 return json.loads(proc.stdout)
             if 'IntentUnavailable' not in proc.stderr:
                 raise ValueError('malformed YAML input')
+    if override:
+        raise PythonOverrideError()
     raise IntentUnavailable('PyYAML unavailable; install it in the Hermes venv or set HERMES_FLEET_PYTHON')
 
 
@@ -138,6 +168,8 @@ def parse(text):
     try:
         return json.loads(text, object_pairs_hook=unique)
     except json.JSONDecodeError:
+        if os.environ.get('HERMES_FLEET_PYTHON'):
+            return yaml_load(text)
         try:
             import yaml
         except ImportError:

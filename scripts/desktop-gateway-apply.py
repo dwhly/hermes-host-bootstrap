@@ -18,7 +18,7 @@ import subprocess
 import sys
 
 from desktop_fleet.common import (admission, atomic_write, digest, existing, gateway_record, host_record,
-                                  json_bytes, load, rooted, update_policy)
+                                  json_bytes, load, rooted, update_policy, PythonOverrideError)
 from desktop_fleet import dashboard, marker
 
 AUTH_KEYS = {'HERMES_DASHBOARD_BASIC_AUTH_PASSWORD', 'HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH',
@@ -264,7 +264,7 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except (ApplyHeld, marker.MarkerDeferred) as exc:
+    except (ApplyHeld, marker.MarkerDeferred, PythonOverrideError) as exc:
         sys.exit('desktop-gateway-apply: ' + str(exc))
     except (OSError, ValueError, KeyError, TypeError, ImportError, subprocess.SubprocessError):
         sys.exit('desktop-gateway-apply: preflight/apply failed; files may need recovery if apply began; no secret values logged')

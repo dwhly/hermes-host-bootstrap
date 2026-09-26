@@ -5,6 +5,8 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -34,7 +36,8 @@ class PolicyTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         env = patch.dict(os.environ, {'HOME': str(self.root), 'HERMES_HOME': str(self.root / '.hermes'),
-                                      'HERMES_FLEET_INTENT': ''})
+                                      'HERMES_FLEET_INTENT': '', 'HERMES_FLEET_PYTHON': '',
+                                      'HERMES_FLEET_YAML_RETRY': ''})
         env.start()
         self.addCleanup(env.stop)
         baseline = patch.object(common, 'BASELINE_INTENT', self.root / 'opt/hermes-config-baseline/fleet/hosts.yaml')
@@ -198,8 +201,8 @@ is_skipped() { return 1; }
         wrapper.write_bytes((REPO / 'lib/97-dashboard-server.sh').read_bytes())
         interpreter = self.root / 'fixture-python'
         interpreter.write_text('#!' + sys.executable + '\n' + '''import os, runpy, socket, subprocess, sys
-if sys.argv[1] == '-c':
-    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+if sys.argv[1:] == ['-c', 'import yaml']:
+    sys.exit(0)  # Interpreter selection is stubbed; held Intent below is JSON.
 socket.gethostname = lambda: os.environ['FIXTURE_HOST']
 def forbidden(*args, **kwargs):
     raise AssertionError('unexpected process/service call')
@@ -209,11 +212,23 @@ sys.path.insert(0, os.path.dirname(sys.argv[0]))
 runpy.run_path(sys.argv[0], run_name='__main__')
 ''')
         interpreter.chmod(0o755)
+        intent = self.root / 'held.json'
+        intent.write_text(json.dumps({'complete': True, 'hosts': [
+            dict(hostname=host, update_policy=policy_name, desktop_gateway=dict(
+                admission=admission, g3_marker='deferred', dashboard_vehicle='module97'))
+            for host, policy_name, admission in (('h-do1', 'protected', 'deferred'),
+                                                 ('h-air2', 'eligible', 'pending-qualification'))]}))
+        env, _ = self.module97_environment()
+        for command in ('dirname', 'id'):
+            (Path(env['PATH']) / command).symlink_to(shutil.which(command))
+        sudo = Path(env['PATH']) / 'sudo'
+        sudo.write_text('#!/bin/sh\nexec "$@"\n')
+        sudo.chmod(0o755)
         for host in ('h-do1', 'h-air2'):
-            proc = subprocess.run(['bash', str(wrapper)], capture_output=True, text=True,
-                env={**os.environ, 'REPO_ROOT': str(fixture_repo), 'FIXTURE_HOST': host,
+            proc = subprocess.run([shutil.which('bash'), str(wrapper)], capture_output=True, text=True,
+                env={**env, 'REPO_ROOT': str(fixture_repo), 'FIXTURE_HOST': host,
                      'HERMES_FLEET_PYTHON': str(interpreter), 'PYTHONDONTWRITEBYTECODE': '1',
-                     'HERMES_FLEET_INTENT': str(REPO / 'tests/fixtures/desktop-deferred-hosts.yaml')})
+                     'HERMES_FLEET_INTENT': str(intent)})
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn('dashboard held: admission ', proc.stdout)
             self.assertFalse((self.root / '.hermes').exists())
@@ -528,28 +543,112 @@ verify_check desktop-g3-marker false hermes verify_desktop_g3
         with self.assertRaisesRegex(ValueError, 'malformed YAML'):
             optional_host_record(path, 'h-af')
 
-    def test_module97_resolves_override_before_sudo(self):
-        # Execute only interpreter selection and a recording sudo stub, never the module.
+    def python_stub(self, path, status=0):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('''#!/bin/bash
+printf '%s\\n' "$0" >>"$FIXTURE_PROBES"
+if [[ "$*" == '-c import yaml' ]]; then
+  exit ''' + str(status) + '''
+fi
+if [[ "$1" == '-c' && "$2" == 'from pathlib '* ]]; then
+  printf '%s\\n' "$FIXTURE_HERMES_PYTHON"
+  exit 0
+fi
+echo 'unexpected fixture interpreter invocation' >&2
+exit 99
+''')
+        path.chmod(0o755)
+        return path
+
+    def module97_environment(self):
+        bin_dir = self.root / 'bin'
+        self.python_stub(bin_dir / 'python3')
+        hermes = bin_dir / 'hermes'
+        hermes.write_text('#!/bin/bash\nexit 99\n')
+        hermes.chmod(0o755)
+        probes = self.root / 'probes'
+        probes.write_text('')
+        return {'HOME': str(self.root), 'PATH': str(bin_dir),
+                'FIXTURE_PROBES': str(probes),
+                'FIXTURE_HERMES_PYTHON': str(self.root / 'runtime/bin/python3')}, probes
+
+    def module97_selection(self, env, candidates=None):
+        # Execute the real selection and a recording sudo stub, never the module.
         source = (REPO / 'lib/97-dashboard-server.sh').read_text()
-        selection = source[source.index('py="'):source.index('args=(install')]
+        selection = source[source.index('dashboard_python() {'):source.index('args=(install')]
+        if candidates is not None:
+            # Inject candidates at the selector's argument boundary to cover the
+            # packaged/system slots without ever probing absolute host runtimes.
+            start = selection.index('\nif [[ -n "${HERMES_FLEET_PYTHON:-}" ]]; then')
+            end = selection.index('if [[ -n "${HERMES_FLEET_INTENT:-}"')
+            selection = selection[:start] + '\npy="$(dashboard_python "$@")"\n' + selection[end:]
         invocation = next(line.strip() for line in source.splitlines() if line.strip().startswith('sudo '))
-        script = ('set -eu\nhermes_executable="$1"\nREPO_ROOT="$2"\nargs=(fixture-only)\n'
+        script = ('set -eu\nhermes_executable="$(command -v hermes)"\nREPO_ROOT="$1"\nshift\nargs=(fixture-only)\n'
                   'sudo() { printf "%s\\n" "$@"; }\n' + selection + invocation)
-        override = self.root / 'runtime-python'
-        override.symlink_to(sys.executable)
-        result = subprocess.run(['bash', '-c', script, '_', '/fixture/hermes', str(REPO)],
-                                env={**os.environ, 'HERMES_FLEET_PYTHON': str(override)},
-                                capture_output=True, text=True)
+        return subprocess.run([shutil.which('bash'), '-c', script, '_', str(REPO),
+                               *map(str, candidates or [])], env=env, capture_output=True, text=True)
+
+    def assert_module97_selected(self, result, interpreter):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(),
-                         [str(override), str(REPO / 'scripts/desktop-dashboard.py'), 'fixture-only'])
-        result = subprocess.run(['bash', '-c', script, '_', '/fixture/hermes', str(REPO)],
-                                env={**os.environ, 'HERMES_FLEET_PYTHON': str(override),
-                                     'HERMES_FLEET_INTENT': str(self.root / 'missing')},
-                                capture_output=True, text=True)
+                         [str(interpreter), str(REPO / 'scripts/desktop-dashboard.py'), 'fixture-only'])
+
+    def test_module97_resolves_override_before_sudo(self):
+        env, probes = self.module97_environment()
+        override = self.python_stub(self.root / 'runtime-python')
+        result = self.module97_selection({**env, 'HERMES_FLEET_PYTHON': str(override)})
+        self.assert_module97_selected(result, override)
+        self.assertEqual(probes.read_text().splitlines(), [str(override)])
+
+    def test_module97_refuses_unusable_override_without_sudo_or_discovery(self):
+        env, probes = self.module97_environment()
+        no_yaml = self.python_stub(self.root / 'no-yaml', status=1)
+        non_executable = self.python_stub(self.root / 'non-executable')
+        non_executable.chmod(0o644)
+        for override in (no_yaml, self.root / 'missing', non_executable, self.root):
+            with self.subTest(override=override.name):
+                probes.write_text('')
+                result = self.module97_selection({**env, 'HERMES_FLEET_PYTHON': str(override)})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stderr.strip(),
+                    'desktop-dashboard: HERMES_FLEET_PYTHON is not an executable Python with PyYAML')
+                self.assertEqual(result.stdout, '')  # no sudo invocation
+                self.assertEqual(probes.read_text().splitlines(), [str(no_yaml)] if override == no_yaml else [])
+
+    def test_module97_missing_intent_refusal_precedes_sudo(self):
+        env, _ = self.module97_environment()
+        override = self.python_stub(self.root / 'runtime-python')
+        result = self.module97_selection({**env, 'HERMES_FLEET_PYTHON': str(override),
+                                         'HERMES_FLEET_INTENT': str(self.root / 'missing')})
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('HERMES_FLEET_INTENT file does not exist', result.stderr)
         self.assertEqual(result.stdout, '')  # no sudo invocation
+
+    def test_module97_unset_or_empty_override_preserves_discovery_order(self):
+        env, probes = self.module97_environment()
+        candidates = [self.root / 'hermes-agent/venv/bin/python3',
+                      self.root / 'hermes-agent/.venv/bin/python3',
+                      Path(env['FIXTURE_HERMES_PYTHON']), self.root / 'packaged/bin/python3',
+                      Path(env['PATH']) / 'python3']
+        for override in (None, ''):
+            run_env = env if override is None else {**env, 'HERMES_FLEET_PYTHON': override}
+            # Also cover discovery exhausting PyYAML candidates: system Python
+            # remains the final legacy fallback, as before this fix.
+            for first_valid in range(len(candidates) + 1):
+                with self.subTest(override=override, first_valid=first_valid):
+                    for index, path in enumerate(candidates):
+                        self.python_stub(path, status=int(index < first_valid))
+                    probes.write_text('')
+                    result = self.module97_selection(run_env, candidates)
+                    self.assert_module97_selected(result, candidates[min(first_valid, len(candidates) - 1)])
+                    self.assertEqual(probes.read_text().splitlines(), list(map(str, candidates[:first_valid + 1])))
+                    if first_valid < 3:
+                        # Verify production HOME/Hermes wiring too; a successful
+                        # fixture always stops selection before the absolute slot.
+                        probes.write_text('')
+                        self.assert_module97_selected(self.module97_selection(run_env), candidates[first_valid])
+                        self.assertEqual(probes.read_text().splitlines(),
+                                         list(map(str, [candidates[-1], *candidates[:first_valid + 1]])))
 
     def test_module98_revision_comes_from_resolved_candidate(self):
         # Run only candidate/revision selection, never the bootstrap module or install.
@@ -577,8 +676,120 @@ verify_check desktop-g3-marker false hermes verify_desktop_g3
         with patch.dict(sys.modules, {'yaml': None}), patch.dict(os.environ, {'HERMES_FLEET_YAML_RETRY': '1'}):
             with self.assertRaisesRegex(IntentUnavailable, 'PyYAML unavailable'):
                 parse('hosts:\n  - hostname: mac\n')
-        with patch.dict(sys.modules, {'yaml': None}), patch.dict(os.environ, {'HERMES_FLEET_PYTHON': sys.executable}):
+        override = self.yaml_interpreter_fixture()
+        with patch.dict(sys.modules, {'yaml': None}), patch.dict(os.environ, {'HERMES_FLEET_PYTHON': str(override)}), \
+             patch.object(common.shutil, 'which', side_effect=AssertionError('unexpected interpreter discovery')):
             self.assertEqual(parse('hosts:\n  - hostname: mac\n')['hosts'][0]['hostname'], 'mac')
+
+    def yaml_interpreter_fixture(self):
+        # A wrapper preserves venv context; a symlink to its Python does not.
+        # Probe the dependency explicitly instead of assuming the runner has it.
+        for candidate in dict.fromkeys((sys.executable, shutil.which('python3'), '/usr/bin/python3')):
+            if not candidate or not os.access(candidate, os.X_OK):
+                continue
+            if subprocess.run([candidate, '-c', 'import yaml'], capture_output=True).returncode == 0:
+                wrapper = self.root / 'yaml-python'
+                wrapper.write_text('#!/bin/sh\nexec ' + shlex.quote(candidate) + ' "$@"\n')
+                wrapper.chmod(0o755)
+                return wrapper
+        self.fail('YAML parser fixtures require a Python with PyYAML')
+
+    def test_yaml_override_refuses_invalid_interpreter_even_for_legacy(self):
+        no_yaml = self.root / 'no-yaml'
+        no_yaml.write_text('#!/bin/sh\nexit 1\n')
+        no_yaml.chmod(0o755)
+        non_executable = self.root / 'non-executable'
+        non_executable.write_text('#!/bin/sh\nexit 0\n')
+        non_executable.chmod(0o644)
+        bad_executable = self.root / 'bad-executable'
+        bad_executable.write_text('#!/missing/fixture/interpreter\n')
+        bad_executable.chmod(0o755)
+        intent = self.root / 'legacy.yaml'
+        intent.write_text('hosts:\n  - hostname: mac\n')
+        selected_json = self.root / 'selected.json'
+        selected_json.write_text('{"hosts": []}')
+        # Do not let the installed parser (or any discovered runtime) bypass an
+        # explicit override. ValueError must escape optional legacy handling.
+        for override in (no_yaml, non_executable, self.root / 'missing', self.root, bad_executable):
+            with self.subTest(override=override.name), \
+                 patch.dict(os.environ, {'HERMES_FLEET_PYTHON': str(override), 'HERMES_FLEET_INTENT': str(intent)}), \
+                 patch.object(common.shutil, 'which', side_effect=AssertionError('unexpected interpreter discovery')):
+                for missing_yaml in (False, True):
+                    with patch.dict(sys.modules, {'yaml': None} if missing_yaml else {}):
+                        for selected in (intent, selected_json):
+                            with self.assertRaisesRegex(ValueError,
+                                'HERMES_FLEET_PYTHON is not an executable Python with PyYAML') as raised:
+                                optional_host_record(selected, 'mac')
+                            self.assertNotIsInstance(raised.exception, IntentUnavailable)
+
+    def test_yaml_override_preserves_parse_errors_without_fallback(self):
+        override = self.yaml_interpreter_fixture()
+        with patch.dict(os.environ, {'HERMES_FLEET_PYTHON': str(override)}), \
+             patch.object(common.shutil, 'which', side_effect=AssertionError('unexpected interpreter discovery')):
+            self.assertEqual(parse('hosts:\n  - hostname: mac\n')['hosts'][0]['hostname'], 'mac')
+            for text in ('hosts: [\n', 'hosts: []\nhosts: []\n'):
+                with self.assertRaisesRegex(ValueError, 'malformed YAML'):
+                    parse(text)
+
+    def test_desktop_entrypoints_refuse_invalid_yaml_override(self):
+        fixture_repo = self.root / 'bootstrap'
+        (fixture_repo / 'lib').mkdir(parents=True)
+        (fixture_repo / 'scripts').symlink_to(REPO / 'scripts', target_is_directory=True)
+        (fixture_repo / 'lib/common.sh').write_text('''OS=macos
+tier_allows() { return 0; }
+role_includes() { return 0; }
+is_skipped() { return 1; }
+''')
+        wrapper = fixture_repo / 'lib/98-desktop-fleet-warm.sh'
+        wrapper.write_bytes((REPO / 'lib/98-desktop-fleet-warm.sh').read_bytes())
+        bin_dir = self.root / 'bin'
+        bin_dir.mkdir()
+        python = bin_dir / 'python3'
+        python.write_text('#!/bin/sh\nexec ' + shlex.quote(sys.executable) + ' "$@"\n')
+        python.chmod(0o755)
+        (bin_dir / 'dirname').symlink_to(shutil.which('dirname'))
+        override = self.root / 'no-yaml'
+        override.write_text('#!/bin/sh\nexit 1\n')
+        override.chmod(0o755)
+        intent = self.root / 'legacy.yaml'
+        intent.write_text('hosts:\n  - hostname: mac\n')
+        env = {'HOME': str(self.root), 'PATH': str(bin_dir), 'HERMES_FLEET_PYTHON': str(override),
+               'HERMES_FLEET_INTENT': str(intent), 'HERMES_FLEET_REVISION': 'fixture',
+               'REPO_ROOT': str(fixture_repo), 'PYTHONDONTWRITEBYTECODE': '1'}
+        bash = shutil.which('bash')
+        verify = 'source "$1/verify.sh"; hostname() { echo mac; }; verify_desktop_g3'
+        plan = self.root / 'plan.json'
+        plan.write_text('{"schema": 1, "host": "mac"}')
+        commands = ([bash, str(wrapper)], [bash, '-c', verify, '_', str(REPO)],
+                    [str(python), str(REPO / 'scripts/desktop-gateway-apply.py'), '--plan-file', str(plan),
+                     '--registry', str(intent), '--root', str(self.root / 'gateway')])
+        for command in commands:
+            with self.subTest(command=command):
+                result = subprocess.run(command, env=env, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('HERMES_FLEET_PYTHON is not an executable Python with PyYAML', result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertFalse((self.root / '.hermes').exists())
+                self.assertFalse((self.root / 'gateway').exists())
+
+    def test_yaml_unset_or_empty_override_preserves_discovery_order(self):
+        candidates = [str(self.root / 'hermes-agent/venv/bin/python3'),
+                      str(self.root / 'hermes-agent/.venv/bin/python3'),
+                      str(self.root / 'runtime/bin/python3'), '/usr/local/lib/hermes-agent/venv/bin/python3']
+        for override in (None, ''):
+            for first_valid in range(len(candidates)):
+                with self.subTest(override=override, first_valid=first_valid), \
+                     patch.dict(os.environ, {'HERMES_FLEET_PYTHON': ''}), \
+                     patch.dict(sys.modules, {'yaml': None}), \
+                     patch.object(common.shutil, 'which', return_value=str(self.root / 'runtime/bin/hermes')), \
+                     patch.object(common.os, 'access', return_value=True), \
+                     patch.object(common.subprocess, 'run') as run:
+                    if override is None:
+                        os.environ.pop('HERMES_FLEET_PYTHON')
+                    run.side_effect = [SimpleNamespace(returncode=1, stderr='IntentUnavailable')] * first_valid + [
+                        SimpleNamespace(returncode=0, stdout='{"hosts": []}')]
+                    self.assertEqual(parse('hosts: []\n'), {'hosts': []})
+                    self.assertEqual([call.args[0][0] for call in run.call_args_list], candidates[:first_valid + 1])
 
 
 if __name__ == '__main__':

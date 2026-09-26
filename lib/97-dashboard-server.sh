@@ -15,16 +15,35 @@ platform=linux
 # A held row returns successfully even before a runtime has been installed.
 hermes_executable="$(command -v hermes || true)"
 # Resolve PyYAML in the invoking runtime's environment before sudo resets it.
-py="$(command -v python3)"
-hermes_python="$("$py" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent / "python3")' "$hermes_executable")"
-for candidate in "${HERMES_FLEET_PYTHON:-}" "$HOME/hermes-agent/venv/bin/python3" \
-  "$HOME/hermes-agent/.venv/bin/python3" "$hermes_python" \
-  /usr/local/lib/hermes-agent/venv/bin/python3 "$py"; do
-  if [[ -n "$candidate" && -x "$candidate" ]] && "$candidate" -c 'import yaml' >/dev/null 2>&1; then
-    py="$candidate"
-    break
+dashboard_python() {
+  local candidate
+  if [[ -n "${HERMES_FLEET_PYTHON:-}" ]]; then
+    candidate="$HERMES_FLEET_PYTHON"
+    if [[ ! -f "$candidate" || ! -x "$candidate" ]] || ! "$candidate" -c 'import yaml' >/dev/null 2>&1; then
+      echo 'desktop-dashboard: HERMES_FLEET_PYTHON is not an executable Python with PyYAML' >&2
+      return 1
+    fi
+    printf '%s\n' "$candidate"
+    return 0
   fi
-done
+  # Arguments are the ordered discovery candidates; the last is the system Python.
+  for candidate in "$@"; do
+    if [[ -n "$candidate" && -x "$candidate" ]] && "$candidate" -c 'import yaml' >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  printf '%s\n' "${!#}"
+}
+if [[ -n "${HERMES_FLEET_PYTHON:-}" ]]; then
+  py="$(dashboard_python)"
+else
+  py="$(command -v python3)"
+  hermes_python="$("$py" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent / "python3")' "$hermes_executable")"
+  py="$(dashboard_python "$HOME/hermes-agent/venv/bin/python3" \
+    "$HOME/hermes-agent/.venv/bin/python3" "$hermes_python" \
+    /usr/local/lib/hermes-agent/venv/bin/python3 "$py")"
+fi
 if [[ -n "${HERMES_FLEET_INTENT:-}" && ! -e "$HERMES_FLEET_INTENT" ]]; then
   echo 'desktop-dashboard: HERMES_FLEET_INTENT file does not exist' >&2
   exit 1
