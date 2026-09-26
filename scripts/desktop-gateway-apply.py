@@ -153,8 +153,9 @@ def main():
     if service_changed:
         if any(name == supervisor.unit for name, *_ in changes):
             actions.append({'action': 'daemon-reload', 'service': supervisor.service})
-        actions += [{'action': 'enable', 'service': supervisor.service},
-                    {'action': 'restart' if state['pid'] else 'start', 'service': supervisor.service}]
+        if not state['loaded']:
+            actions.append({'action': 'enable', 'service': supervisor.service})
+        actions.append({'action': 'restart' if state['pid'] else 'start', 'service': supervisor.service})
     # Preflight all backup conflicts before any file writes. Never replace a prior backup.
     for name, old, _, _ in changes:
         backup = rooted(root, backup_dir + name)

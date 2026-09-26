@@ -89,6 +89,13 @@ class Fixtures(unittest.TestCase):
             with self.assertRaises(ValueError):
                 supervisor.check(9000)
 
+    def test_refresh_preserves_existing_service_enablement(self):
+        run = Mock()
+        supervisor = dashboard.Supervisor('linux', 'existing-dashboard.service', '/unit', 0, run)
+        supervisor.refresh({'loaded': True, 'pid': 41}, unit_changed=True)
+        self.assertEqual([call.args[0] for call in run.call_args_list],
+                         [['systemctl', 'daemon-reload'], ['systemctl', 'restart', 'existing-dashboard.service']])
+
     def test_mac_hidden_listener_is_not_adopted(self):
         run = Mock(side_effect=[subprocess.CalledProcessError(113, 'launchctl'),
                                subprocess.CalledProcessError(1, 'lsof'),

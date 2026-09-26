@@ -134,7 +134,8 @@ class Supervisor:
         else:
             if unit_changed:
                 self.run(['systemctl', 'daemon-reload'])
-            self.run(['systemctl', 'enable', self.service])
+            if not state['loaded']:
+                self.run(['systemctl', 'enable', self.service])
             self.run(['systemctl', 'restart' if state['pid'] else 'start', self.service])
 
 
