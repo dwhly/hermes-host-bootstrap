@@ -206,7 +206,7 @@ seed_model_config() {
   mkdir -p "$HERMES_HOME_DIR"
 
   provider="${HERMES_MODEL_PROVIDER:-openrouter}"
-  model="${HERMES_MODEL_DEFAULT:-${HERMES_DEFAULT_MODEL:-openai/gpt-5.5}}"
+  model="${HERMES_MODEL_DEFAULT:-${HERMES_DEFAULT_MODEL:-~anthropic/claude-opus-latest}}"  # floating id; setdefault below never overwrites an existing host
   base_url="${HERMES_MODEL_BASE_URL:-https://openrouter.ai/api/v1}"
   api_mode="${HERMES_MODEL_API_MODE:-chat_completions}"
 
