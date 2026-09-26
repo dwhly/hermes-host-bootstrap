@@ -26,6 +26,7 @@ HOSTS_DIR="${HERMES_FLEET_HOSTS_DIR:-${HERMES_HOME:-$HOME/.hermes}/hosts}"
 INTENT="${HERMES_FLEET_INTENT:-${HERMES_HOME:-$HOME/.hermes}/fleet/hosts.yaml}"
 POLICY_HELPER="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent / "scripts/desktop-fleet-policy.py")' "${BASH_SOURCE[0]}")"
 DEPLOY_NODE="$BOOTSTRAP_SRC/deploy-node.sh"
+SSH_OPTIONS=(-o BatchMode=yes -o ConnectTimeout=12 -o ServerAliveInterval=10 -o StrictHostKeyChecking=accept-new)
 
 log() { printf '\033[36m[fleet-upgrade %s]\033[0m %s\n' "$1" "$2" >&2; }
 err() { printf '\033[31m[fleet-upgrade %s] ERROR:\033[0m %s\n' "$1" "$2" >&2; }
@@ -56,6 +57,15 @@ host_spec() {  # host_spec <host> -> echoes "ssh_target|oskind" or returns 2
   printf '%s|%s' "$ssh_target" "$oskind"
 }
 
+local_marker_status() {
+  if [[ -e /etc/hermes/image-provenance.json || -L /etc/hermes/image-provenance.json ]]; then
+    return 3
+  elif [[ ! -r /etc || ! -x /etc || ( -d /etc/hermes && ( ! -r /etc/hermes || ! -x /etc/hermes ) ) ]]; then
+    return 4
+  fi
+  return 0
+}
+
 # Returns 3 for protected, 1 for indeterminate. No update or refresh precedes this.
 check_protection() {
   local host="$1" policy spec ssh_target rc=0
@@ -69,16 +79,18 @@ check_protection() {
   spec="$(host_spec "$host")" || return 1
   ssh_target="${spec%%|*}"
   if [[ -z "$ssh_target" ]]; then
-    if [[ -e /etc/hermes/image-provenance.json || -L /etc/hermes/image-provenance.json ]]; then
-      rc=3
-    elif [[ ! -r /etc || ! -x /etc || ( -d /etc/hermes && ( ! -r /etc/hermes || ! -x /etc/hermes ) ) ]]; then
-      rc=4
-    fi
+    local_marker_status || rc=$?
   else
     # Presence (even malformed/unreadable) is protected. Failure to establish absence
     # is indeterminate. No sudo, update, gateway refresh, or deploy-node in this probe.
-    ssh -o BatchMode=yes -o ConnectTimeout=12 "$ssh_target" \
-      'if test -e /etc/hermes/image-provenance.json || test -L /etc/hermes/image-provenance.json; then exit 3; elif test ! -r /etc || test ! -x /etc || { test -d /etc/hermes && { test ! -r /etc/hermes || test ! -x /etc/hermes; }; }; then exit 4; else exit 0; fi' || rc=$?
+    local attempt
+    for attempt in 1 2; do
+      rc=0
+      ssh "${SSH_OPTIONS[@]}" "$ssh_target" \
+        'if test -e /etc/hermes/image-provenance.json || test -L /etc/hermes/image-provenance.json; then exit 3; elif test ! -r /etc || test ! -x /etc || { test -d /etc/hermes && { test ! -r /etc/hermes || test ! -x /etc/hermes; }; }; then exit 4; else exit 0; fi' || rc=$?
+      [[ "$rc" == 255 && "$attempt" == 1 ]] || break
+      sleep 3
+    done
   fi
   if [[ "$rc" == 3 ]]; then
     log "$host" "protected (image-provenance marker); owner maintenance required"
@@ -117,7 +129,7 @@ upgrade_one() {  # returns 0 ok, 1 problem
     return 1
   fi
 
-  local SSH=(ssh -o ConnectTimeout=12 -o ServerAliveInterval=10 -o StrictHostKeyChecking=accept-new "$ssh_target")
+  local SSH=(ssh "${SSH_OPTIONS[@]}" "$ssh_target")
 
   # reachability (Macs sleep) — two attempts; the first often just wakes it
   if ! "${SSH[@]}" 'true' 2>/dev/null; then
@@ -194,4 +206,6 @@ main() {
   fi
   exit $rc
 }
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
