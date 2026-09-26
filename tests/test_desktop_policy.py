@@ -159,6 +159,21 @@ class PolicyTests(unittest.TestCase):
                                 capture_output=True)
         self.assertNotEqual(result.returncode, 0)
 
+    def test_missing_host_is_legacy_only_in_undeclared_intent(self):
+        fixture = REPO / 'tests/fixtures/desktop-missing-hosts.yaml'
+        self.assertEqual(optional_host_record(fixture, 'new-mac'), {})
+        events, host = self.run_entry(host='new-mac', intent=fixture)
+        self.assertEqual(host, 'new-mac')
+        self.assertEqual(events, ['check', 'install'])
+        intent = parse(fixture.read_text())
+        path = self.root / 'declared.json'
+        for declaration in ({'complete': False}, {'hosts': [dict(intent['hosts'][0], update_policy='eligible')]}):
+            path.write_text(json.dumps({**intent, **declaration}))
+            with self.assertRaisesRegex(ValueError, 'exactly one host record'):
+                optional_host_record(path, 'new-mac')
+            with self.assertRaisesRegex(ValueError, 'exactly one host record'):
+                self.run_entry(host='new-mac', intent=path)
+
     def test_marker_requires_explicit_module97_protected_authorization(self):
         for record in ({'hostname': 'actual'}, {'hostname': 'actual', 'update_policy': 'eligible'},
                        {'hostname': 'actual', 'update_policy': 'protected'}):

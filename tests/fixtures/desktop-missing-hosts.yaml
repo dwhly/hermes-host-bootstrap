@@ -1,0 +1,5 @@
+# A newly bootstrapped Mac is not yet listed in this undeclared Intent.
+hosts:
+  - hostname: h-mini
+    role: both
+    form_factor: desktop

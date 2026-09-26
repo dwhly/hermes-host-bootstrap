@@ -100,6 +100,10 @@ if FIXTURE_MARKER_RC=255 bash "$ROOT/fleet-upgrade.sh" mac >"$TMP/unknown.out" 2
 fi
 grep -q 'indeterminate' "$TMP/unknown.out" || fail 'unknown marker state not explicit'
 ! grep -q 'hermes update' "$FIXTURE_LOG" || fail 'unknown marker state mutated host'
+cp "$ROOT/tests/fixtures/desktop-missing-hosts.yaml" "$TMP/intent.json"
+: >"$FIXTURE_LOG"
+bash "$ROOT/fleet-upgrade.sh" mac >"$TMP/missing-legacy.out" 2>&1 || fail 'missing host in undeclared Intent blocked'
+grep -q 'hermes update' "$FIXTURE_LOG" || fail 'undeclared missing host did not take legacy flow'
 printf '%s\n' '{"complete":false,"hosts":[]}' >"$TMP/intent.json"
 : >"$FIXTURE_LOG"
 if bash "$ROOT/fleet-upgrade.sh" mac >"$TMP/no-policy.out" 2>&1; then
