@@ -9,7 +9,7 @@ export PYTHONPATH="/usr/local/lib/hermes-host-bootstrap:${PYTHONPATH:-}"
 PY=""
 for cand in \
   /root/code/chief/hermes-node/.venv/bin/python \
-  "$HOME/code/chief/hermes-node/.venv/bin/python" \
+  "${HOME:-/var/empty}/code/chief/hermes-node/.venv/bin/python" \
   /Users/*/code/chief/hermes-node/.venv/bin/python; do
   if [[ -x "$cand" ]]; then PY="$cand"; break; fi
 done
