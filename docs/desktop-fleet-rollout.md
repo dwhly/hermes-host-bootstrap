@@ -25,6 +25,7 @@ build and review perform only fixture checks; they do not authorize host changes
    Subsequent healthy, identical applies do nothing; owned credential/public-URL
    changes refresh the service, and failed refreshes retry on the next apply.
    Credential digests are stored mode 0600 (root-owned on Linux, user-owned on Mac).
+   On a Mac bootstrapped over SSH without a GUI session, module 97 may fail at launchd bootstrap; log in and reapply to retry the pending refresh.
 4. The Mac launcher moves from `/usr/local/bin` to `~/.local/bin`; the old copy is
    left unused and may be removed only after checking for other references. Linux
    retains tailscaled ordering, startup limits and `/root/.local/bin` PATH coverage.
