@@ -1,7 +1,7 @@
 [Unit]
 Description=Chief node daemon
 Wants=network-online.target
-After=network-online.target chief-node-reconcile.service
+After=network-online.target
 StartLimitIntervalSec=600
 StartLimitBurst=5
 

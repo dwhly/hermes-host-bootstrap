@@ -1,0 +1,11 @@
+[Unit]
+Description=Chief minute pulse, five-minute normal checks
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=60s
+AccuracySec=1s
+Unit=chief-update.service
+
+[Install]
+WantedBy=timers.target

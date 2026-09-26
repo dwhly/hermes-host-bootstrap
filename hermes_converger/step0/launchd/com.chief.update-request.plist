@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>com.chief.node-reconcile</string>
+	<string>com.chief.update-request</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/usr/local/bin/hermes-converger</string>
@@ -11,10 +11,19 @@
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardErrorPath</key>
-	<string>/var/log/com.chief.node-reconcile.err</string>
+	<string>/var/log/com.chief.update-request.err</string>
 	<key>StandardOutPath</key>
-	<string>/var/log/com.chief.node-reconcile.log</string>
+	<string>/var/log/com.chief.update-request.log</string>
+	<key>StartCalendarInterval</key>
+	<dict/>
 	<key>ThrottleInterval</key>
 	<integer>15</integer>
+	<key>WatchPaths</key>
+	<array>
+		<string>/var/lib/chief/requests/login</string>
+		<string>/var/lib/chief/requests/wake</string>
+		<string>/var/lib/chief/requests/network</string>
+		<string>/var/lib/chief/requests/request</string>
+	</array>
 </dict>
 </plist>

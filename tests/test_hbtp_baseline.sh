@@ -231,7 +231,8 @@ grep -qx 'WantedBy=multi-user.target' "$UNIT" || fail "install target missing"
 ! grep -Eq '^(Requires|ExecStartPre|ExecStartPost)=' "$UNIT" || fail "h-btp unit contains forbidden requirement/hook"
 ! grep -Eq 'reconcile|supervisor|converger' "$UNIT" || fail "h-btp unit contains convergence coupling"
 
-grep -q 'chief-node-reconcile.service' "$ROOT/systemd/chief-node.service" || fail "existing converging unit no longer references reconcile"
+! grep -Eq '^(Requires|After|Before)=.*chief-node-reconcile' "$ROOT/systemd/chief-node.service" || fail "Chief startup depends on convergence"
+grep -qx 'WantedBy=multi-user.target' "$ROOT/systemd/chief-node-reconcile.service" || fail "independent boot reconcile missing"
 grep -qx 'Group=chief' "$ROOT/systemd/chief-node.service" || fail "existing converging unit group changed"
 
 pass "h-btp verifier notes and telemetry-only unit contract"

@@ -1,5 +1,5 @@
 [Unit]
-Description=Chief legacy convergence request
+Description=Chief Step 0 pulse (wake and network return)
 After=network-online.target
 
 [Service]

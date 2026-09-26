@@ -1,0 +1,44 @@
+{
+  "h-mini2": {
+    "CHIEF_NODE_ID": "h-mini2",
+    "CHIEF_CORE_URL": "http://100.122.202.37:8088",
+    "fqdn": "h-mini2",
+    "runtime_user": "dano"
+  },
+  "h-mini": {
+    "CHIEF_NODE_ID": "h-mini",
+    "CHIEF_CORE_URL": "http://100.122.202.37:8088",
+    "fqdn": "h-mini",
+    "runtime_user": "danz"
+  },
+  "h-air2": {
+    "CHIEF_NODE_ID": "h-air2",
+    "CHIEF_CORE_URL": "http://100.122.202.37:8088",
+    "fqdn": "h-air2",
+    "runtime_user": "dano"
+  },
+  "h-air": {
+    "CHIEF_NODE_ID": "h-air",
+    "CHIEF_CORE_URL": "http://100.122.202.37:8088",
+    "fqdn": "MacBook-Air-8.local",
+    "runtime_user": "danz"
+  },
+  "h-do1": {
+    "CHIEF_NODE_ID": "h-do1",
+    "CHIEF_CORE_URL": "http://100.122.202.37:8088",
+    "fqdn": "h-do1",
+    "runtime_user": "root"
+  },
+  "h-af": {
+    "CHIEF_NODE_ID": "h-af",
+    "CHIEF_CORE_URL": "http://100.122.202.37:8088",
+    "fqdn": "h-af.tailb554cd.ts.net",
+    "runtime_user": "root"
+  },
+  "h-btp": {
+    "CHIEF_NODE_ID": "h-btp",
+    "CHIEF_CORE_URL": "http://100.122.202.37:8088",
+    "fqdn": "h-btp.tailb554cd.ts.net",
+    "runtime_user": "root"
+  }
+}

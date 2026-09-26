@@ -1,6 +1,5 @@
 [Unit]
-Description=Chief legacy convergence request
-After=network-online.target
+Description=Chief coalesced request pulse
 
 [Service]
 Type=oneshot

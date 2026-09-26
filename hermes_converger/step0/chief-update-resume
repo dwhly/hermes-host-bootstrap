@@ -1,0 +1,3 @@
+#!/bin/sh
+# systemd-sleep passes exactly 'post <sleep-operation>' after resume.
+case "${1:-}" in post) printf 'wake\n' > /var/lib/chief/requests/wake;; esac
