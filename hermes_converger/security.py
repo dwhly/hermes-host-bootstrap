@@ -6,6 +6,8 @@ import os
 import pathlib
 import re
 import stat
+import subprocess
+import sys
 import urllib.parse
 
 
@@ -13,17 +15,34 @@ class TrustError(RuntimeError):
     pass
 
 
-def trusted_path(path: pathlib.Path, *, tree: bool = False) -> None:
+def trusted_path(path: pathlib.Path, *, tree: bool = False, _depth: int = 0,
+                 _walked: set[str] | None = None) -> None:
+    if _depth >= 64:
+        raise TrustError("trust_path_cycle")
     path = path.absolute()
     for item in (*reversed(path.parents), path):
         info = item.lstat()
         if info.st_uid != 0 or (not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022):
             raise TrustError(f"untrusted_path:{item}")
+        if sys.platform == "darwin":
+            listing = subprocess.run(["/bin/ls", "-lde", str(item)], capture_output=True, text=True, check=True).stdout
+            if "+" in listing.split()[0] or re.search(r"^\s*[0-9]+:", listing, re.MULTILINE):
+                raise TrustError(f"untrusted_acl:{item}")
         if item.is_symlink():
-            trusted_path(item.resolve(strict=True))
+            target = pathlib.Path(os.readlink(item))
+            if not target.is_absolute():
+                target = item.parent / target
+            # Do not collapse away an untrusted intermediate symlink parent.
+            trusted_path(target, _depth=_depth + 1)
     if tree and path.is_dir():
+        walked = _walked if _walked is not None else set()
+        real = str(path.resolve(strict=True))
+        if real in walked:
+            return
+        walked.add(real)
         for item in path.rglob("*"):
-            trusted_path(item)
+            trusted_path(item, tree=item.is_symlink() and item.is_dir(),
+                         _depth=_depth + 1, _walked=walked)
 
 
 def read_env(path: pathlib.Path) -> dict[str, str]:
@@ -54,7 +73,9 @@ def validate_config(data: dict[str, str]) -> dict[str, str]:
 
 def resolve_config(existing: dict[str, str] | None, hostname: str, registry: dict) -> dict[str, str]:
     """Registry snapshot shipped as reviewed code; existing root config is checked."""
-    matches = [v for k, v in registry.items() if hostname in (k, v["fqdn"], v["fqdn"].split(".")[0])]
+    matches = [v for k, v in registry.items() if hostname.split(".")[0] in (k, v["fqdn"].split(".")[0])]
+    if not matches and existing and existing.get("CHIEF_NODE_ID") in registry:
+        matches = [registry[existing["CHIEF_NODE_ID"]]]
     if len(matches) != 1:
         raise TrustError(f"host_not_in_trusted_registry:{hostname}")
     record = matches[0]

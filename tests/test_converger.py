@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import pathlib
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -438,12 +439,12 @@ def test_macos_hermes_node_restart_uses_launchd_gui_domain(tmp_path, monkeypatch
     ops = core.HostOps(core.LocalState(tmp_path), DummyTransport())
     calls = []
     monkeypatch.setattr(core, "_resolve_tool", lambda name: name)
-    monkeypatch.setattr(core.subprocess, "run", lambda cmd, *a, **kw: calls.append(cmd))
+    monkeypatch.setattr(core.subprocess, "run", lambda cmd, *a, **kw: calls.append(cmd) or SimpleNamespace(returncode=0))
 
     assert core.unit_for("chief-node") == "com.chief.node"
     ops.restart_units(verified)
 
-    assert calls == [["launchctl", "kickstart", "-k", "gui/501/com.chief.node"]]
+    assert calls == [["launchctl", "print", "gui/501"], ["launchctl", "kickstart", "-k", "gui/501/com.chief.node"]]
 
 
 @pytest.mark.parametrize("is_macos", [False, True])
@@ -470,6 +471,7 @@ def test_macos_reload_records_signal_time_before_launchd_kickstart(tmp_path, mon
         assert "chief-node" in data
         assert data["chief-node"]["config"]
         calls.append(cmd)
+        return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(core, "_resolve_tool", lambda name: name)
     monkeypatch.setattr(core.subprocess, "run", capture_run)
@@ -477,7 +479,7 @@ def test_macos_reload_records_signal_time_before_launchd_kickstart(tmp_path, mon
     reload_at = ops.record_reload_and_signal(verified)
 
     assert json.loads(stamp.read_text())["chief-node"]["config"] == reload_at
-    assert calls == [["launchctl", "kickstart", "-k", "gui/501/com.chief.node"]]
+    assert calls == [["launchctl", "print", "gui/501"], ["launchctl", "kickstart", "-k", "gui/501/com.chief.node"]]
 
 
 def test_macos_runtime_stamp_roots_honor_fixed_env_override(monkeypatch):
@@ -621,3 +623,38 @@ def test_transport_emit_posts_observations_endpoint(tmp_path, monkeypatch):
 
     assert captured["url"] == "http://core.example/v1/observations"
     assert captured["body"]["type"] == "hermes.fleet.convergence.started"
+
+
+def test_exception_restore_happens_before_lease_release(monkeypatch):
+    import contextlib
+    ops = FailingOps()
+    held = []
+    @contextlib.contextmanager
+    def lease(*a, **kw):
+        held.append(True)
+        try:
+            yield
+        finally:
+            held.pop()
+    ops.state.convergence_lease = lease
+    ops.fetch = lambda _: (_ for _ in ()).throw(RuntimeError("fixture apply failure"))
+    restored = []
+    def restore(plan, observed_ops):
+        assert held and observed_ops is ops
+        restored.append(True)
+        return True
+    monkeypatch.setattr(core, "attempt_rollback_once", restore)
+    assert core.execute_plan(verify(make_plan()), ops, fresh_idle_snapshot()) == "rolled_back"
+    assert restored == [True] and not held
+
+
+def test_macos_converger_defers_restart_without_gui(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "IS_MACOS", True)
+    monkeypatch.setattr(core, "_launchd_target", lambda *a: "gui/502/com.chief.node")
+    monkeypatch.setattr(core, "_resolve_tool", lambda n: n)
+    calls = []
+    monkeypatch.setattr(core.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or SimpleNamespace(returncode=113))
+    ops = core.HostOps(core.LocalState(tmp_path), DummyTransport())
+    with pytest.raises(core.Deferred, match="gui_unavailable"):
+        ops.restart_units(verify(make_plan()))
+    assert calls == [["launchctl", "print", "gui/502"]]

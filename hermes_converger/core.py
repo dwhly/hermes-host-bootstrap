@@ -918,6 +918,15 @@ class HostOps:
             cmd = [uv, "pip", "install", "--python", ".venv/bin/python", "-q", "-e", "../chief-spec/sdk/python", "-e", "."]
             self.run_artifact(cmd, cwd, env=_tool_subprocess_env(), check=True)
 
+    def _restart_launchd(self, token: str, unit: str) -> None:
+        target = _launchd_target(token, unit)
+        if target.startswith("gui/"):
+            probe = subprocess.run([_resolve_tool("launchctl"), "print", target.rsplit("/", 1)[0]],
+                                   check=False, capture_output=True, text=True)
+            if probe.returncode:
+                raise Deferred("gui_unavailable")
+        subprocess.run([_resolve_tool("launchctl"), "kickstart", "-k", target], check=True)
+
     def restart_units(self, plan: VerifiedPlan) -> None:
         guard_mutation()
         for token in plan.restart_units:
@@ -925,7 +934,7 @@ class HostOps:
             unit = unit_for(token)
             self.journal_before("restart", {"unit": unit, "token": token})
             if IS_MACOS and token not in DOCKER_TOKENS:
-                subprocess.run([_resolve_tool("launchctl"), "kickstart", "-k", _launchd_target(token, unit)], check=True)
+                self._restart_launchd(token, unit)
             elif unit.endswith(".service"):
                 subprocess.run([_resolve_tool("systemctl"), "restart", unit], check=True)
             else:
@@ -946,7 +955,7 @@ class HostOps:
             unit = unit_for(token)
             self.journal_before("signal_reload", {"process": unit, "token": token})
             if IS_MACOS and token not in DOCKER_TOKENS:
-                subprocess.run([_resolve_tool("launchctl"), "kickstart", "-k", _launchd_target(token, unit)], check=True)
+                self._restart_launchd(token, unit)
             elif unit.endswith(".service"):
                 subprocess.run([_resolve_tool("systemctl"), "kill", "-s", "HUP", unit], check=True)
         return reload_at
@@ -1072,16 +1081,23 @@ def execute_plan(
             if not inside.idle:
                 ops.emit("deferred", plan, reason="accepted_work_after_idle_check", idle_snapshot=inside.probes)
                 return "deferred"
-            ops.fetch(plan)
-            ops.emit("fetched", plan)
-            ops.install_restart_required(plan)
-            ops.restart_units(plan)
-            proof = ops.poll_runtime_ack(plan, iso_now())
-            if proof:
-                ops.emit("applied", plan, verification=proof)
-                mark_success()
-                return "applied"
-            ops.emit("failed", plan, reason="steady_health_timeout", verification=None)
+            try:
+                ops.fetch(plan)
+                ops.emit("fetched", plan)
+                ops.install_restart_required(plan)
+                ops.restart_units(plan)
+                proof = ops.poll_runtime_ack(plan, iso_now())
+                if proof:
+                    ops.emit("applied", plan, verification=proof)
+                    mark_success()
+                    return "applied"
+                ops.emit("failed", plan, reason="steady_health_timeout", verification=None)
+            except Deferred:
+                raise
+            except Exception as exc:
+                ops.emit("failed", plan, reason=type(exc).__name__, verification=None)
+            # Keep the lease across the immediate single restore, including
+            # exception failures. Never restore after releasing admission.
             rolled = attempt_rollback_once(plan, ops)
             if rolled:
                 mark_success()
@@ -1091,10 +1107,7 @@ def execute_plan(
         return "deferred"
     except Exception as exc:
         ops.emit("failed", plan, reason=type(exc).__name__, verification=None)
-        rolled = attempt_rollback_once(plan, ops)
-        if rolled:
-            mark_success()
-        return "rolled_back" if rolled else "failed"
+        return "failed"
 
 
 def attempt_rollback_once(plan: VerifiedPlan, ops: HostOps) -> bool:
