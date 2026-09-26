@@ -1,134 +1,39 @@
 #!/usr/bin/env bash
-# 97-dashboard-server: serve the Hermes web dashboard (`hermes dashboard`) over
-# the tailnet as a durable service on EVERY fleet host — systemd on Linux,
-# launchd (per-user LaunchAgent) on macOS. Port 9000 fleet-wide.
-#
-# WHY: `hermes dashboard` binds 127.0.0.1 by default and — in current versions —
-# REFUSES a non-loopback bind unless an auth provider is configured (it exposes
-# API keys). The fleet configures the basic_auth dashboard plugin via env vars
-# sourced from the host's local ~/.hermes/.env (HERMES_DASHBOARD_BASIC_AUTH_*,
-# resolved from the 1Password DashboardAuth-fleet item by op inject in
-# lib/35-secrets.sh — NOT stored in the fleet-synced config.yaml). The auth gate
-# then permits the tailnet bind behind a login prompt. Running it by hand dies on
-# restart; this module makes it a first-class service (Restart=always / KeepAlive)
-# so every node's dashboard is always reachable at http://<tailnet-ip>:9000.
-#
-# Skip key: dashboard-server.
-#
-# PREREQ: HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH + _SECRET must resolve into
-# ~/.hermes/.env (needs the DashboardAuth-fleet 1Password item + a secrets run).
-# This module installs the service regardless; it warns if auth looks unset.
-
+# Render/compare before refreshing the owned dashboard. Never adopt an occupied socket.
 set -euo pipefail
+MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="${REPO_ROOT:-$(cd "$MODULE_DIR/.." && pwd)}"
 # shellcheck disable=SC1091
-source "$(dirname "$0")/common.sh"
-# REPO_ROOT is exported by bootstrap.sh; self-derive so the module can run standalone.
-REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-
-PORT="${HERMES_DASHBOARD_PORT:-9000}"
-
-step "Hermes web dashboard server (port ${PORT})"
-
-# Recommended tier (R): part of the observability surface, not a base essential.
-if ! tier_allows R; then
-  skip "dashboard-server skipped (tier below R)"
+source "$REPO_ROOT/lib/common.sh"
+step "Hermes dashboard server"
+if ! tier_allows R || is_skipped dashboard-server; then
+  skip "dashboard-server skipped"
   return 0 2>/dev/null || exit 0
 fi
-
-if is_skipped dashboard-server; then
-  skip "dashboard-server skipped (HERMES_SKIP includes dashboard-server)"
-  return 0 2>/dev/null || exit 0
-fi
-
-# Runs on EVERY fleet host (each node gets its own dashboard at :PORT). No role
-# gate — clients and the server all expose their own local dashboard.
-
-# Warn (don't fail) if the dashboard auth env vars aren't resolved yet — the
-# tailnet bind will be refused until they are.
-HERMES_ENV="${HERMES_HOME:-$HOME/.hermes}/.env"
-if [[ -f "$HERMES_ENV" ]] \
-   && ! grep -q '^HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=*** "$HERMES_ENV" 2>/dev/null \
-   && ! grep -q '^HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH=*** "$HERMES_ENV" 2>/dev/null; then
-  warn "no dashboard password (HERMES_DASHBOARD_BASIC_AUTH_PASSWORD or _PASSWORD_HASH) found in $HERMES_ENV — the tailnet bind will be REFUSED until the dashboard auth secret resolves. Ensure the DashboardAuth-fleet 1Password item exists and re-run the secrets module (r --only=35-secrets)."
-fi
-
-# --- macOS: per-user LaunchAgent -----------------------------------------------
-if [[ "$OS" == "macos" ]]; then
-  home="$HOME"
-  label="com.hermes.dashboard-server"
-  agent_dir="$home/Library/LaunchAgents"
-  plist_dst="$agent_dir/$label.plist"
-
-  # Install the launcher into a user-writable, on-PATH location. Macs typically
-  # can't write /usr/local/bin and sudo needs a TTY (unavailable over SSH), so
-  # prefer ~/.local/bin (already on PATH for the fleet user).
-  if [[ -w /usr/local/bin ]]; then
-    launcher_dst="/usr/local/bin/hermes-dashboard-server"
-  else
-    mkdir -p "$home/.local/bin"
-    launcher_dst="$home/.local/bin/hermes-dashboard-server"
+platform=linux
+[[ "$OS" != macos ]] || platform=macos
+hermes_executable="$(command -v hermes)"
+# Resolve PyYAML in the invoking runtime's environment before sudo resets it.
+py="$(command -v python3)"
+hermes_python="$("$py" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent / "python3")' "$hermes_executable")"
+for candidate in "${HERMES_FLEET_PYTHON:-}" "$HOME/hermes-agent/venv/bin/python3" \
+  "$HOME/hermes-agent/.venv/bin/python3" "$hermes_python" \
+  /usr/local/lib/hermes-agent/venv/bin/python3 "$py"; do
+  if [[ -n "$candidate" && -x "$candidate" ]] && "$candidate" -c 'import yaml' >/dev/null 2>&1; then
+    py="$candidate"
+    break
   fi
-  info "installing $launcher_dst"
-  install -m 0755 "$REPO_ROOT/scripts/hermes-dashboard-server.sh" "$launcher_dst"
-
-  mkdir -p "$agent_dir" "$home/.hermes/logs"
-  info "installing $label LaunchAgent"
-  # Substitute both the home dir and the resolved launcher path into the plist.
-  sed -e "s|__HOME__|$home|g" -e "s|__LAUNCHER__|$launcher_dst|g" \
-    "$REPO_ROOT/launchd/$label.plist" > "$plist_dst"
-  chmod 0644 "$plist_dst"
-
-  uid="$(id -u)"
-  # Reload: bootout then bootstrap so an edited plist is picked up (kickstart
-  # alone won't reload a changed plist). Tolerate not-loaded on first install.
-  launchctl bootout "gui/$uid/$label" 2>/dev/null || true
-  launchctl bootstrap "gui/$uid" "$plist_dst" 2>/dev/null \
-    || launchctl load -w "$plist_dst" 2>/dev/null || true
-  launchctl kickstart -k "gui/$uid/$label" 2>/dev/null || true
-
-  sleep 3
-  ip="$(tailscale ip -4 2>/dev/null | head -1 || echo '<tailnet-ip>')"
-  if launchctl print "gui/$uid/$label" >/dev/null 2>&1; then
-    ok "dashboard-server LaunchAgent loaded — http://$ip:$PORT (RunAtLoad, KeepAlive)"
-  else
-    warn "dashboard-server LaunchAgent not loaded — check: launchctl print gui/$uid/$label ; log: $home/.hermes/logs/dashboard-server.err"
-  fi
-  return 0 2>/dev/null || exit 0
+done
+if [[ -n "${HERMES_FLEET_INTENT:-}" && ! -e "$HERMES_FLEET_INTENT" ]]; then
+  echo 'desktop-dashboard: HERMES_FLEET_INTENT file does not exist' >&2
+  exit 1
 fi
-
-# --- Linux: systemd unit -------------------------------------------------------
-if ! have systemctl; then
-  warn "systemctl not present — cannot install dashboard-server unit"
-  return 0 2>/dev/null || exit 0
-fi
-
-# 1) install the launcher wrapper (waits for tailnet IP, binds, execs hermes dashboard)
-info "installing /usr/local/bin/hermes-dashboard-server"
-sudo install -m 0755 "$REPO_ROOT/scripts/hermes-dashboard-server.sh" /usr/local/bin/hermes-dashboard-server
-
-# 2) install the systemd unit
-info "installing hermes-dashboard-server.service"
-sudo install -m 0644 "$REPO_ROOT/systemd/hermes-dashboard-server.service" /etc/systemd/system/hermes-dashboard-server.service
-
-# 3) reload + enable + (re)start
-sudo systemctl daemon-reload
-sudo systemctl enable hermes-dashboard-server.service >/dev/null 2>&1 || true
-# If a manual `hermes dashboard` is already holding :PORT, the unit's bind would
-# fail — stop any stray manual server first (best-effort; won't kill the unit).
-if ss -ltn 2>/dev/null | grep -q ":${PORT} "; then
-  stray="$(pgrep -f 'hermes dashboard' | head -1 || true)"
-  if [[ -n "$stray" ]] && ! systemctl status hermes-dashboard-server.service 2>/dev/null | grep -q "$stray"; then
-    info "stopping stray manual hermes dashboard (pid $stray) holding :${PORT}"
-    sudo kill "$stray" 2>/dev/null || true
-    sleep 1
-  fi
-fi
-sudo systemctl restart hermes-dashboard-server.service
-
-sleep 3
-if systemctl is-active --quiet hermes-dashboard-server.service; then
-  ip="$(tailscale ip -4 2>/dev/null | head -1 || echo '<tailnet-ip>')"
-  ok "dashboard-server active — http://$ip:${PORT} (enabled at boot, Restart=always)"
+args=(install --platform "$platform" --home "$HOME" --hermes-home "${HERMES_HOME:-$HOME/.hermes}"
+  --user "$(id -un)" --executable "$hermes_executable" --port "${HERMES_DASHBOARD_PORT:-9000}"
+  --bind "${HERMES_DASHBOARD_BIND:-tailnet}"
+  --registry "${HERMES_FLEET_INTENT:-}")
+if [[ "$platform" == linux && "$EUID" != 0 ]]; then
+  sudo "$py" "$REPO_ROOT/scripts/desktop-dashboard.py" "${args[@]}"
 else
-  warn "dashboard-server not active — check: sudo systemctl status hermes-dashboard-server.service (most likely the bind was refused: dashboard auth secrets not resolved in ~/.hermes/.env)."
+  "$py" "$REPO_ROOT/scripts/desktop-dashboard.py" "${args[@]}"
 fi

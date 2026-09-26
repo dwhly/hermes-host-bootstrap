@@ -1,0 +1,50 @@
+# Sanitized seven-host Intent before desktop rollout declarations.
+fleet:
+  name: Fixture fleet
+  boss: h-do1
+  probe_interval_seconds: 60
+  offline_threshold_seconds: 600
+hosts:
+  - hostname: h-do1
+    role: server
+    form_factor: vps
+    expected_online: true
+  - hostname: h-mini
+    role: both
+    form_factor: desktop
+    public_ip: null
+    ssh_user: danz
+    expected_online: false
+  - hostname: h-mini2
+    role: both
+    form_factor: desktop
+    ssh_user: dano
+  - hostname: h-air
+    role: both
+    form_factor: laptop
+  - hostname: h-air2
+    role: both
+    form_factor: laptop
+    ssh_user: dano
+  - hostname: h-btp
+    role: server
+    management:
+      mode: managed
+      runtime_user: hermes
+      hermes_home: /home/hermes/.hermes
+    responsibilities:
+      - btp-environment-work
+    credential_scopes:
+      - provider: 1password
+        mode: read-only
+        availability: pending
+    resource_policy:
+      build_host: false
+  - hostname: h-af
+    role: server
+    management:
+      runtime_user: root
+      hermes_home: /root/.hermes
+      enrollment: baseline-existing
+    responsibilities:
+      - amforge-business

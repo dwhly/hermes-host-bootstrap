@@ -1,0 +1,8 @@
+# A formerly protected h-af row lost its policy during a partial Intent edit.
+complete: false
+hosts:
+  - hostname: h-af
+    desktop_gateway:
+      dashboard_vehicle: preserved-node
+  - hostname: mac
+    update_policy: eligible

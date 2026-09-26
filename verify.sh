@@ -118,6 +118,42 @@ print("configured")
 PY
 }
 
+verify_desktop_g3() {
+  local helper
+  helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/desktop-fleet-policy.py"
+  python3 "$helper" verify --legacy \
+    --registry "${HERMES_FLEET_INTENT:-${HERMES_HOME:-$HOME/.hermes}/fleet/hosts.yaml}" \
+    --host "$(hostname -s)"
+}
+
+verify_desktop_fleet() {
+  if [[ "$(uname -s)" != Darwin ]]; then
+    printf '%s\n' not-applicable
+    return 0
+  fi
+  local fleet_repo
+  fleet_repo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local args=(verify --optional --hermes-home "${HERMES_HOME:-$HOME/.hermes}"
+    --compatibility "$fleet_repo/desktop-plugins/fleet-gateways/compatibility.json")
+  [[ -z "${HERMES_DESKTOP_USER_DATA:-}" ]] || args+=(--user-data "$HERMES_DESKTOP_USER_DATA")
+  [[ -z "${HERMES_DESKTOP_APP_LOG:-}" ]] || args+=(--app-log "$HERMES_DESKTOP_APP_LOG")
+  python3 "$fleet_repo/scripts/desktop-fleet.py" "${args[@]}"
+}
+
+verify_desktop_fleet_version() {
+  if [[ "$(uname -s)" != Darwin ]]; then
+    printf '%s\n' not-applicable
+    return 0
+  fi
+  if [[ ! -f "${HERMES_HOME:-$HOME/.hermes}/fleet/generated/desktop-gateways.json" ]]; then
+    verify_desktop_fleet
+    return $?
+  fi
+  local fleet_repo
+  fleet_repo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  hermes-desktop-fleet-warm "$1" --compatibility "$fleet_repo/desktop-plugins/fleet-gateways/compatibility.json"
+}
+
 verify_mac_desktop_pmset() {
   # Desktop Macs should not idle-sleep even without a user session, should
   # answer Wake-on-LAN, and should reboot after a power loss.
@@ -163,6 +199,10 @@ verify_check "herdr"      "false" "harness" "herdr --version 2>&1 | sed -n '1p'"
 verify_check "hermes-workspace" "false" "harness" "test -x '$HOME/.local/bin/hermes-workspace' && test -x '$HOME/.local/bin/hmw-tmux' && grep -q 'HMW_BACKEND:-herdr' '$HOME/.local/bin/hermes-workspace' && echo herdr-default"
 verify_check "mac-keepawake" "false" "system" "verify_mac_keepawake"
 verify_check "hermes-native-api" "false" "hermes" "verify_hermes_native_api"
+verify_check "desktop-g3-marker" "false" "hermes" "verify_desktop_g3"
+verify_check "desktop-fleet-warm" "false" "hermes" "verify_desktop_fleet_version --version"
+verify_check "desktop-app-pin" "false" "hermes" "verify_desktop_fleet_version --app-version"
+verify_check "desktop-fleet-registry" "false" "hermes" "verify_desktop_fleet"
 verify_check "hermes-desktop-launchagent" "false" "hermes" "verify_hermes_desktop_launchagent"
 verify_check "mac-desktop-pmset" "false" "system" "verify_mac_desktop_pmset"
 verify_check "herdr-new-agent" "false" "harness" "test -x '$HOME/.local/bin/herdr-new-agent' && grep -q 'command = \"herdr-new-agent right\"' '$HOME/.config/herdr/config.toml' && echo present"
