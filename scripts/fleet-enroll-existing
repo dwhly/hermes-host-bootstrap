@@ -25,6 +25,13 @@
 #                ENROLL_PROVIDER (digitalocean) CHIEF_CORE_URL (http://100.122.202.37:8088)
 set -euo pipefail
 
+# Desktop-only enrollment bypasses every legacy default, SSH/key, hostname and
+# auto-commit path below. It writes only generated fleet/plugin artifacts locally.
+if [[ "${1:-}" == --desktop-only ]]; then
+  shift
+  exec python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/desktop-fleet.py" install "$@"
+fi
+
 HOST="${1:?usage: fleet-enroll-existing <host> <tailnet_ip> [steps...]}"
 IP="${2:?usage: fleet-enroll-existing <host> <tailnet_ip> [steps...]}"
 shift 2

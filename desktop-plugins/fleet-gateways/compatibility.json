@@ -1,0 +1,8 @@
+{
+  "plugin_revision": "1.0.0",
+  "sdk_source_revision": "61c06ca3ceb9fc775f79377402ea56107c127d5b",
+  "sdk_import": "@hermes/plugin-sdk",
+  "sdk_surface": ["host.connections", "host.warmAgent", "ctx.setTimeout", "ctx.setInterval", "ctx.addEventListener", "ctx.onDispose"],
+  "app_pin": null,
+  "qualification": "pending artifact selection and Mac canary"
+}

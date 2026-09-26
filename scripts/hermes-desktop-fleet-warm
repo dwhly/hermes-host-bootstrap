@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Version-only interface. The installed bundle digest is verified before reporting.
+set -euo pipefail
+case "${1:-}" in
+  --version) action=version ;;
+  --app-version) action=app-version ;;
+  *) echo 'usage: hermes-desktop-fleet-warm --version|--app-version' >&2; exit 2 ;;
+esac
+exec python3 "${HERMES_HOME:-$HOME/.hermes}/fleet/tools/desktop-fleet.py" "$action"

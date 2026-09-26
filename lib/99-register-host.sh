@@ -107,6 +107,8 @@ GIT_VER="$(get_ver 'git --version')"
 FABRIC_VER="$(get_ver 'fabric --version')"
 HERDR_VER="$(get_ver 'herdr --version')"
 HERMES_NATIVE_BOTS_VER="$(get_ver 'hermes-native-bots --version')"
+FLEET_WARM_VER="$(get_ver 'hermes-desktop-fleet-warm --version')"
+DESKTOP_APP_PIN_VER="$(get_ver 'hermes-desktop-fleet-warm --app-version')"
 if [[ "$OS_KIND" == "macos" ]] && [[ -d /Applications/FluidVoice.app ]]; then
   FLUIDVOICE_VER="$(defaults read /Applications/FluidVoice.app/Contents/Info CFBundleShortVersionString 2>/dev/null || echo unknown)"
 else
@@ -205,6 +207,8 @@ versions:
   herdr: "$HERDR_VER"
   hermes_native_bots: "$HERMES_NATIVE_BOTS_VER"
   hermes_desktop: "$HERMES_DESKTOP_VER"
+  desktop_fleet_warm: "$FLEET_WARM_VER"
+  desktop_app_pin: "$DESKTOP_APP_PIN_VER"
   fluidvoice: "$FLUIDVOICE_VER"
 YAML
 

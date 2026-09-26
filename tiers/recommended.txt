@@ -71,3 +71,4 @@ MAC-CLIENT (macOS + client/both role only)
   + Hermes Desktop LaunchAgent + packaged app
     (builds with hermes desktop --build-only if needed on macOS client/both,
     ~/Applications/Hermes.app symlink, /usr/bin/open, RunAtLoad, no KeepAlive)
+  + desktop-fleet-warm (SDK-only fleet-gateways plugin, manifest/checklist, digest-verified version shim)
