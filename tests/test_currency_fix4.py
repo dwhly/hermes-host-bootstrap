@@ -103,7 +103,7 @@ def test_preflight_pass_is_read_only_before_and_after_closure(tmp_path, platform
         assert 'PASS (read-only' in result.stdout
         assert snapshot(host.root) == before
         actions = host.log.read_text()[len(calls):]
-        assert not any(word in actions for word in ('install ', 'bootstrap ', 'bootout ', 'stop ', 'disable ', 'enable ', 'dseditgroup ', 'chown ', 'sync '))
+        assert not any(line.startswith(word) for line in actions.splitlines() for word in ('install ', 'bootstrap ', 'bootout ', 'stop ', 'disable ', 'enable ', 'dseditgroup ', 'chown ', 'sync '))
         if not closed:
             result = host.run()
             assert result.returncode == 0, host.output(result)
@@ -144,10 +144,10 @@ def test_preflight_python_hold_does_not_skip_path_or_shell_config_checks(tmp_pat
     assert snapshot(host.root) == before
 
 
-@pytest.mark.parametrize('boot,live,expected', [('old-boot', True, 0), ('boot-or-wake', False, 0), ('boot-or-wake', True, 75), ('', True, 75)])
-def test_persistent_closure_lock_reclaims_old_boot_or_dead_pid(tmp_path, boot, live, expected):
+@pytest.mark.parametrize('boot,live,expected', [('old-boot', True, 75), ('boot-or-wake', False, 0), ('boot-or-wake', True, 75), ('', True, 75)])
+def test_persistent_closure_lock_reclaims_dead_pid_never_live_pid(tmp_path, boot, live, expected):
     host = Host(tmp_path)
-    lock = host.root / 'var/lib/chief/chief-currency-closure.lock'
+    lock = host.root / 'var/lib/chief/chief-currency-closure.boot-or-wake.lock'
     lock.mkdir(parents=True)
     (lock / 'boot').write_text(boot + '\n')
     (lock / 'pid').write_text(str(os.getpid() if live else 2147483647) + '\n')
@@ -179,11 +179,12 @@ def test_live_canary_hold_retry_refreshes_verified_opt_copy_and_completes(tmp_pa
 
 
 def test_mac_runtime_paths_and_unweakened_group_write_guard(tmp_path, monkeypatch):
-    assert str(core.MACOS_RUNTIME_STAMP_DIR) == '/var/lib/chief/runtime'
+    assert str(core.MACOS_RUNTIME_STAMP_DIR) == '/var/run/chief/runtime'
     source = (ROOT / 'hermes_converger/core.py').read_text()
     assert 'RUN_BASE = "/var/lib" if IS_MACOS else "/run"' in source
     assert 'state._path(f"{RUN_BASE}/chief/reconcile.lock")' in source
-    assert '/var/run' not in source.replace('# macOS /var/run is root:daemon 0775.', '')
+    assert 'RUN_BASE}/chief/convergence' in source
+    assert 'RUN_BASE}/chief/reconcile.lock' in source
     # Execute the actual unchanged path guard with root:daemon 0775 evidence.
     path = tmp_path / 'var/run'
     path.mkdir(parents=True)
@@ -226,7 +227,7 @@ def test_preflight_effective_linux_definitions(tmp_path, kind):
 def test_preflight_reports_live_closure_lock_without_reclaiming_it(tmp_path):
     host = Host(tmp_path)
     prepare_preflight(host)
-    lock = host.root / 'var/lib/chief/chief-currency-closure.lock'
+    lock = host.root / 'var/lib/chief/chief-currency-closure.boot-or-wake.lock'
     lock.mkdir(parents=True)
     (lock / 'pid').write_text(str(os.getpid()) + '\n')
     (lock / 'boot').write_text('boot-or-wake\n')

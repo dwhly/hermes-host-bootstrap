@@ -2,6 +2,7 @@
 # Run a private root-owned copy of this script AFTER pinning its own SHA256.
 # argv is administrator-only, never a sudoers command or daemon entry point.
 set -eu
+trap '' HUP PIPE
 umask 077
 [ "$#" = 2 ] || { echo 'usage: install-archive.sh archive.tar expected-sha256' >&2; exit 2; }
 archive=$1
@@ -16,7 +17,23 @@ case "$OS" in
 esac
 stage=$(/usr/bin/mktemp -d "$private/currency-step0.XXXXXX")
 previous=''
-trap '/bin/rm -rf "$stage"; [ -z "$previous" ] || /bin/rm -rf "$previous"' EXIT
+published=no
+cleanup_archive() {
+    /bin/rm -rf "$stage"
+    [ -n "$previous" ] || return 0
+    if [ "$published" != yes ]; then
+        # A failed copy may have left an incomplete replacement. Preserve the
+        # known-good previous tree for administrator recovery in that case.
+        if [ ! -e "$base/hermes_converger" ]; then
+            /bin/mv "$previous/hermes_converger" "$base/" || return
+        else
+            printf 'chief install: previous payload retained at %s\n' "$previous" >&2
+            return
+        fi
+    fi
+    /bin/rm -rf "$previous"
+}
+trap 'cleanup_archive' EXIT
 /bin/chmod 0700 "$stage"
 # Copy before hashing: the transfer account may replace the source at any time.
 # Neither tar nor imported code ever reads that source after this copy.
@@ -53,4 +70,5 @@ if [ -e "$base/hermes_converger" ]; then
     /bin/mv "$base/hermes_converger" "$previous/"
 fi
 /bin/cp -R "$stage/hermes_converger" "$base/"
+published=yes
 /bin/sh "$base/hermes_converger/step0/close.sh"

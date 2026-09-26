@@ -30,7 +30,7 @@ PREFIX = '''#!/bin/sh
 [ "$#" = 0 ] || { echo 'chief: arguments refused' >&2; exit 2; }
 '''
 for name, mode in (("hermes-converger", "converge"), ("chief-node-supervisor", "supervisor"), ("chief-update", "update")):
-    body = "cd /\numask 027\n" + TRUST + '''
+    body = "cd /\numask 027\ntrap '' HUP PIPE\n" + TRUST + '''
 [ "${EUID:-$(/usr/bin/id -u)}" = 0 ] || { hold 'root service entry point'; exit 1; }
 BASE=/opt/chief/lib/hermes-host-bootstrap/hermes_converger/step0
 if [ ! -d "$BASE" ] || { [ "$CHIEF_LEGACY_ENTRY" = yes ] && [ ! -f /var/lib/chief/currency-step0/prepared ]; }; then
@@ -43,7 +43,19 @@ if [ ! -d "$BASE" ] || { [ "$CHIEF_LEGACY_ENTRY" = yes ] && [ ! -f /var/lib/chie
         trusted_path "$dir" || refuse unsafe_destination
     done
     bridge=$(/usr/bin/mktemp -d /opt/chief/lib/hermes-host-bootstrap/.bridge.XXXXXX)
-    trap '/bin/rm -rf "$bridge"' EXIT
+    bridge_published=no
+    cleanup_bridge() {
+        if [ -d "$bridge/previous" ] && [ "$bridge_published" != yes ]; then
+            if [ ! -e /opt/chief/lib/hermes-host-bootstrap/hermes_converger ]; then
+                /bin/mv "$bridge/previous" /opt/chief/lib/hermes-host-bootstrap/hermes_converger || return
+            else
+                printf 'chief bridge: previous payload retained at %s/previous\\n' "$bridge" >&2
+                return
+            fi
+        fi
+        /bin/rm -rf "$bridge"
+    }
+    trap 'cleanup_bridge' EXIT
     /bin/cp -R /usr/local/lib/hermes-host-bootstrap/hermes_converger "$bridge/"
     trusted_tree "$bridge/hermes_converger" || refuse unsafe_bridge
     # A failed first closure can leave the previous reviewed /opt copy behind.
@@ -56,7 +68,8 @@ if [ ! -d "$BASE" ] || { [ "$CHIEF_LEGACY_ENTRY" = yes ] && [ ! -f /var/lib/chie
         [ ! -d "$bridge/previous" ] || /bin/mv "$bridge/previous" /opt/chief/lib/hermes-host-bootstrap/hermes_converger
         exit 1
     fi
-    /bin/rm -rf "$bridge"
+    bridge_published=yes
+    cleanup_bridge
     trap - EXIT
 fi
 # Only the installed fixed entries use the batched check. During initial closure

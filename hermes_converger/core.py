@@ -51,7 +51,7 @@ MACOS_UNIT_MAP = {
 }
 DOCKER_TOKENS = {"chief-core"}
 MACOS_USER_AGENT_TOKENS = {"chief-node"}
-MACOS_RUNTIME_STAMP_DIR = pathlib.Path("/var/lib/chief/runtime")
+MACOS_RUNTIME_STAMP_DIR = pathlib.Path("/var/run/chief/runtime")
 # macOS /var/run is root:daemon 0775. Persistent root-written locks live
 # below /var/lib/chief; flock releases on exit/reboot, independent of file age.
 RUN_BASE = "/var/lib" if IS_MACOS else "/run"

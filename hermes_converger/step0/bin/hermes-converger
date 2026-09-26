@@ -5,6 +5,7 @@ legacy=no
 [ "$0" != /usr/local/bin/hermes-converger ] || legacy=yes
 exec /usr/bin/env -i CHIEF_LEGACY_ENTRY="$legacy" PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/empty LANG=C /bin/sh -c 'cd /
 umask 027
+trap '"'"''"'"' HUP PIPE
 # Sourced only after the dispatcher has checked this file and all its parents.
 # No caller-controlled executable lookup, Python startup, or shell evaluation.
 # HOLD_REASON and read_state'"'"'s value are outputs to the sourcing dispatcher.
@@ -186,7 +187,7 @@ trusted_runtime() {
     trusted_path "$PY_TREE" || return 1
     trusted_path "$BASE" || return 1
     if [ "$TRUST_OS" = Darwin ]; then
-        boot_id=$(/usr/sbin/sysctl -n kern.boottime) || return 1
+        boot_id=$(/usr/sbin/sysctl -n kern.bootsessionuuid) || return 1
         identity=$(/usr/bin/stat -L -f '"'"'%d:%i:%u:%g:%p:%z:%m:%c'"'"' "$PY" "$PY_TREE" "$BASE" "$BASE/.." "$BASE/trust.sh" "$BASE/pulse.sh" "$BASE/supervise.sh") || return 1
     else
         boot_id=$(/bin/cat /proc/sys/kernel/random/boot_id) || return 1
@@ -364,7 +365,19 @@ if [ ! -d "$BASE" ] || { [ "$CHIEF_LEGACY_ENTRY" = yes ] && [ ! -f /var/lib/chie
         trusted_path "$dir" || refuse unsafe_destination
     done
     bridge=$(/usr/bin/mktemp -d /opt/chief/lib/hermes-host-bootstrap/.bridge.XXXXXX)
-    trap '"'"'/bin/rm -rf "$bridge"'"'"' EXIT
+    bridge_published=no
+    cleanup_bridge() {
+        if [ -d "$bridge/previous" ] && [ "$bridge_published" != yes ]; then
+            if [ ! -e /opt/chief/lib/hermes-host-bootstrap/hermes_converger ]; then
+                /bin/mv "$bridge/previous" /opt/chief/lib/hermes-host-bootstrap/hermes_converger || return
+            else
+                printf '"'"'chief bridge: previous payload retained at %s/previous\n'"'"' "$bridge" >&2
+                return
+            fi
+        fi
+        /bin/rm -rf "$bridge"
+    }
+    trap '"'"'cleanup_bridge'"'"' EXIT
     /bin/cp -R /usr/local/lib/hermes-host-bootstrap/hermes_converger "$bridge/"
     trusted_tree "$bridge/hermes_converger" || refuse unsafe_bridge
     # A failed first closure can leave the previous reviewed /opt copy behind.
@@ -377,7 +390,8 @@ if [ ! -d "$BASE" ] || { [ "$CHIEF_LEGACY_ENTRY" = yes ] && [ ! -f /var/lib/chie
         [ ! -d "$bridge/previous" ] || /bin/mv "$bridge/previous" /opt/chief/lib/hermes-host-bootstrap/hermes_converger
         exit 1
     fi
-    /bin/rm -rf "$bridge"
+    bridge_published=yes
+    cleanup_bridge
     trap - EXIT
 fi
 # Only the installed fixed entries use the batched check. During initial closure

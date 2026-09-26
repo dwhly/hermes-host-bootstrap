@@ -43,6 +43,19 @@ class Host:
         for name in ("getent", "groupadd", "dscl", "dseditgroup", "chown", "sudo", "sync", "curl"):
             self.tool(name, ':')
         self.tool("sysctl", 'echo boot-or-wake')
+        # Model lstat metadata for the inline bootstrap guard. The private host
+        # root replaces /; pytest's /tmp ancestors are outside that virtual host.
+        stat_tool = self.bin / 'stat'
+        stat_tool.write_text('#!'+sys.executable+'\n'+f'''
+import os,sys
+root={str(self.root)!r}
+for path in sys.argv[3:]:
+    info=os.lstat(path)
+    uid,mode=(info.st_uid,info.st_mode) if path.startswith(root) else (0,0o40755)
+    print(uid, format(mode, 'o' if sys.argv[1] == '-f' else 'x'))
+''')
+        stat_tool.chmod(0o755)
+        self.tool('ls', 'shift; exec /bin/ls -ld "$@"')
         self.tool("ioreg", '''echo '\"SystemPowerStateCapabilities\" = 15' ''')
         self.tool("visudo", f'''if [ "$#" = 1 ]; then exec /usr/sbin/visudo -c -f {shlex.quote(str(self.policy))}; fi
 exec /usr/sbin/visudo "$@"''')
@@ -111,7 +124,7 @@ hold() {{ HOLD_REASON=$*; echo "HOLD: $*" >&2; return 1; }}
         helpers = (PAYLOAD/'trust.sh').read_text()
         self.trust += helpers[helpers.index('read_state() {'):helpers.index('# Check both sides')]
         dirs = ('/opt/' , '/usr/local/', '/etc/', '/var/', '/Library/', '/usr/lib/systemd', '/run/')
-        commands = ('/usr/bin/id', '/usr/bin/uname', '/bin/hostname', '/usr/bin/getent', '/usr/sbin/groupadd',
+        commands = ('/usr/bin/stat', '/bin/ls', '/usr/bin/id', '/usr/bin/uname', '/bin/hostname', '/usr/bin/getent', '/usr/sbin/groupadd',
                     '/usr/bin/dscl', '/usr/sbin/dseditgroup', '/usr/bin/systemctl', '/bin/launchctl', '/bin/chown',
                     '/usr/sbin/chown', '/usr/sbin/visudo', '/usr/bin/sudo', '/bin/sync', '/usr/bin/install',
                     '/usr/bin/curl', '/usr/sbin/sysctl', '/usr/sbin/ioreg')

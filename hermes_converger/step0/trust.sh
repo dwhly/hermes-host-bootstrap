@@ -176,7 +176,7 @@ trusted_runtime() {
     trusted_path "$PY_TREE" || return 1
     trusted_path "$BASE" || return 1
     if [ "$TRUST_OS" = Darwin ]; then
-        boot_id=$(/usr/sbin/sysctl -n kern.boottime) || return 1
+        boot_id=$(/usr/sbin/sysctl -n kern.bootsessionuuid) || return 1
         identity=$(/usr/bin/stat -L -f '%d:%i:%u:%g:%p:%z:%m:%c' "$PY" "$PY_TREE" "$BASE" "$BASE/.." "$BASE/trust.sh" "$BASE/pulse.sh" "$BASE/supervise.sh") || return 1
     else
         boot_id=$(/bin/cat /proc/sys/kernel/random/boot_id) || return 1

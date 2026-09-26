@@ -1,6 +1,7 @@
 #!/bin/sh
 # Administrator-only replacement for chief-update. Never granted NOPASSWD.
 set -eu
+trap '' HUP PIPE
 [ "$#" = 1 ] || { echo 'usage: update.sh reviewed-40-hex-commit (administrator only)' >&2; exit 2; }
 commit=$1
 case "$commit" in ''|*[!0-9a-f]*) exit 2;; esac
@@ -18,7 +19,22 @@ fi
 trusted_path "$GIT"
 trusted_path /etc/chief/.git-fleet-credentials
 stage=$(/usr/bin/mktemp -d /opt/chief/lib/.chief-update.XXXXXX)
-trap '/bin/rm -rf "$stage"' EXIT
+published=no
+cleanup_update() {
+    if [ -d "$stage/previous" ] && [ "$published" != yes ]; then
+        if [ ! -e /opt/chief/lib/hermes-host-bootstrap/hermes_converger ]; then
+            /bin/mv "$stage/previous" /opt/chief/lib/hermes-host-bootstrap/hermes_converger || {
+                printf 'chief update: previous payload retained at %s/previous\n' "$stage" >&2
+                return
+            }
+        else
+            printf 'chief update: previous payload retained at %s/previous\n' "$stage" >&2
+            return
+        fi
+    fi
+    /bin/rm -rf "$stage"
+}
+trap 'cleanup_update' EXIT
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
 # A fresh root checkout avoids retained hooks/config/alternates. Only the fixed
 # origin and an administrator's reviewed commit can select the payload.
@@ -42,6 +58,7 @@ if ! /bin/mv "$stage/src/hermes_converger" /opt/chief/lib/hermes-host-bootstrap/
     hold package_install_failed
     exit 1
 fi
+published=yes
 # close.sh (not a broader bootstrap module) restores the install/config contract,
 # switches safe jobs and revokes grants last, including on preparation failure.
 /bin/sh "$BASE/close.sh"

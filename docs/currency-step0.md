@@ -1,4 +1,4 @@
-# Fleet currency Step 0 / A0 — fix round 4
+# Fleet currency Step 0 / A0 — fix round 5
 
 Step 0 closes the legacy privilege grants and retains the existing authenticated,
 six-artifact converger. Success requires active root readers, boss check-ins,
@@ -10,11 +10,12 @@ credentials, cron, local code/config and owner workloads are preserved.
 
 ## Mandatory first step on every host
 
-Before any bridge, closure, archive installation or administrator update, run
+Before any live closure, bridge, archive installation or administrator update, run
 `close.sh --preflight` from a **reviewed root-owned payload** in a clean root
 shell. This applies to every Mac and Linux host, including h-mini2 retries and
 preserved h-af/h-btp. Use an absolute path to the reviewed script; preflight can
-run from a private extracted review directory before `/opt/chief` exists:
+run from a private extracted review directory before `/opt/chief` exists. Its
+path must be symlink-free; on macOS use `/private/var/root/...`, not `/var/root/...`:
 
 ```sh
 # currency_review is the administrator's verified, root-owned extracted payload.
@@ -28,7 +29,11 @@ job-definition holds. It checks prospective destinations against their existing
 parent chains. It never writes files, takes a lock, populates the trust cache,
 rotates logs, installs/stops jobs or revokes grants. Rendered policy goes through
 `visudo -c -f -` on stdin. Missing required tools or unavailable dependent checks
-hold. Resolve **all** printed reasons, then repeat preflight. A pass describes
+hold. Before sourcing a helper, the script checks its uid, write permissions,
+file type and every lexical parent inline; macOS ACLs and symlinks hold too.
+The legacy-path preflight also checks the bridge launcher and full source tree
+before preparation. A private archive preflight checks its own source and `/opt`
+destinations; that route does not execute the legacy bridge. Resolve **all** printed reasons, then repeat preflight. A pass describes
 the current files and policy; closure still repeats its checks and can fail if
 state changes or an activation command fails.
 
@@ -74,6 +79,7 @@ stat -f '%Su:%Sg %Lp %N' /usr/local /usr/local/bin /usr/local/lib \
 sudo -ll -U "$runtime_user"; echo "sudo-list-status=$?"
 /Library/Developer/CommandLineTools/usr/bin/python3 -I -S -B -c 'import sys; sys.path.append("<review dir>"); import hermes_converger.core, hermes_converger.runtime, hermes_converger.supervisor'
 /usr/sbin/ioreg -r -n IOPMrootDomain -d 1
+/usr/sbin/sysctl -n kern.bootsessionuuid
 # After sourcing the reviewed trust.sh in that clean shell:
 trusted_python
 trusted_path /usr/local/bin
@@ -142,8 +148,19 @@ ssh -o BatchMode=yes -o ConnectTimeout=15 "$currency_target" \
   < currency-step0-digest.py > currency-installed.digest
 cmp currency-step0.digest currency-installed.digest
 # STOP on drift. This login-user/xcrun result is NOT adversarial integrity proof.
-ssh -o BatchMode=yes -o ConnectTimeout=15 "$currency_target" \
-  '/usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/empty /usr/bin/sudo -n /usr/local/bin/hermes-converger'
+```
+
+After `chief-update` and the digest comparison, run this command **on the Mac as
+the login user**, from the root-owned install path. It needs **administrator sudo**
+(interactive password where required), not the retiring command grants. Never
+run the preflight script from a login-user checkout. Require exit 0 before the
+final bridge invocation:
+
+```sh
+sudo /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/empty LANG=C \
+  /bin/sh /usr/local/lib/hermes-host-bootstrap/hermes_converger/step0/close.sh --preflight
+# Only after PASS, as the login user on that same Mac:
+sudo -n /usr/local/bin/hermes-converger
 ```
 
 The shim on the last command verifies the legacy payload and copies it to the
@@ -207,7 +224,9 @@ Never execute the installer directly from `/var/tmp`, media or a login checkout.
 
 The tested installer uses `umask 022` and `tar --no-same-permissions` (GNU tar and
 macOS bsdtar; never `-p`), validates the extracted tree, installs into `/opt/chief`,
-removes its temporary previous payload on exit and invokes close.sh. It does not require `/usr/local`
+invokes close.sh after publishing a complete replacement. It removes the previous
+payload only after publication, or restores it when the destination is absent.
+A failed partial copy leaves the previous payload at the printed recovery path. It does not require `/usr/local`
 ownership, owner credentials or an existing sudo grant.
 
 Subsequent administrator Git updates require an explicit reviewed 40-hex commit:
@@ -231,12 +250,15 @@ completed revocation failure records its exact reason and retries at most once
 per 15 minutes. During that interval the prepared pulse and supervisor continue
 check-ins and health. After administrator policy repair, clearing the root-owned
 `revocation-retry` stamp permits an immediate retry. A root-owned PID lock serializes attempts;
-boot clears stale locks, and dead holders are reclaimed. A live holder returns
+Linux: boot clears the lock; macOS: boot UUID selects a new lock name.
+Dead holders on the current boot are reclaimed under an atomic reclaim guard. A live holder returns
 nonzero (75), with revocation pending; this is not installation success. Prepared
 retries and re-closure with matching reviewed job definitions don't stop their own
 reader. Administrator updates publish a preparing receipt and stop jobs before
 replacing any payload or removing markers. Launchd activation skips loaded jobs and retries transient
-bootstrap failures. HUP/PIPE cannot abort closure: full output remains in
+bootstrap failures. The bridge, both installers and closure ignore HUP/PIPE.
+Installer cleanup restores or retains the previous payload if publication fails;
+even a failed restore never deletes the only remaining copy. All closure output remains in
 `/var/log/chief-closure.log`; the caller receives the final receipt when connected.
 Post-preparation trust failures refuse that run and retain enabled readers for retry.
 Preparation publishes `hold: preparing` before stopping unsafe jobs. Every trigger
@@ -314,11 +336,15 @@ The fixture is not live Apple Silicon or battery evidence.
 macOS `/var/run` (`/private/var/run`) is `root:daemon 0775` on all three measured
 OS versions. Trust still rejects every group-writable directory; there is no
 `daemon` exception. The closure lock now lives at
-`/var/lib/chief/chief-currency-closure.lock`, reconciliation at
-`/var/lib/chief/reconcile.lock`, leases at `/var/lib/chief/convergence`, and the
-runtime-stamp default at `/var/lib/chief/runtime`. These use trusted root-writable
-parent chains. Configure any runtime-stamp producer to the matching new path
-through its owner release process; this closure does not rewrite owner jobs.
+`/var/lib/chief/chief-currency-closure.<bootsessionuuid>.lock`, reconciliation at
+`/var/lib/chief/reconcile.lock`, and leases at `/var/lib/chief/convergence`.
+These locks use trusted root-writable parent chains. Runtime stamps are the only
+macOS `/var/run` use: producer and consumer both use `/var/run/chief/runtime`.
+That directory is login-user-written data (`root:chief 0770`), not trusted code,
+locks or root state; preflight must accept the documented producer setup in
+[the runtime-directory repair](chief-node-source-reconciliation.md#missing-macos-runtime-directory).
+The reader still requires bounded, no-follow regular files. Closure does not
+rewrite owner jobs or provision the volatile runtime directory after reboot.
 Linux uses `/run` for locks and `/run/chief/runtime` for runtime stamps.
 
 The audit also covers the shared worker/supervisor `run.lock`, trust cache, pulse
@@ -326,11 +352,23 @@ boot/wake/online/check stamps and supervisor targets under
 `/var/lib/chief/currency-step0`; journals/restart limits under
 `/var/lib/chief/converger`; request slots under `/var/lib/chief/requests`; and
 update staging under `/opt/chief/lib`. No macOS root runtime writer uses
-`/var/run`. Persistent closure locks record `kern.boottime` alongside the PID:
-a live PID retains the lock on the same boot (or conservatively when an older
-holder has no boot record). Explicit old-boot PID reuse and dead holders are reclaimed. Python's flock locks are released by the kernel on
-exit/reboot even though their files persist; pulse boot identity and the trust
-cache also invalidate old boot observations.
+`/var/run`. Closure, preflight, pulse and trust cache use `kern.bootsessionuuid`,
+which identifies the boot independently of timezone, wall-clock and wake changes.
+Preflight requires that sysctl to succeed on the target; capture its output on
+both macOS 15 and 26 before rollout. Native version availability has not been
+verified in this Linux fixture environment (the public-source lookup was blocked
+by sandbox DNS), so those captures remain a rollout gate.
+
+Old-boot directories never collide with the current UUID name and may be removed
+by an administrator after preflight. A live PID retains the current-boot lock.
+Dead-PID reclaim has one writer, elected by atomic `mkdir` of `<lock>.reclaim`,
+and rechecks liveness under that guard. If killed during PID publication or
+reclaim, the next attempt and preflight report `closure_pid_publication_pending`
+or `closure_reclaim_pending`. After verifying no closure is running, an
+administrator may remove that UUID's incomplete lock/guard and repeat preflight;
+a reboot also selects a fresh name. Neither path blindly reclaims a live or
+unpublished holder. Python's flock locks are released by the kernel on exit/reboot
+even though their files persist; pulse and trust cache invalidate old observations.
 
 Supervisor cadence is 60 seconds. Between five-minute health reports, shell checks
 all resolved targets with launchctl/systemctl/Docker. Python records the observed

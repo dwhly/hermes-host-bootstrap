@@ -11,7 +11,7 @@ wake=linux
 full=yes
 if [ "$TRUST_OS" = Darwin ]; then
     # One sysctl, no sed/grep pipelines or second uname.
-    epochs=$(/usr/sbin/sysctl -n kern.boottime kern.waketime 2>/dev/null) || epochs='unknown
+    epochs=$(/usr/sbin/sysctl -n kern.bootsessionuuid kern.waketime 2>/dev/null) || epochs='unknown
 unknown'
     boot=${epochs%%'
 '*}

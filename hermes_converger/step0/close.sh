@@ -38,6 +38,39 @@ BASE=/opt/chief/lib/hermes-host-bootstrap/hermes_converger/step0
 if [ "$preflight" = yes ]; then
     case "$0" in /*/close.sh) BASE=${0%/*};; *) echo 'preflight requires an absolute reviewed script path' >&2; exit 2;; esac
 fi
+# Bootstrap trust without executing any helper from the selected payload. lstat
+# every lexical parent in one batch; reject links, writable chains and Mac ACLs.
+# This also protects a direct administrator invocation before importing code.
+bootstrap_trust() (
+    p=$BASE/trust.sh
+    set -- "$p"
+    while [ "$p" != / ]; do
+        p=${p%/*}; [ -n "$p" ] || p=/
+        set -- "$@" "$p"
+    done
+    if [ "$(/usr/bin/uname -s)" = Darwin ]; then
+        radix=0
+        metadata=$(/usr/bin/stat -f '%u %p' "$@") || exit 1
+        acl=$(/bin/ls -lde "$@") || exit 1
+        while IFS= read -r row; do
+            row=${row#"${row%%[![:space:]]*}"}
+            case "$row" in ??????????+*|[0-9]*:*) exit 1;; esac
+        done <<EOF
+$acl
+EOF
+    else
+        radix=0x
+        metadata=$(/usr/bin/stat -c '%u %f' "$@") || exit 1
+    fi
+    while read -r uid mode; do
+        bits=$(( ${radix}${mode} ))
+        [ "$uid" = 0 ] && [ $((bits & 0022)) = 0 ] &&
+            { [ $((bits & 0170000)) = $((0040000)) ] || [ $((bits & 0170000)) = $((0100000)) ]; } || exit 1
+    done <<EOF
+$metadata
+EOF
+)
+bootstrap_trust || { echo 'chief Step 0 HOLD: unsafe bootstrap trust chain' >&2; exit 1; }
 # shellcheck source=hermes_converger/step0/trust.sh
 . "$BASE/trust.sh"
 OS=$(/usr/bin/uname -s)
@@ -58,43 +91,22 @@ trusted_path /opt/chief/bin || exit 1
 
 # Keep all output in a root log even after the SSH pipe disappears. A final
 # receipt is also sent to the original caller when that fd remains available.
-lock=/run/chief-currency-closure.lock
 if [ "$OS" = Darwin ]; then
-    # /var/run is intentionally group-writable on macOS. Never trust it.
+    # /var/run is group-writable on macOS; root locks use trusted state parents.
     for dir in /var/lib /var/lib/chief; do
         trusted_path "${dir%/*}"
         [ -e "$dir" ] || /usr/bin/install -d -o root -m 0755 "$dir"
         trusted_path "$dir"
     done
-    lock=/var/lib/chief/chief-currency-closure.lock
-    boot_id=$(/usr/sbin/sysctl -n kern.boottime) || exit 1
-else
-    boot_id=$(/bin/cat /proc/sys/kernel/random/boot_id) || exit 1
 fi
-[ -n "$boot_id" ] || { hold missing_boot_identity; exit 1; }
+# shellcheck source=hermes_converger/step0/closure-lock.sh
+. "$BASE/closure-lock.sh"
+lock='' # populated by the shared identity helper
+closure_lock_identity
 trusted_path "${lock%/*}"
-if ! /bin/mkdir "$lock" 2>/dev/null; then
-    trusted_path "$lock"
-    # mkdir and pid publication are separate syscalls. Give a new holder time.
-    [ -s "$lock/pid" ] || /bin/sleep 1
-    holder=0
-    [ ! -f "$lock/pid" ] || read -r holder < "$lock/pid" || holder=0
-    case "$holder" in ''|*[!0-9]*) holder=0;; esac
-    # Unknown boot on an older live holder remains busy; an explicit boot
-    # mismatch permits reclaim even when the PID has been reused.
-    holder_boot=''
-    [ ! -f "$lock/boot" ] || IFS= read -r holder_boot < "$lock/boot" || holder_boot=''
-    if { [ "$holder_boot" = "$boot_id" ] || [ -z "$holder_boot" ]; } &&
-       [ "$holder" != 0 ] && kill -0 "$holder" 2>/dev/null; then
-        printf 'closure already running; revocation pending\n'
-        exit 75
-    fi
-    /bin/rm -rf "$lock"
-    /bin/mkdir "$lock" || exit 1
-fi
-printf '%s\n' "$boot_id" > "$lock/boot"
-printf '%s\n' "$$" > "$lock/pid"
+closure_lock_acquire
 cleanup() { /bin/rm -rf "$lock"; }
+trap 'cleanup' EXIT
 trusted_path /var/log
 [ ! -L /var/log/chief-closure.log ] || exit 1
 [ ! -e /var/log/chief-closure.log ] || trusted_path /var/log/chief-closure.log

@@ -400,6 +400,19 @@ def test_closure_without_python_repairs_config_disables_jobs_and_revokes_last(tm
         output={'id':'0','uname':platform,'hostname':hostname,'sysctl':'fixture-boot'}.get(name,'')
         (bin/name).write_text('#!/bin/sh\nprintf "%s\\n" '+shlex.quote(name)+'" $*" >> '+shlex.quote(str(log))+'\nprintf "%s\\n" '+shlex.quote(output)+'\n')
         (bin/name).chmod(0o755)
+    # Inline bootstrap trust and the shared lock helper still execute; only
+    # OS metadata at this private host boundary is adapted to Linux fixtures.
+    commands.extend(['/usr/bin/stat', '/bin/ls'])
+    (bin/'stat').write_text('#!'+sys.executable+'\n'+f'''
+import os,sys
+for path in sys.argv[3:]:
+    info=os.lstat(path)
+    uid,mode=(info.st_uid,info.st_mode) if path.startswith({str(host)!r}) else (0,0o40755)
+    print(uid, format(mode, 'o' if sys.argv[1] == '-f' else 'x'))
+''')
+    (bin/'stat').chmod(0o755)
+    (bin/'ls').write_text('#!/bin/sh\nshift; exec /bin/ls -ld "$@"\n')
+    (bin/'ls').chmod(0o755)
     installer=bin/'install'
     installer.write_text('''#!/usr/bin/python3
 import subprocess,sys
@@ -413,7 +426,7 @@ subprocess.run(['/usr/bin/install',*args],check=True)
     validator=bin/'visudo'
     validator.write_text('#!/bin/sh\necho visudo >> '+shlex.quote(str(log))+'\nif [ "$#" = 1 ]; then exec /usr/sbin/visudo -c -f '+shlex.quote(str(policy))+'; fi\nexec /usr/sbin/visudo "$@"\n')
     validator.chmod(0o755)
-    for path in (base/'close.sh',base/'contain.sh',base/'configure.sh'):
+    for path in (base/'close.sh',base/'closure-lock.sh',base/'contain.sh',base/'configure.sh'):
         source=path.read_text()
         for directory in ('/opt/','/usr/local/','/var/lib','/var/log','/var/run','/run/','/Library/','/usr/lib/systemd','/etc/'):
             source=source.replace(directory,str(host)+directory)
