@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import pathlib
 import sys
 from types import SimpleNamespace
 
 import pytest
 
-CHIEF_SPEC_SDK = pathlib.Path("/root/code/chief/chief-spec/sdk/python")
-if CHIEF_SPEC_SDK.exists():
-    sys.path.insert(0, str(CHIEF_SPEC_SDK))
+CHIEF_SPEC_SDK = pathlib.Path(os.environ.get("CHIEF_SPEC_SDK", "/root/code/chief/chief-spec/sdk/python"))
+try:  # CI runners can't traverse /root: PermissionError on Python 3.9 means "absent", not a collection error
+    if CHIEF_SPEC_SDK.exists():
+        sys.path.insert(0, str(CHIEF_SPEC_SDK))
+except OSError:
+    pass
 
 try:
     from chief_spec.validation import validate_event
