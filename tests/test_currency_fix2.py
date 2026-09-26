@@ -30,6 +30,7 @@ class PulseHost:
         self.state.mkdir(parents=True)
         (self.root/'etc/chief').mkdir(parents=True)
         (self.root/'opt/chief/bin').mkdir(parents=True)
+        (self.root/'var/run/chief/runtime').mkdir(parents=True)
         self.hints = self.root/'var/lib/chief/requests'; self.hints.mkdir()
         self.tool('uname', 'echo Darwin')
         self.tool('id', 'echo 0')

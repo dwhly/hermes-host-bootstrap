@@ -18,6 +18,54 @@ STATE = pathlib.Path("/var/lib/chief/currency-step0")
 HINTS = pathlib.Path("/var/lib/chief/requests")
 
 
+def prepare_runtime_directory():
+    """Provision volatile Mac proof data without following replaceable entries."""
+    if os.uname().sysname != "Darwin":
+        return
+    descriptors = []
+    try:
+        chief_gid = grp.getgrnam("chief").gr_gid
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        # /var is Apple's root-owned alias; the final run component cannot be
+        # a link. This root:daemon 0775 parent is not a code/state trust root.
+        parent = os.open("/var/run", flags)
+        descriptors.append(parent)
+        for name, mode in (("chief", 0o750), ("runtime", 0o770)):
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent)
+            except FileExistsError:
+                pass
+            # lstat first, including existing entries: never repair a non-root
+            # entry or a link. mkdir cannot follow a pre-planted symlink.
+            before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if not stat.S_ISDIR(before.st_mode) or before.st_uid != 0:
+                raise TrustError("unsafe_runtime_directory:" + name)
+            child = os.open(name, flags, dir_fd=parent)
+            descriptors.append(child)
+            info = os.fstat(child)
+            if (info.st_dev, info.st_ino, info.st_uid) != (before.st_dev, before.st_ino, 0):
+                raise TrustError("runtime_directory_changed:" + name)
+            # Inspect group/mode before changing them; operate on the verified
+            # descriptor, never a pathname beneath the daemon-writable parent.
+            if info.st_gid != chief_gid:
+                os.fchown(child, 0, chief_gid)
+            if stat.S_IMODE(info.st_mode) != mode:
+                os.fchmod(child, mode)
+            info = os.fstat(child)
+            if (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) != (0, chief_gid, mode):
+                raise TrustError("runtime_directory_metadata:" + name)
+            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+                raise TrustError("runtime_directory_changed:" + name)
+            parent = child
+    except (OSError, KeyError, TrustError) as exc:
+        print("chief Step 0 HOLD: runtime_directory_unavailable: " + str(exc), flush=True)
+        raise
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 def configure(config=None, *, check_only=False):
     config = load_config() if config is None else config
     user = config["CHIEF_RUNTIME_USER"]
@@ -153,6 +201,8 @@ def _run(mode: str) -> int:
         except BlockingIOError:
             print('{"deferred":"step0_already_running","pending":"retained"}')
             return 0
+        # Both RunAtLoad root readers enter here before any service restart.
+        prepare_runtime_directory()
         if mode == "supervisor":
             from . import supervisor
             allow = pathlib.Path("/etc/chief/supervisor-allowlist.json")

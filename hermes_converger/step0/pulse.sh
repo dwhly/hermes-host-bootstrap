@@ -88,6 +88,10 @@ if [ $((now - last)) -ge 0 ]; then
     [ $((now - last)) -ge 60 ] || noop=yes
     [ "$trigger" != periodic ] || [ $((now - last)) -ge 300 ] || noop=yes
 fi
+# /var/run is cleared at reboot. Provision proof data in the trusted worker
+# even when persistent cadence stamps would otherwise suppress this boot run.
+if [ "$TRUST_OS" = Darwin ] && { [ ! -d /var/run/chief/runtime ] ||
+   [ -L /var/run/chief ] || [ -L /var/run/chief/runtime ]; }; then noop=no; fi
 if [ "$noop" = yes ]; then
     printf 'chief-pulse at=%s decision=noop python=0 full=%s online=%s\n' "$now" "$full" "$online"
     exit 0

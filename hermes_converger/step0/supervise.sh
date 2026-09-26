@@ -29,6 +29,9 @@ if [ -f "$STATE/supervisor-targets" ] && [ ! -L "$STATE/supervisor-targets" ]; t
         if [ "$active" = no ] && [ "$retry" -gt 0 ] && [ "$now" -ge "$retry" ]; then changed=yes; fi
     done < "$STATE/supervisor-targets"
 fi
+# Boot must provision the volatile proof directory before supervision/restart.
+if [ "$TRUST_OS" = Darwin ] && { [ ! -d /var/run/chief/runtime ] ||
+   [ -L /var/run/chief ] || [ -L /var/run/chief/runtime ]; }; then changed=yes; fi
 # A stable dead/quarantined/report-only target is also a no-op. Fresh health and
 # admission/restart decisions are re-evaluated at least every five minutes.
 if [ "$changed" = no ] && [ $((now - last)) -ge 0 ] && [ $((now - last)) -lt 300 ]; then

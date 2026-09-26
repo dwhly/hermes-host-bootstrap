@@ -30,6 +30,13 @@ PREFIX = '''#!/bin/sh
 [ "$#" = 0 ] || { echo 'chief: arguments refused' >&2; exit 2; }
 '''
 for name, mode in (("hermes-converger", "converge"), ("chief-node-supervisor", "supervisor"), ("chief-update", "update")):
+    pending_closure = 'exec /bin/sh "$BASE/close.sh"'
+    if mode != "update":
+        # Busy/ambiguous handoffs retain the single closure writer while the
+        # prepared readers keep checking in. The updater must still stop here.
+        pending_closure = '''closure_status=0
+        /bin/sh "$BASE/close.sh" || closure_status=$?
+        [ "$closure_status" -eq 75 ] || exit "$closure_status"'''
     body = "cd /\numask 027\ntrap '' HUP PIPE\n" + TRUST + '''
 [ "${EUID:-$(/usr/bin/id -u)}" = 0 ] || { hold 'root service entry point'; exit 1; }
 BASE=/opt/chief/lib/hermes-host-bootstrap/hermes_converger/step0
@@ -88,7 +95,7 @@ if [ ! -f "$STATE/grants-removed" ]; then
     now=$(/bin/date +%s)
     if [ "$now" -ge "$value" ] || [ "$value" -gt "$((now + 900))" ]; then
         trusted_tree "$BASE/.." || refuse unsafe_payload_tree
-        exec /bin/sh "$BASE/close.sh"
+        ''' + pending_closure + '''
     fi
     # Safe readers still check in and report health during a revocation hold.
 fi

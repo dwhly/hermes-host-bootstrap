@@ -3,12 +3,12 @@
 closure_lock_identity() {
     lock=/run/chief-currency-closure.lock
     if [ "$OS" = Darwin ]; then
-        boot_id=$(/usr/sbin/sysctl -n kern.bootsessionuuid) || return 1
+        boot_id=$(/usr/sbin/sysctl -n kern.bootsessionuuid) || { hold boot_identity_unavailable; return 1; }
         # A boot identity is also a filename component, never arbitrary output.
         case "$boot_id" in ''|*[!a-zA-Z0-9-]*) hold invalid_boot_identity; return 1;; esac
         lock=/var/lib/chief/chief-currency-closure.$boot_id.lock
     else
-        boot_id=$(/bin/cat /proc/sys/kernel/random/boot_id) || return 1
+        boot_id=$(/bin/cat /proc/sys/kernel/random/boot_id) || { hold boot_identity_unavailable; return 1; }
     fi
     [ -n "$boot_id" ] || { hold missing_boot_identity; return 1; }
 }

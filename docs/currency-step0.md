@@ -1,4 +1,4 @@
-# Fleet currency Step 0 / A0 — fix round 5
+# Fleet currency Step 0 / A0 — fix round 6
 
 Step 0 closes the legacy privilege grants and retains the existing authenticated,
 six-artifact converger. Success requires active root readers, boss check-ins,
@@ -12,9 +12,12 @@ credentials, cron, local code/config and owner workloads are preserved.
 
 Before any live closure, bridge, archive installation or administrator update, run
 `close.sh --preflight` from a **reviewed root-owned payload** in a clean root
-shell. This applies to every Mac and Linux host, including h-mini2 retries and
-preserved h-af/h-btp. Use an absolute path to the reviewed script; preflight can
-run from a private extracted review directory before `/opt/chief` exists. Its
+shell. This applies to every Mac and Linux host, including preserved h-af/h-btp.
+**Bridge hosts, including h-mini2 retries, must use the `/usr/local/.../close.sh
+--preflight` command under [Reachable Macs](#reachable-macs-with-a-trusted-legacy-delivery-path), after the reviewed
+legacy update.** A private-directory PASS does not gate that bridge's launcher
+or source tree. For the archive route, use an absolute path to the reviewed
+script; preflight can run from a private extracted review directory before `/opt/chief` exists. Its
 path must be symlink-free; on macOS use `/private/var/root/...`, not `/var/root/...`:
 
 ```sh
@@ -247,8 +250,10 @@ Only after installed-policy validation, effective-policy checks and sync does
 closure atomically write `/var/lib/chief/currency-step0/grants-removed`. Until then,
 a fixed launcher resumes closure. Interrupted attempts retry immediately; a
 completed revocation failure records its exact reason and retries at most once
-per 15 minutes. During that interval the prepared pulse and supervisor continue
-check-ins and health. After administrator policy repair, clearing the root-owned
+per 15 minutes. During that interval, and when closure returns 75 for a busy or
+interrupted lock handoff, the prepared pulse and supervisor continue check-ins
+and health. The updater still exits on 75 without replacing the payload.
+After administrator policy repair, clearing the root-owned
 `revocation-retry` stamp permits an immediate retry. A root-owned PID lock serializes attempts;
 Linux: boot clears the lock; macOS: boot UUID selects a new lock name.
 Dead holders on the current boot are reclaimed under an atomic reclaim guard. A live holder returns
@@ -288,6 +293,11 @@ Require all of the following per host:
 - Core receives check-ins and health, and a qualified full-wake plan demonstrably
   converges. Verify login, boot, lid-open/full wake and network return, plus the
   headless mini and GUI-absent cases. Dark/unknown wake emits health/deferred only.
+- After a Mac reboot clears `/var/run`, verify that a RunAtLoad root reader
+  recreates `/var/run/chief/runtime` as `root:chief 0770` without administrator
+  repair. Require a fresh converger check-in and a restart-required plan reaching
+  `applied` with a new login-user runtime stamp, not `runtime_ack_timeout` or
+  `rollback_unverified`. Record this post-reboot restart-convergence proof.
 
 A no-interpreter/config/override hold still removes unsafe grants, but exits
 nonzero and leaves a visible failed rollout. Fix it through remaining administrator
@@ -330,7 +340,10 @@ Unknown output, unqualified policy and dark wake defer mutation while health and
 check-ins continue. Mutations recheck the wake epoch, signed-plan freshness and
 power capability; a wake change during a run requires the next pulse to reauthorize.
 Qualify on headless h-mini2, h-air2 and h-mini: the paired Q6 runs, full/dark wakes,
-network returns, sleep races, latency, CPU/RSS and battery gates are still mandatory.
+network returns, sleep races, post-reboot restart-convergence, latency, CPU/RSS
+and battery gates are still mandatory. Q6 must include a reboot that clears
+`/var/run`, automatic directory recreation by either root reader, a fresh check-in,
+and a restart-required plan verified by a new login-user runtime stamp.
 The fixture is not live Apple Silicon or battery evidence.
 
 macOS `/var/run` (`/private/var/run`) is `root:daemon 0775` on all three measured
@@ -340,19 +353,30 @@ OS versions. Trust still rejects every group-writable directory; there is no
 `/var/lib/chief/reconcile.lock`, and leases at `/var/lib/chief/convergence`.
 These locks use trusted root-writable parent chains. Runtime stamps are the only
 macOS `/var/run` use: producer and consumer both use `/var/run/chief/runtime`.
-That directory is login-user-written data (`root:chief 0770`), not trusted code,
-locks or root state; preflight must accept the documented producer setup in
+That directory is login-user-written data (`root:chief 0770`); it is not
+trust-checked. The product owner's accepted rationale is that the producer is
+the login-user node attesting its own restart. A same-group writer gains nothing
+it could not already do, since it controls the node process. Code and root state
+stay strictly trust-checked. Preflight accepts the documented producer setup in
 [the runtime-directory repair](chief-node-source-reconciliation.md#missing-macos-runtime-directory).
-The reader still requires bounded, no-follow regular files. Closure does not
-rewrite owner jobs or provision the volatile runtime directory after reboot.
+The reader still requires bounded, no-follow regular files. Both RunAtLoad root
+readers now provision the volatile directory before service control, under the
+existing shared worker lock. Missing proof directories bypass cadence no-ops.
+The provisioner uses `mkdir` (`os.mkdir`, never `install -d`), then lstat-checks
+each entry as a root-owned directory, rejecting links and non-root entries with
+a loud HOLD. It checks group/mode before any correction and pins the verified
+directory with a no-follow descriptor for `fchown`/`fchmod`; final metadata must
+be `root:chief 0750` for `chief` and `root:chief 0770` for `runtime`. These are
+provisioning checks, not an assertion that runtime-proof data is trusted.
+Closure does not rewrite owner jobs. Live reboot proof remains a rollout gate.
 Linux uses `/run` for locks and `/run/chief/runtime` for runtime stamps.
 
 The audit also covers the shared worker/supervisor `run.lock`, trust cache, pulse
 boot/wake/online/check stamps and supervisor targets under
 `/var/lib/chief/currency-step0`; journals/restart limits under
 `/var/lib/chief/converger`; request slots under `/var/lib/chief/requests`; and
-update staging under `/opt/chief/lib`. No macOS root runtime writer uses
-`/var/run`. Closure, preflight, pulse and trust cache use `kern.bootsessionuuid`,
+update staging under `/opt/chief/lib`. Only runtime-proof directory provisioning
+uses `/var/run` as a root writer. Closure, preflight, pulse and trust cache use `kern.bootsessionuuid`,
 which identifies the boot independently of timezone, wall-clock and wake changes.
 Preflight requires that sysctl to succeed on the target; capture its output on
 both macOS 15 and 26 before rollout. Native version availability has not been
@@ -366,7 +390,8 @@ and rechecks liveness under that guard. If killed during PID publication or
 reclaim, the next attempt and preflight report `closure_pid_publication_pending`
 or `closure_reclaim_pending`. After verifying no closure is running, an
 administrator may remove that UUID's incomplete lock/guard and repeat preflight;
-a reboot also selects a fresh name. Neither path blindly reclaims a live or
+a reboot also selects a fresh name. Prepared readers continue check-ins and
+health on exit 75 while leaving the ambiguous lock/guard untouched. Neither path blindly reclaims a live or
 unpublished holder. Python's flock locks are released by the kernel on exit/reboot
 even though their files persist; pulse and trust cache invalidate old observations.
 
@@ -438,7 +463,8 @@ than holding the shared lock forever.
   resolve that shape before qualification, without editing/signing cached plans.
   Run Q6 paired 24h baseline/enabled tests on h-mini2/h-air2 then h-mini, covering
   AC/battery, closed-lid sleep, ≥20 full wakes, ≥10 dark wakes and ≥10 network
-  returns, sleep races, headless and GUI-absent cases. Zero observed dark wakes
+  returns, sleep races, post-reboot restart-convergence, headless and GUI-absent
+  cases. Zero observed dark wakes
   leaves qualification pending. Require zero dark-wake mutations, check-in ≤300s
   on full wake/return, and all CPU/RSS/battery caps above. Only then enable each
   node in `CHIEF_WAKE_QUALIFIED_NODES` and verify a fresh signed boolean.

@@ -410,7 +410,9 @@ if [ ! -f "$STATE/grants-removed" ]; then
     now=$(/bin/date +%s)
     if [ "$now" -ge "$value" ] || [ "$value" -gt "$((now + 900))" ]; then
         trusted_tree "$BASE/.." || refuse unsafe_payload_tree
-        exec /bin/sh "$BASE/close.sh"
+        closure_status=0
+        /bin/sh "$BASE/close.sh" || closure_status=$?
+        [ "$closure_status" -eq 75 ] || exit "$closure_status"
     fi
     # Safe readers still check in and report health during a revocation hold.
 fi
