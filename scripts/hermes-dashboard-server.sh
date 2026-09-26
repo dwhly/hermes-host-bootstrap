@@ -34,7 +34,7 @@ if [[ "$_os" == "Darwin" ]]; then
   export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/Applications/Tailscale.app/Contents/MacOS:$PATH"
 else
   # Linux: packaged install venv + user-local bin.
-  export PATH="/usr/local/lib/hermes-agent/venv/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
+  export PATH="/usr/local/lib/hermes-agent/venv/bin:$HOME/.local/bin:/root/.local/bin:/usr/local/bin:$PATH"
 fi
 
 # --- Load per-host dashboard auth from ~/.hermes/.env --------------------------

@@ -63,7 +63,8 @@ def render(runtime, platform, launcher, service, bind, port):
             raise ValueError('unexpected systemd dashboard unit')
         # Percent specifiers must not expand paths. Other metacharacters rejected above.
         lines = ['[Unit]', 'Description=Hermes fleet dashboard (auth required)',
-                 'After=network-online.target', 'Wants=network-online.target', '', '[Service]',
+                 'After=network-online.target tailscaled.service', 'Wants=network-online.target tailscaled.service',
+                 'StartLimitIntervalSec=600', 'StartLimitBurst=10', '', '[Service]',
                  'Type=simple', f"User={runtime['user']}", f"Group={runtime['group']}",
                  f"WorkingDirectory={runtime['home']}", f'ExecStart="{launcher}"']
         lines += [f'Environment="{key}={value}"' for key, value in env.items()]
