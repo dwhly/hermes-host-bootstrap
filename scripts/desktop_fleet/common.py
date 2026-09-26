@@ -4,11 +4,49 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
+import sys
+import shutil
 import tempfile
 
 
+class IntentUnavailable(ValueError):
+    """Optional rollout input/dependency is absent, not malformed."""
+
+
+def yaml_load(text):
+    """Prefer the Hermes interpreter when the system Python lacks PyYAML."""
+    candidates = [os.environ.get('HERMES_FLEET_PYTHON', ''),
+                  str(Path.home() / 'hermes-agent/venv/bin/python3'),
+                  str(Path.home() / 'hermes-agent/.venv/bin/python3')]
+    hermes = shutil.which('hermes')
+    if hermes:
+        candidates.append(str(Path(hermes).resolve().parent / 'python3'))
+    candidates.append('/usr/local/lib/hermes-agent/venv/bin/python3')
+    if not os.environ.get('HERMES_FLEET_YAML_RETRY'):
+        for candidate in dict.fromkeys(candidates):
+            if not candidate or not os.access(candidate, os.X_OK):
+                continue
+            code = ('import sys,json; sys.path.insert(0,sys.argv[1]); '
+                    'from desktop_fleet.common import parse; print(json.dumps(parse(sys.stdin.read())))')
+            proc = subprocess.run([candidate, '-c', code, str(Path(__file__).resolve().parents[1])],
+                                  input=text, text=True, capture_output=True,
+                                  env={**os.environ, 'HERMES_FLEET_YAML_RETRY': '1'})
+            if proc.returncode == 0:
+                return json.loads(proc.stdout)
+            if 'IntentUnavailable' not in proc.stderr:
+                raise ValueError('malformed YAML input')
+    raise IntentUnavailable('PyYAML unavailable; install it in the Hermes venv or set HERMES_FLEET_PYTHON')
+
+
 def load(path):
-    text = Path(path).read_text()
+    try:
+        return parse(Path(path).read_text())
+    except FileNotFoundError as exc:
+        raise IntentUnavailable('Intent/input file is absent') from exc
+
+
+def parse(text):
     def unique(pairs):
         result = {}
         for key, value in pairs:
@@ -19,7 +57,10 @@ def load(path):
     try:
         return json.loads(text, object_pairs_hook=unique)
     except json.JSONDecodeError:
-        import yaml  # Existing fleet YAML dependency; fixture JSON needs only stdlib.
+        try:
+            import yaml
+        except ImportError:
+            return yaml_load(text)
         class UniqueLoader(yaml.SafeLoader):
             pass
         def mapping(loader, node):
@@ -40,11 +81,31 @@ def host_record(registry, host):
     return matches[0]
 
 
-def update_policy(record):
-    policy = record.get('desktop_gateway', {}).get('update_policy', record.get('update_policy'))
-    if policy not in ('protected', 'eligible'):
+def gateway_record(record):
+    gateway = record.get('desktop_gateway', {})
+    if not isinstance(gateway, dict):
+        raise ValueError('desktop_gateway must be a mapping')
+    return gateway
+
+
+def update_policy(record, *, legacy=False):
+    gateway = gateway_record(record)
+    policies = [row['update_policy'] for row in (record, gateway) if 'update_policy' in row]
+    if not policies and legacy:
+        return None
+    if not policies or any(policy not in ('protected', 'eligible') for policy in policies):
         raise ValueError('Intent update policy is missing or invalid; refusing update')
-    return policy
+    if len(set(policies)) != 1:
+        raise ValueError('conflicting Intent update policies; refusing operation')
+    return policies[0]
+
+
+def optional_host_record(registry, host):
+    try:
+        return host_record(registry, host)
+    except IntentUnavailable as exc:
+        print(f'desktop-fleet: {exc}; legacy behavior only, new rollout actions disabled', file=sys.stderr)
+        return {}
 
 
 def digest(data):

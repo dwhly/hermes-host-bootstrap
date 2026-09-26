@@ -59,7 +59,7 @@ host_spec() {  # host_spec <host> -> echoes "ssh_target|oskind" or returns 2
 # Returns 3 for protected, 1 for indeterminate. No update or refresh precedes this.
 check_protection() {
   local host="$1" policy spec ssh_target rc=0
-  policy="$(python3 "$POLICY_HELPER" policy --registry "$INTENT" --host "$host")" || {
+  policy="$(python3 "$POLICY_HELPER" policy --legacy --registry "$INTENT" --host "$host")" || {
     err "$host" "indeterminate Intent policy — refusing update"; return 1;
   }
   if [[ "$policy" == protected ]]; then

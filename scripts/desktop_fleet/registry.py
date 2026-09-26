@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 from urllib.parse import urlsplit, urlunsplit
 
-from .common import digest, load, update_policy
+from .common import digest, load, update_policy, gateway_record
 
 AUTHORITY = 'hermes-config/fleet/hosts.yaml'
 
@@ -36,19 +36,20 @@ def manifest(registry, client, revision):
     rows = []
     complete = intent.get('complete') is True
     for record in hosts:
-        gateway = record.get('desktop_gateway')
-        if not gateway:
+        gateway = gateway_record(record)
+        policy = update_policy(record, legacy=True)
+        if not gateway or policy is None:
             complete = False
             rows.append({'managed_id': record['hostname'], 'label': record['hostname'],
                          'admission': 'pending-qualification', 'endpoint': None,
-                         'runtime': None, 'native_sign_in': None, 'update_policy': None})
+                         'runtime': None, 'native_sign_in': None, 'update_policy': policy})
             continue
         row = {key: gateway.get(key) for key in ('label', 'admission', 'runtime', 'endpoint', 'native_sign_in')}
         if isinstance(row['runtime'], dict):
             row['runtime'] = {key: value for key, value in row['runtime'].items() if key in
                 ('user', 'uid', 'group', 'home', 'hermes_home', 'executable', 'executable_sha256', 'build', 'auth_provider')}
         row['managed_id'] = record['hostname']
-        row['update_policy'] = update_policy(record)
+        row['update_policy'] = policy
         if not row['label'] or row['admission'] not in ('admitted', 'pending-qualification', 'deferred'):
             raise ValueError('invalid desktop declaration')
         if row['admission'] == 'admitted':

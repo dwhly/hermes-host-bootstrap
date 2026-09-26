@@ -4,7 +4,7 @@ import argparse
 import sys
 import json
 from pathlib import Path
-from desktop_fleet.common import host_record, rooted, update_policy
+from desktop_fleet.common import host_record, optional_host_record, rooted, update_policy
 from desktop_fleet import marker
 
 
@@ -13,15 +13,18 @@ def main():
     parser.add_argument('action', choices=['policy', 'verify', 'render', 'install', 'backup', 'suspend', 'restore'])
     parser.add_argument('--registry', required=True)
     parser.add_argument('--host', required=True)
+    parser.add_argument('--legacy', action='store_true', help='allow absent rollout policy for existing flows only')
     parser.add_argument('--root', default='/')
     parser.add_argument('--backup', default='/var/backups/hermes-desktop/image-provenance.json')
     args = parser.parse_args()
-    policy = update_policy(host_record(args.registry, args.host))
+    legacy = args.legacy and args.action in ('policy', 'verify')
+    record = optional_host_record(args.registry, args.host) if legacy else host_record(args.registry, args.host)
+    policy = update_policy(record, legacy=legacy)
     if args.action == 'policy':
-        print(policy)
+        print(policy or 'legacy')
     elif args.action == 'verify':
         if policy != 'protected':
-            print('not-applicable (eligible Intent)')
+            print('not-applicable (eligible or legacy Intent)')
         else:
             path = rooted(args.root, marker.MARKER)
             data = json.loads(path.read_text())
@@ -43,5 +46,5 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except (OSError, ValueError, KeyError, TypeError, ImportError):
-        sys.exit('desktop-fleet-policy: invalid/unavailable Intent or marker; operation refused')
+    except (OSError, ValueError, KeyError, TypeError, ImportError) as exc:
+        sys.exit('desktop-fleet-policy: ' + str(exc) + '; operation refused')

@@ -121,7 +121,7 @@ PY
 verify_desktop_g3() {
   local helper
   helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/desktop-fleet-policy.py"
-  python3 "$helper" verify \
+  python3 "$helper" verify --legacy \
     --registry "${HERMES_FLEET_INTENT:-${HERMES_HOME:-$HOME/.hermes}/fleet/hosts.yaml}" \
     --host "$(hostname -s)"
 }
@@ -129,6 +129,10 @@ verify_desktop_g3() {
 verify_desktop_fleet() {
   if [[ "$(uname -s)" != Darwin ]]; then
     printf '%s\n' not-applicable
+    return 0
+  fi
+  if [[ ! -f "${HERMES_HOME:-$HOME/.hermes}/fleet/generated/desktop-gateways.json" ]]; then
+    printf '%s\n' 'not-configured (desktop rollout pending)'
     return 0
   fi
   local args=(verify --hermes-home "${HERMES_HOME:-$HOME/.hermes}")
@@ -140,6 +144,10 @@ verify_desktop_fleet() {
 verify_desktop_fleet_version() {
   if [[ "$(uname -s)" != Darwin ]]; then
     printf '%s\n' not-applicable
+    return 0
+  fi
+  if [[ ! -f "${HERMES_HOME:-$HOME/.hermes}/fleet/generated/desktop-gateways.json" ]]; then
+    printf '%s\n' 'not-configured (desktop rollout pending)'
     return 0
   fi
   hermes-desktop-fleet-warm "$1"

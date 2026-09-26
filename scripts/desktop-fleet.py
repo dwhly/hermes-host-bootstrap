@@ -9,7 +9,7 @@ import re
 import subprocess
 import sys
 
-from desktop_fleet.common import atomic_write, digest, json_bytes, load
+from desktop_fleet.common import atomic_write, digest, json_bytes, load, IntentUnavailable
 from desktop_fleet.registry import checklist, manifest, read_only_report
 
 REPO = Path(__file__).resolve().parents[1]
@@ -72,14 +72,26 @@ def main():
     p.add_argument('--user-data', type=Path, default=Path(os.environ.get('HERMES_DESKTOP_USER_DATA_DIR', str(Path.home() / 'Library/Application Support/Hermes'))))
     p.add_argument('--app-log', type=Path, help='log of the current app launch for effective pool settings')
     p.add_argument('--app-pin', type=Path, help='reviewed app build pin; checked post-build only')
+    p.add_argument('--optional', action='store_true', help='bootstrap: skip an unconfigured rollout without writes')
     a = p.parse_args()
     generated = a.hermes_home / 'fleet/generated'
     if a.action in ('version', 'app-version'):
         print(version(a.hermes_home, a.action == 'app-version'))
     elif a.action in ('render', 'install'):
+        try:
+            data = manifest(a.registry, a.client, a.revision)
+        except IntentUnavailable as exc:
+            if not a.optional:
+                raise
+            print(f'not-configured ({exc}); desktop rollout disabled')
+            return 0
+        if a.action == 'install' and not data['complete']:
+            if a.optional:
+                print('not-configured (complete desktop Intent required); desktop rollout disabled')
+                return 0
+            raise ValueError('complete desktop Intent is required for installation')
         if not a.revision:
             raise ValueError('explicit registry revision is required')
-        data = manifest(a.registry, a.client, a.revision)
         if a.action == 'render':
             print(json.dumps({'manifest': data, 'checklist': checklist(data)}, sort_keys=True))
             return
@@ -119,5 +131,7 @@ def main():
 if __name__ == '__main__':
     try:
         sys.exit(main())
+    except IntentUnavailable as exc:
+        sys.exit('desktop-fleet: ' + str(exc) + '; enrollment disabled')
     except (OSError, ValueError, KeyError, TypeError, ImportError, subprocess.SubprocessError):
         sys.exit('desktop-fleet: indeterminate inventory, settings, or artifact pin; stop enrollment; no removal advice')

@@ -7,7 +7,7 @@ import pwd
 import socket
 import sys
 from desktop_fleet import dashboard, marker
-from desktop_fleet.common import host_record, update_policy
+from desktop_fleet.common import optional_host_record, update_policy, gateway_record
 
 
 def main():
@@ -28,7 +28,10 @@ def main():
                    home=a.home, hermes_home=a.hermes_home, executable=a.executable)
     if user.pw_dir != a.home or not os.access(a.executable, os.X_OK):
         raise ValueError('runtime account/home or executable mismatch')
-    policy = update_policy(host_record(a.registry, a.host))
+    record = optional_host_record(a.registry, a.host)
+    policy = update_policy(record, legacy=True)
+    if policy == 'protected' and gateway_record(record).get('dashboard_vehicle') != 'module97':
+        raise ValueError('protected host requires the preserved-node apply vehicle; module97 not authorized in Intent')
     mac = a.platform == 'macos'
     launcher = a.home + '/.local/bin/hermes-dashboard-server' if mac else '/usr/local/bin/hermes-dashboard-server'
     service = dashboard.LABEL if mac else 'hermes-dashboard-server.service'
@@ -48,5 +51,5 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except (OSError, ValueError, KeyError, ImportError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, ImportError) as exc:
         sys.exit('desktop-dashboard: ' + str(exc))

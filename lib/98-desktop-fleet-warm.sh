@@ -11,8 +11,8 @@ if ! tier_allows R || ! role_includes client || [[ "$OS" != macos ]] || is_skipp
 fi
 fleet_home="${HERMES_HOME:-$HOME/.hermes}"
 intent="${HERMES_FLEET_INTENT:-$fleet_home/fleet/hosts.yaml}"
-revision="${HERMES_FLEET_REVISION:-$(git -C "$(dirname "$intent")" rev-parse HEAD)}"
-args=(install --registry "$intent" --revision "$revision" --hermes-home "$fleet_home")
+revision="${HERMES_FLEET_REVISION:-$(git -C "$(dirname "$intent")" rev-parse HEAD 2>/dev/null || true)}"
+args=(install --optional --registry "$intent" --revision "$revision" --hermes-home "$fleet_home")
 if [[ -n "${HERMES_DESKTOP_APP_PIN:-}" ]]; then
   args+=(--app-pin "$HERMES_DESKTOP_APP_PIN")
 fi
