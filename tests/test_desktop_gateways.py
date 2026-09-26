@@ -40,7 +40,7 @@ class Fixtures(unittest.TestCase):
         self.intent.write_bytes(json_bytes({'complete': True, 'hosts': [self.host('h-btp', 'protected'), self.host('mac', 'eligible')]}))
 
     def host(self, name, policy):
-        return {'hostname': name, 'desktop_gateway': dict(label=name, admission='admitted',
+        return {'hostname': name, 'desktop_client': 'enabled', 'desktop_gateway': dict(label=name, admission='admitted',
             runtime=self.runtime, endpoint=f'https://{name}.example.test', native_sign_in='password', update_policy=policy,
             g3_marker='armed' if policy == 'protected' else 'deferred', dashboard_vehicle='preserved-node')}
 

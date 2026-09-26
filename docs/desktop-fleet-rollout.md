@@ -18,6 +18,15 @@ build and review perform only fixture checks; they do not authorize host changes
    and preserved-node apply require their explicit declarations and fail closed.
    Verification reports an unconfigured desktop rollout without failing existing
    hosts. It does not claim G3 or desktop qualification.
+
+   **Reader ordering is an activation gate before the declared Intent merges.**
+   Record the deployed SHA for every bootstrap checkout that can read it on
+   h-do1, h-mini, h-mini2, h-air and h-air2, including cached/collector copies.
+   Every reader must contain slice 1.1 (`55daa05` and its final fix `dbb6e63`)
+   and this slice 1.2 client gate. Slice-1 readers ignore marker deferral and
+   admission; slice-1.1 readers still install the client on every Mac.
+   Offline hosts do not waive this ordering gate. Follow each Mac's Step 0 and
+   owner window requirements before advancing its checkout.
 2. Before enabling the new protection/enrollment actions, land and review the
    hermes-config change for all seven hosts: one consistent `update_policy`,
    `desktop_gateway` declarations and top-level `complete: true`. Declare
@@ -36,6 +45,36 @@ build and review perform only fixture checks; they do not authorize host changes
    | h-af | protected | pending-qualification | deferred | preserved-node |
    | h-air2 | eligible | pending-qualification; endpoint null | omitted | module97 |
    | h-mini, h-mini2, h-air | eligible | admitted after their rollout gates | omitted | module97 |
+
+   Client installation is independently enabled per host with the optional
+   **host-row** field `desktop_client: enabled` (a sibling of `desktop_gateway`).
+   In declared Intent, omission means `desktop_client: deferred`; the only valid
+   values are `enabled` and `deferred`. Invalid values refuse the operation.
+   Declaration alone never enables a client. Change a host to `enabled` in the
+   same reviewed Intent commit as that host's rollout window, **h-mini2 first**,
+   after its app/plugin pin, canary prerequisites and owner approvals are met
+   (including h-air's custom app approval). Subsequent hosts wait for the canary
+   proof. This desired state also applies when an offline host returns; local
+   `SKIP_KEYS` changes are not the rollout gate.
+
+   Module 98 and `fleet-enroll-existing --desktop-only` both use the install
+   gate: `deferred` exits 0 without creating directories or writing the manifest,
+   checklist, live plugin, receipt or tools. The client identity is the short
+   hostname (or explicit `--client`), matched exactly to `hosts[].hostname`.
+   A missing/duplicate client row still refuses with a nonzero exit and no writes.
+   `enabled` retains the existing installation and post-build app-pin checks;
+   enabling it does not itself qualify the app. Legacy/undeclared behavior stays
+   unchanged, including optional install's `not-configured` result.
+
+   Client verification reports `deferred (client deferred for HOST; ...)`, exit
+   0, using the marker's existing `status: deferred` reporting shape for the
+   registry, plugin-version and app-pin checks. Any leftover manifest, plugin,
+   receipt, checklist or tools are listed as untouched; deferral does not unload
+   or uninstall a previously enabled plugin and asserts no qualification.
+   Before activation, Chief must render `deferred` neutrally: the existing
+   slice-1.1 r1 MINOR 2 consumer fix is still required in Chief, separately from
+   this bootstrap change. An enabled client without its manifest still fails
+   verification until installation runs.
 
    `deferred` blocks marker creation, restoration and suspension at every writer;
    any pre-existing marker remains untouched. Explicit backup remains available.

@@ -53,6 +53,219 @@ class PolicyTests(unittest.TestCase):
         return [sys.executable, '-c', runner, str(REPO / 'scripts'), str(common.BASELINE_INTENT),
                 str(REPO / 'scripts/desktop-fleet.py'), *args]
 
+    def client_intent(self, state='deferred'):
+        rows = [{'hostname': name, 'update_policy': 'eligible', 'desktop_client': 'enabled',
+                 'desktop_gateway': {'label': name, 'admission': 'pending-qualification',
+                                     'endpoint': None, 'runtime': None, 'native_sign_in': None}}
+                for name in ('mac', 'other-mac')]
+        if state == 'absent':
+            rows[0].pop('desktop_client')
+        else:
+            rows[0]['desktop_client'] = state
+        path = self.root / 'client-intent.json'
+        path.write_bytes(common.json_bytes({'complete': True, 'hosts': rows}))
+        return path
+
+    def home_snapshot(self):
+        # Include directories and metadata: even an empty mkdir violates deferral.
+        result = {}
+        for path in [self.root, *self.root.rglob('*')]:
+            info = path.lstat()
+            result[str(path.relative_to(self.root))] = (
+                path.read_bytes() if path.is_file() else None, info.st_mode, info.st_ino,
+                info.st_uid, info.st_gid, info.st_mtime_ns, info.st_ctime_ns)
+        return result
+
+    def test_client_install_deferred_or_absent_is_zero_write(self):
+        for state in ('deferred', 'absent'):
+            path = self.client_intent(state)
+            for optional in ([], ['--optional']):
+                with self.subTest(state=state, optional=optional):
+                    before = self.home_snapshot()
+                    # Neither a revision nor an app-pin file is needed to defer.
+                    result = subprocess.run(self.fleet_command('install', '--registry', str(path),
+                        '--client', 'mac', '--app-pin', str(self.root / 'missing-pin'), *optional),
+                        capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(),
+                        'desktop-fleet: client install deferred for mac (desktop_client=deferred)')
+                    self.assertEqual(before, self.home_snapshot())
+
+    def test_client_invalid_values_and_unknown_hosts_fail_closed(self):
+        for state in (None, True, False, '', 'enable', [], {}):
+            path = self.client_intent(state)
+            with self.assertRaisesRegex(ValueError, 'desktop_client is invalid'):
+                registry.manifest(path, 'mac', 'fixture')
+            for action in ('install', 'verify'):
+                for optional in ([], ['--optional']):
+                    before = self.home_snapshot()
+                    result = subprocess.run(self.fleet_command(action, '--registry', str(path),
+                        '--client', 'mac', '--revision', 'fixture', *optional), capture_output=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(before, self.home_snapshot())
+        path = self.client_intent()
+        for action in ('install', 'verify'):
+            for optional in ([], ['--optional']):
+                before = self.home_snapshot()
+                result = subprocess.run(self.fleet_command(action, '--registry', str(path),
+                    '--client', 'unknown-mac', '--revision', 'fixture', *optional), capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(before, self.home_snapshot())
+        # Deferral cannot hide a bad declaration elsewhere in the fleet.
+        intent = json.loads(path.read_text())
+        intent['hosts'][1]['desktop_client'] = 'invalid'
+        path.write_bytes(common.json_bytes(intent))
+        with self.assertRaisesRegex(ValueError, 'desktop_client is invalid'):
+            registry.manifest(path, 'mac', 'fixture')
+
+    def test_enabled_client_matches_slice11_artifacts_and_copies_current_tools(self):
+        path = self.client_intent('enabled')
+        golden = json.loads((REPO / 'tests/fixtures/desktop-enabled-slice1-1.json').read_text())
+        self.assertEqual(common.digest(path.read_bytes()), golden['intent_sha256'])
+        command = self.fleet_command('install', '--registry', str(path), '--client', 'mac',
+                                     '--revision', 'fixture')
+        # The enabled path retains the explicit revision requirement.
+        before = self.home_snapshot()
+        self.assertNotEqual(subprocess.run(command[:-2], capture_output=True).returncode, 0)
+        self.assertEqual(before, self.home_snapshot())
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'changed')
+        artifacts = {str(p.relative_to(self.root)) for directory in ('.hermes', '.local')
+                     for p in (self.root / directory).rglob('*') if p.is_file()}
+        self.assertEqual(artifacts, set(golden['artifact_sha256']) | set(golden['tool_sources']))
+        for name, sha256 in golden['artifact_sha256'].items():
+            self.assertEqual(common.digest((self.root / name).read_bytes()), sha256, name)
+        # Tools are source inputs: their installed bytes track this build, while
+        # the paths and generated payloads are frozen from dbb6e63's installer.
+        for name, source in golden['tool_sources'].items():
+            self.assertEqual((self.root / name).read_bytes(), (REPO / source).read_bytes(), name)
+        for name in artifacts:
+            expected_mode = 0o755 if name.startswith('.local/bin/') else 0o644
+            self.assertEqual((self.root / name).stat().st_mode & 0o777, expected_mode)
+        before = self.home_snapshot()
+        result = subprocess.run(command + ['--optional'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'unchanged')
+        self.assertEqual(before, self.home_snapshot())
+        with self.assertRaisesRegex(ValueError, 'app pin unselected'):
+            fleet.version(self.root / '.hermes', app=True)
+        # Enabling this client does not require another client's enablement.
+        intent = json.loads(path.read_text())
+        intent['hosts'][1]['desktop_client'] = 'deferred'
+        path.write_bytes(common.json_bytes(intent))
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'changed')
+        # Reverting desired state preserves every installed byte and reports it.
+        intent['hosts'][0]['desktop_client'] = 'deferred'
+        path.write_bytes(common.json_bytes(intent))
+        before = self.home_snapshot()
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('client install deferred for mac', result.stdout)
+        result = subprocess.run(self.fleet_command('verify', '--registry', str(path), '--client', 'mac'),
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in artifacts - set(golden['tool_sources']):
+            self.assertIn(str(self.root / name), result.stdout)
+        self.assertEqual(before, self.home_snapshot())
+
+    def test_client_verify_deferred_reports_leftovers_without_mutation(self):
+        home = self.root / '.hermes'
+        artifacts = ['fleet/generated/desktop-gateways.json',
+                     'desktop-plugins/fleet-gateways/plugin.js']
+        for state in ('deferred', 'absent'):
+            path = self.client_intent(state)
+            for leftover in (None, *artifacts):
+                if leftover:
+                    artifact = self.intent_copy(home / leftover, 'leftover bytes; deliberately not valid JSON')
+                for optional in ([], ['--optional']):
+                    before = self.home_snapshot()
+                    result = subprocess.run(self.fleet_command('verify', '--registry', str(path),
+                        '--client', 'mac', *optional), capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue(result.stdout.startswith('deferred (client deferred for mac;'))
+                    self.assertIn('leftover client artifacts (untouched)' if leftover
+                                  else 'no client artifacts installed', result.stdout)
+                    if leftover:
+                        self.assertIn(str(artifact), result.stdout)
+                    self.assertEqual(before, self.home_snapshot())
+                if leftover:
+                    artifact.unlink()
+
+    def client_shell_fixture(self):
+        # Real shell entrypoints, real Python, only OS identity/common.sh are fixtures.
+        repo = self.root / 'bootstrap'
+        (repo / 'lib').mkdir(parents=True)
+        (repo / 'scripts').symlink_to(REPO / 'scripts', target_is_directory=True)
+        (repo / 'lib/common.sh').write_text('''OS=macos
+tier_allows() { return 0; }
+role_includes() { return 0; }
+is_skipped() { return 1; }
+''')
+        module = repo / 'lib/98-desktop-fleet-warm.sh'
+        module.write_bytes((REPO / 'lib/98-desktop-fleet-warm.sh').read_bytes())
+        driver = self.root / 'python-driver.py'
+        driver.write_text('''import os, platform, runpy, sys
+from pathlib import Path
+sys.dont_write_bytecode = True
+sys.path.insert(0, ''' + repr(str(REPO / 'scripts')) + ''')
+from desktop_fleet import common
+common.BASELINE_INTENT = Path(os.environ['HOME']) / 'absent-baseline'
+platform.node = lambda: 'mac.fixture.test'
+sys.argv = sys.argv[1:]
+if sys.argv[0] == '-B':
+    sys.argv.pop(0)
+if sys.argv[0] == '-c':
+    code = sys.argv.pop(1)
+    exec(code)
+else:
+    runpy.run_path(sys.argv[0], run_name='__main__')
+''')
+        bin_dir = self.root / 'fixture-bin'
+        bin_dir.mkdir()
+        python = bin_dir / 'python3'
+        python.write_text('#!/bin/sh\nexec ' + shlex.quote(sys.executable) + ' ' + shlex.quote(str(driver)) + ' "$@"\n')
+        python.chmod(0o755)
+        # No host tools, service managers, networking or git are on this PATH.
+        for name in ('dirname', 'sed'):
+            (bin_dir / name).symlink_to(shutil.which(name))
+        env = {'HOME': str(self.root), 'PATH': str(bin_dir), 'REPO_ROOT': str(repo),
+               'HERMES_FLEET_REVISION': 'fixture', 'HERMES_FLEET_INTENT': str(self.client_intent())}
+        return module, env
+
+    def test_real_module98_and_desktop_enrollment_defer_own_short_hostname(self):
+        module, env = self.client_shell_fixture()
+        commands = ([shutil.which('bash'), str(module)],
+                    [shutil.which('bash'), str(REPO / 'scripts/fleet-enroll-existing'), '--desktop-only'])
+        for state in ('deferred', 'absent'):
+            self.client_intent(state)
+            for command in commands:
+                before = self.home_snapshot()
+                result = subprocess.run(command, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(),
+                    'desktop-fleet: client install deferred for mac (desktop_client=deferred)')
+                self.assertEqual(before, self.home_snapshot())
+
+    def test_verify_shell_checks_emit_deferred_status_even_with_leftovers(self):
+        _, env = self.client_shell_fixture()
+        for leftovers in (False, True):
+            if leftovers:
+                self.intent_copy(self.root / '.hermes/fleet/generated/desktop-gateways.json', '{}')
+                self.intent_copy(self.root / '.hermes/desktop-plugins/fleet-gateways/plugin.js', 'old plugin')
+            for check in ('verify_desktop_fleet', 'verify_desktop_fleet_version --version',
+                          'verify_desktop_fleet_version --app-version'):
+                before = self.home_snapshot()
+                script = 'source "$1/verify.sh"; uname() { echo Darwin; }; verify_run_check "$2"'
+                result = subprocess.run([shutil.which('bash'), '-c', script, '_', str(REPO), check],
+                                        env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(result.stdout.startswith('deferred\t\tdeferred (client deferred for mac;'), result.stdout)
+                self.assertIn('leftover client artifacts' if leftovers else 'no client artifacts', result.stdout)
+                self.assertEqual(before, self.home_snapshot())
+
     def test_real_yaml_shape_is_legacy_and_cannot_enroll(self):
         path = REPO / 'tests/fixtures/desktop-legacy-hosts.yaml'
         row = host_record(path, 'h-btp')
@@ -326,7 +539,7 @@ verify_check desktop-g3-marker false hermes verify_desktop_g3
             args = self.fleet_command('verify', '--optional', '--registry', str(intent),
                                      '--client', 'mac', '--hermes-home', tmp)
             self.assertEqual(subprocess.run(args, capture_output=True).returncode, 0)
-            row = dict(hostname='mac', desktop_gateway=dict(label='mac', admission='admitted',
+            row = dict(hostname='mac', desktop_client='enabled', desktop_gateway=dict(label='mac', admission='admitted',
                        runtime={'uid': 501}, endpoint='https://mac.test', native_sign_in='password'))
             intent.write_text(json.dumps({'complete': True, 'hosts': [row]}))
             self.assertNotEqual(subprocess.run(args, capture_output=True).returncode, 0)

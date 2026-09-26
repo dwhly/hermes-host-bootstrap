@@ -1,0 +1,20 @@
+{
+  "artifact_sha256": {
+    ".hermes/desktop-plugins/fleet-gateways/installed.json": "fd8d0b21c0546f406ae9793c28eca13a905f2ec0f5d1c10e7be06ef2bd86a2dc",
+    ".hermes/desktop-plugins/fleet-gateways/plugin.js": "c68032c5f38d3cf3293cbca3e2559fae64dc34747b7036ce618207168b7a789c",
+    ".hermes/fleet/generated/desktop-gateways-checklist.txt": "587e0643696079aebf3f29377c96eb0d91aa05d8129bde15bb54603dd2b03d81",
+    ".hermes/fleet/generated/desktop-gateways.json": "d52cb730a11fc40768292aa944236cb7b4200ef6073b6d661f2f32aebcd6b3e3"
+  },
+  "intent_sha256": "f111f4b54806aba51f4246b1e9940e285dede928043db603dab122485ef9637f",
+  "source_revision": "dbb6e63",
+  "tool_sources": {
+    ".hermes/fleet/tools/desktop-fleet.py": "scripts/desktop-fleet.py",
+    ".hermes/fleet/tools/desktop_fleet/__init__.py": "scripts/desktop_fleet/__init__.py",
+    ".hermes/fleet/tools/desktop_fleet/common.py": "scripts/desktop_fleet/common.py",
+    ".hermes/fleet/tools/desktop_fleet/compatibility.json": "desktop-plugins/fleet-gateways/compatibility.json",
+    ".hermes/fleet/tools/desktop_fleet/dashboard.py": "scripts/desktop_fleet/dashboard.py",
+    ".hermes/fleet/tools/desktop_fleet/marker.py": "scripts/desktop_fleet/marker.py",
+    ".hermes/fleet/tools/desktop_fleet/registry.py": "scripts/desktop_fleet/registry.py",
+    ".local/bin/hermes-desktop-fleet-warm": "scripts/hermes-desktop-fleet-warm"
+  }
+}

@@ -201,11 +201,19 @@ def gateway_record(record):
     return gateway
 
 
+def desktop_client(record):
+    state = record.get('desktop_client', 'deferred')
+    if state not in ('enabled', 'deferred'):
+        raise ValueError('desktop_client is invalid; expected enabled or deferred')
+    return state
+
+
 def update_policy(record, *, legacy=False):
     gateway = gateway_record(record)
     policies = [row['update_policy'] for row in (record, gateway) if 'update_policy' in row]
     if not policies and legacy:
         return None
+    desktop_client(record)
     if not policies or any(policy not in ('protected', 'eligible') for policy in policies):
         raise ValueError('Intent update policy is missing or invalid; refusing update')
     if len(set(policies)) != 1:

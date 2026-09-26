@@ -151,7 +151,11 @@ verify_desktop_fleet_version() {
   fi
   local fleet_repo
   fleet_repo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  hermes-desktop-fleet-warm "$1" --compatibility "$fleet_repo/desktop-plugins/fleet-gateways/compatibility.json"
+  local action=version
+  [[ "$1" != --app-version ]] || action=app-version
+  python3 "$fleet_repo/scripts/desktop-fleet.py" "$action" --optional \
+    --hermes-home "${HERMES_HOME:-$HOME/.hermes}" \
+    --compatibility "$fleet_repo/desktop-plugins/fleet-gateways/compatibility.json"
 }
 
 verify_mac_desktop_pmset() {
