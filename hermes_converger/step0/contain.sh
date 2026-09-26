@@ -81,14 +81,21 @@ EOF
 }
 
 stop_jobs() {
+    # Disable EVERY trigger before stopping anything: stopping a service can
+    # terminate this shell. Callers must publish a current hold receipt first.
     if [ "$OS" = Darwin ]; then
         for label in com.chief.node-reconcile com.chief.node-supervisor com.chief.update-request; do
-            /bin/launchctl bootout "system/$label" 2>/dev/null || true
             /bin/launchctl disable "system/$label"
         done
+        for label in com.chief.node-reconcile com.chief.node-supervisor com.chief.update-request; do
+            /bin/launchctl bootout "system/$label" 2>/dev/null || true
+        done
     else
-        for unit in chief-node-reconcile.service chief-node-converger.service chief-node-supervisor.service chief-node-supervisor.timer chief-update.service chief-update.timer chief-update-request.path; do
-            /usr/bin/systemctl disable --now "$unit" 2>/dev/null || true
+        for unit in chief-node-reconcile.service chief-node-converger.service chief-node-supervisor.service chief-node-supervisor.timer chief-update.service chief-update.timer chief-update-request.path chief-update-request.service; do
+            /usr/bin/systemctl disable "$unit" 2>/dev/null || true
+        done
+        for unit in chief-node-supervisor.timer chief-update.timer chief-update-request.path chief-node-reconcile.service chief-node-converger.service chief-node-supervisor.service chief-update.service chief-update-request.service; do
+            /usr/bin/systemctl stop "$unit" 2>/dev/null || true
         done
     fi
 }
@@ -118,8 +125,8 @@ contain() {
     containment_reason=$*
     printf 'chief Step 0 HOLD: %s; disabling root jobs and retiring sudo grants\n' "$*" >&2
     OS=$(/usr/bin/uname -s)
-    stop_jobs
     receipt "contained:$containment_reason" disabled pending
+    stop_jobs
     trap 'receipt "contained:$containment_reason:${HOLD_REASON:-revocation_failed}" disabled pending; send_receipt' EXIT
     remove_grants
     receipt "contained:$containment_reason" disabled removed

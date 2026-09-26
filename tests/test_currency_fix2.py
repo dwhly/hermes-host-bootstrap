@@ -217,7 +217,7 @@ def test_offline_periodic_has_no_python_but_keeps_explicit_hints(tmp_path):
     host=PulseHost(tmp_path)
     host.tool('curl','exit 1')
     (host.state/'online').write_text('no\n')
-    (host.state/'last-check').write_text(str(int(time.time())-3600)+'\n')
+    (host.state/'last-check').write_text(str(int(time.time())-600)+'\n')
     result=host.run();assert result.returncode==0 and 'python=0' in result.stdout
     # Replace only the worker boundary with a fixture exit; pending hints must
     # reach it without being consumed by shell even when offline.

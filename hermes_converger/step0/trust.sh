@@ -30,13 +30,20 @@ trusted_entries() {
         /opt/chief/bin/hermes-converger /opt/chief/bin/chief-node-supervisor /opt/chief/bin/chief-update \
         "$STATE" "$CONFIG" "$REQUESTS"
     if [ "$TRUST_OS" = Darwin ]; then
-        set -- "$@" /private /private/var /private/var/lib /private/var/lib/chief /private/etc /private/etc/chief
+        set -- "$@" /private /private/var /private/var/lib /private/var/lib/chief /private/etc /private/etc/chief /private/var/log
+        # Include existing launchd logs in the same trust/ACL batch. Truncating
+        # in place retains launchd's open append descriptors and adds no fork.
+        for log in /private/var/log/com.chief.node-reconcile.log /private/var/log/com.chief.node-reconcile.err \
+                   /private/var/log/com.chief.node-supervisor.log /private/var/log/com.chief.node-supervisor.err \
+                   /private/var/log/com.chief.update-request.log /private/var/log/com.chief.update-request.err; do
+            if [ -e "$log" ] || [ -L "$log" ]; then set -- "$@" "$log"; fi
+        done
     else
         set -- "$@" /var /var/lib /var/lib/chief /etc /etc/chief
     fi
     if [ "$TRUST_OS" = Darwin ]; then
         mode_base=0
-        meta=$(/usr/bin/stat -f '%u %p' "$@") || return 1
+        meta=$(/usr/bin/stat -f '%u %p %z %N' "$@") || return 1
         acl=$(/bin/ls -lde "$@") || return 1
         # ACL records start with a numbered entry; '+' also marks an ACL.
         while IFS= read -r row; do
@@ -49,10 +56,14 @@ EOF
         mode_base=0x
         meta=$(/usr/bin/stat -c '%u %f' "$@") || return 1
     fi
-    while read -r uid mode; do
+    while read -r uid mode size path; do
         permissions=$(( ${mode_base}${mode} ))
         [ "$uid" = 0 ] && [ $((permissions & 0022)) -eq 0 ] &&
             [ $((permissions & 0170000)) -ne $((0120000)) ] || { hold unsafe_entry_chain; return 1; }
+        case "$path" in /private/var/log/com.chief.*)
+            [ $((permissions & 0170000)) -eq $((0100000)) ] || { hold unsafe_log; return 1; }
+            if [ "$size" -ge 1048576 ]; then : > "$path"; fi;;
+        esac
     done <<EOF
 $meta
 EOF

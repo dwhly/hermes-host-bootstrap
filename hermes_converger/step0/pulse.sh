@@ -41,7 +41,12 @@ while IFS='=' read -r name value; do
 done < "$CONFIG"
 [ -n "$url" ] || { hold missing_core_url; exit 1; }
 online=no
-/usr/bin/curl --silent --max-time 1 --connect-timeout 1 --noproxy '*' --output /dev/null -- "$url/health" && online=yes
+# Cold/relayed Tailscale paths need more than one second. Retry one miss without
+# adding any work to the normal successful probe (six seconds maximum total).
+probe_core() {
+    /usr/bin/curl --silent --max-time 3 --connect-timeout 3 --noproxy '*' --output /dev/null -- "$url/health"
+}
+if probe_core || probe_core; then online=yes; fi
 read_state online no; old_online=$value
 if [ "$online" != "$old_online" ]; then
     if [ "$online" = yes ]; then
@@ -57,9 +62,11 @@ read_state full no; old_full=$value
 [ "$full" != yes ] || [ "$old_full" = yes ] || trigger=wake
 [ "$boot" = "$old_boot" ] || trigger=boot
 # Worker commits stamps under the shared lock. Pending wake/return survives a
-# busy worker. Offline periodic checks do not start Python; explicit hints do.
+# busy worker. Offline suppression is bounded by the last worker check; explicit
+# hints and the half-hour fallback still run even during a persistent outage.
 noop=no
-[ "$online" != no ] || [ "$trigger" != periodic ] || [ "$pending" != no ] || noop=yes
+if [ "$online" = no ] && [ "$trigger" = periodic ] && [ "$pending" = no ] &&
+   [ $((now - last)) -ge 0 ] && [ $((now - last)) -lt 1800 ]; then noop=yes; fi
 if [ $((now - last)) -ge 0 ]; then
     [ $((now - last)) -ge 60 ] || noop=yes
     [ "$trigger" != periodic ] || [ $((now - last)) -ge 300 ] || noop=yes

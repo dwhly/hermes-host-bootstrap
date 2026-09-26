@@ -8,13 +8,15 @@ archive=$1
 expected=$2
 case "$expected" in ''|*[!0-9a-f]*) exit 2;; esac
 [ "${#expected}" = 64 ] || exit 2
-case "$(/usr/bin/uname -s)" in
+OS=$(/usr/bin/uname -s)
+case "$OS" in
     Darwin) private=/var/root;;
     Linux) private=/root;;
     *) echo 'unsupported platform' >&2; exit 1;;
 esac
 stage=$(/usr/bin/mktemp -d "$private/currency-step0.XXXXXX")
-trap '/bin/rm -rf "$stage"' EXIT
+previous=''
+trap '/bin/rm -rf "$stage"; [ -z "$previous" ] || /bin/rm -rf "$previous"' EXIT
 /bin/chmod 0700 "$stage"
 # Copy before hashing: the transfer account may replace the source at any time.
 # Neither tar nor imported code ever reads that source after this copy.
@@ -35,8 +37,15 @@ for dir in /opt /opt/chief /opt/chief/bin /opt/chief/lib /opt/chief/lib/hermes-h
     if [ ! -e "$dir" ]; then /usr/bin/install -d -o root -m 0755 "$dir"; fi
     trusted_path "$dir"
 done
+# Publish the hold and stop jobs before either the payload or markers change.
+# Use only the already verified archive's helpers, including on first install.
+# shellcheck source=hermes_converger/step0/contain.sh
+. "$stage/hermes_converger/step0/contain.sh"
+receipt preparing disabled pending
+stop_jobs
+/bin/rm -f /var/lib/chief/currency-step0/prepared /var/lib/chief/currency-step0/grants-removed
 # Copy the verified tree to the fixed root-owned home, avoiding /usr/local on
-# Intel Homebrew Macs. Retain the previous payload for administrator inspection.
+# Intel Homebrew Macs. The previous tree is private temporary update state.
 base=/opt/chief/lib/hermes-host-bootstrap
 if [ -e "$base/hermes_converger" ]; then
     trusted_tree "$base/hermes_converger"
@@ -44,8 +53,4 @@ if [ -e "$base/hermes_converger" ]; then
     /bin/mv "$base/hermes_converger" "$previous/"
 fi
 /bin/cp -R "$stage/hermes_converger" "$base/"
-if [ -d /var/lib/chief/currency-step0 ]; then
-    trusted_path /var/lib/chief/currency-step0
-    /bin/rm -f /var/lib/chief/currency-step0/prepared /var/lib/chief/currency-step0/grants-removed
-fi
 /bin/sh "$base/hermes_converger/step0/close.sh"

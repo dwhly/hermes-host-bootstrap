@@ -57,7 +57,7 @@ if ! /bin/mkdir "$lock" 2>/dev/null; then
     case "$holder" in ''|*[!0-9]*) holder=0;; esac
     if [ "$holder" != 0 ] && kill -0 "$holder" 2>/dev/null; then
         printf 'closure already running; revocation pending\n'
-        exit 0
+        exit 75
     fi
     /bin/rm -rf "$lock"
     /bin/mkdir "$lock" || exit 1
@@ -129,10 +129,28 @@ if [ -f "$STATE/prepared" ] && [ "$(/bin/cat "$STATE/prepared")" = fix1 ]; then
     exit 0
 fi
 
-# Initial unsafe jobs only; later holds never disable a prepared safe reader.
-stop_jobs
+# Re-closure can be entered by one of these very jobs after marker loss. Exact
+# installed definitions are sufficient to retain the reviewed readers while
+# rebuilding preparation; never stop the job performing that recovery.
+reviewed_jobs() {
+    if [ "$OS" = Darwin ]; then
+        for label in com.chief.node-reconcile com.chief.node-supervisor com.chief.update-request; do
+            installed=/Library/LaunchDaemons/$label.plist
+            trusted_path "$installed" && /usr/bin/cmp -s "$BASE/launchd/$label.plist" "$installed" || return 1
+        done
+    else
+        for definition in "$BASE"/systemd/*; do
+            installed=/etc/systemd/system/${definition##*/}
+            trusted_path "$installed" && /usr/bin/cmp -s "$definition" "$installed" || return 1
+        done
+    fi
+}
+jobs=disabled
+retain_readers=no
+if reviewed_jobs; then retain_readers=yes; jobs=activation_pending; fi
+receipt preparing "$jobs" pending
 trap 'trap - EXIT; cleanup; contain preparation_failed' EXIT
-receipt preparing disabled pending
+[ "$retain_readers" = yes ] || stop_jobs
 # Old success markers must never survive an interrupted re-closure.
 /bin/rm -f "$STATE/grants-removed"
 if [ "$OS" = Darwin ]; then
@@ -243,6 +261,8 @@ if [ -z "$reason" ]; then
     jobs=enabled
 else
     printf 'chief Step 0 HOLD: %s; root jobs remain disabled\n' "$reason" >&2
+    receipt "$reason" disabled pending
+    stop_jobs
 fi
 finish_revocation
 printf 'chief Step 0: grants removed; hold=%s\n' "${reason:-none}"

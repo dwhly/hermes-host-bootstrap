@@ -393,7 +393,7 @@ def test_real_git_archive_installer_uses_safe_modes(tmp_path):
     archive=tmp_path/'payload.tar'
     with archive.open('wb') as f:
         subprocess.run(['git','-C',str(repo),'-c','tar.umask=022','archive','--format=tar',tree,'hermes_converger'],stdout=f,check=True)
-    host=tmp_path/'target'; host.mkdir()
+    host=tmp_path/'target'; host.mkdir(); (host/'var').mkdir()
     # Stage/extract and run the real trust check and install block. Stop at
     # close.sh (its execution is covered by the Host fixtures above).
     stat=tmp_path/'stat'
@@ -403,6 +403,10 @@ def test_real_git_archive_installer_uses_safe_modes(tmp_path):
     # Only fake ancestor ownership/mode of tmp; payload modes remain real.
     stat.write_text('#!/bin/sh\nfor p do :; done\ncase "$p" in '+shlex.quote(str(tmp_path))+'/*) echo "0 $(/usr/bin/stat -c %a "$p")";; *) echo "0 755";; esac\n')
     (repo/'hermes_converger/step0/trust.sh').write_text(trust)
+    contain=(repo/'hermes_converger/step0/contain.sh').read_text()
+    contain=contain.replace('/var/lib',str(host)+'/var/lib').replace('/usr/bin/systemctl','/bin/true')
+    contain=contain.replace('/usr/bin/install -d -o root','/usr/bin/install -d')
+    (repo/'hermes_converger/step0/contain.sh').write_text(contain)
     subprocess.run(['git','-C',str(repo),'add','.'],check=True)
     tree=subprocess.check_output(['git','-C',str(repo),'write-tree'],text=True).strip()
     with archive.open('wb') as f:

@@ -1,4 +1,4 @@
-# Fleet currency Step 0 / A0 — fix round 2
+# Fleet currency Step 0 / A0 — fix round 3
 
 Step 0 closes the legacy privilege grants and retains the existing authenticated,
 six-artifact converger. Success requires active root readers, boss check-ins,
@@ -174,8 +174,13 @@ Never execute the installer directly from `/var/tmp`, media or a login checkout.
 
 The tested installer uses `umask 022` and `tar --no-same-permissions` (GNU tar and
 macOS bsdtar; never `-p`), validates the extracted tree, installs into `/opt/chief`,
-retains any old payload and invokes close.sh. It does not require `/usr/local`
+removes its temporary previous payload on exit and invokes close.sh. It does not require `/usr/local`
 ownership, owner credentials or an existing sudo grant.
+
+Subsequent administrator Git updates require an explicit reviewed 40-hex commit:
+`/bin/sh /opt/chief/lib/hermes-host-bootstrap/hermes_converger/step0/update.sh "$currency_commit"`
+from the clean root shell above. The argv-free `chief-update` launcher cannot select
+a commit and returns usage; use the direct administrator script or pinned archive.
 
 ## Completion and interruption
 
@@ -193,14 +198,19 @@ completed revocation failure records its exact reason and retries at most once
 per 15 minutes. During that interval the prepared pulse and supervisor continue
 check-ins and health. After administrator policy repair, clearing the root-owned
 `revocation-retry` stamp permits an immediate retry. A root-owned PID lock serializes attempts;
-boot clears stale locks, and dead holders are reclaimed. Prepared retries don't
-bootout their own reader. Launchd activation skips loaded jobs and retries transient
+boot clears stale locks, and dead holders are reclaimed. A live holder returns
+nonzero (75), with revocation pending; this is not installation success. Prepared
+retries and re-closure with matching reviewed job definitions don't stop their own
+reader. Administrator updates publish a preparing receipt and stop jobs before
+replacing any payload or removing markers. Launchd activation skips loaded jobs and retries transient
 bootstrap failures. HUP/PIPE cannot abort closure: full output remains in
 `/var/log/chief-closure.log`; the caller receives the final receipt when connected.
 Post-preparation trust failures refuse that run and retain enabled readers for retry.
-Preparation publishes `hold: preparing / jobs: disabled` immediately after stopping
-unsafe jobs. Failure then publishes and returns `hold: contained:<reason>`, with
+Preparation publishes `hold: preparing` before stopping unsafe jobs. Every trigger
+is disabled before any service is stopped, so even termination of a legacy caller
+leaves a visible hold without a repeating Linux timer. Failure publishes `hold: contained:<reason>`, with
 `jobs: disabled` and `grants: removed|pending`; old success receipts cannot survive.
+A stopped/contained host requires an administrator re-run of the reviewed closure.
 A prepared activation failure says `jobs: activation_pending` until all daemon
 activation commands succeed; it does not claim enabled readers.
 
@@ -283,7 +293,10 @@ per no-op; the Mac Bash fixture uses seven for the pulse and five for supervisio
 The Mac pulse uses one sysctl, one ioreg and one bounded network probe. In the
 already-clean shell, Bash's own EUID/OSTYPE avoid id/uname startup; other shells
 use the portable commands. No caller environment reaches that choice.
-Offline periodic no-ops start no Python unless a trigger/hint needs handling. Root-only trees cannot be modified by the login
+The Core probe allows three seconds and retries once on failure. Offline periodic
+no-ops start no Python for at most 30 minutes since the last check; the next due
+periodic check runs even if both probes still fail. Explicit triggers remain due.
+Root-only trees cannot be modified by the login
 account after verification; administrator in-place runtime changes must remove
 `/var/lib/chief/currency-step0/trust-cache` first. Whole-tree replacement naturally
 invalidates it. Minute no-ops do not traverse trees or start Python. Measure cost
@@ -292,6 +305,12 @@ with `/usr/bin/time -l /opt/chief/bin/hermes-converger` from the administrator
 shell. Then collect 1,440 no-op samples (full checks measured separately), including
 the independent supervisor cost, and enforce §6: p95 CPU ≤50ms, total ≤72 CPU-s,
 RSS ≤20MiB, zero no-op Python and ≤1 percentage-point/day battery increase.
+Record Core `/health` probe latency and retry frequency on h-mini2/h-air2, including
+cold and relayed Tailscale paths; the probe can take up to six seconds on failure.
+The Mac entry trust/ACL batch also checks the six daemon stdout/stderr logs.
+At each entry, any log at or above 1 MiB is truncated in place before new output;
+open launchd append descriptors remain valid. This bounds minute-log accumulation
+to the threshold plus output between entries without a new per-minute process.
 
 One shell writer owns node.env creation. Correct existing configs are validated
 without replacement; unexpected/ambiguous content holds unchanged. Python only
