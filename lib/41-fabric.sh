@@ -64,7 +64,8 @@ have fabric && fabric_bin="fabric"
 
 # ── 2. Render ~/.config/fabric/.env from the resolved fleet key (every run) ──
 # Sourced from ~/.hermes/.env (populated by lib/35-secrets.sh before this module).
-FABRIC_MODEL="${FABRIC_DEFAULT_MODEL:-anthropic/claude-sonnet-4.5}"
+# Floating OpenRouter id: tracks the newest Opus, so Fabric never freezes on an old model.
+FABRIC_MODEL="${FABRIC_DEFAULT_MODEL:-~anthropic/claude-opus-latest}"
 HERMES_ENV="${HERMES_HOME:-$HOME/.hermes}/.env"
 FABRIC_CFG_DIR="$HOME/.config/fabric"
 FABRIC_ENV="$FABRIC_CFG_DIR/.env"

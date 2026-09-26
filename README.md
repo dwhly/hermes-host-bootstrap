@@ -173,7 +173,7 @@ Each module can also be run on its own:
 | `HERMES_WIKI_REPO=git@github.com:USER/hermes-automation-wiki.git` | clone/pull local wiki during bootstrap |
 | `HERMES_WIKI_DIR=~/code/hermes-automation-wiki` | override local wiki checkout path |
 | `HERMES_MODEL_PROVIDER=openrouter` | non-interactively seed `model.provider` so `hermes setup` is unnecessary |
-| `HERMES_MODEL_DEFAULT=openai/gpt-5.5` | non-interactively seed `model.default` |
+| `HERMES_MODEL_DEFAULT=~anthropic/claude-opus-latest` | non-interactively seed `model.default` (prefer a floating `~vendor/family-latest` id; the synced fleet config overrides it) |
 | `HERMES_GATEWAY_INSTALL=1` / `HERMES_GATEWAY_START=1` | install/start gateway after config + secrets are in place |
 
 ---
