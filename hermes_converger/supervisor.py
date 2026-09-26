@@ -6,36 +6,44 @@ import os
 import pathlib
 import subprocess
 import time
-import urllib.request
 from typing import Any
 
-from .core import DOCKER_TOKENS, LINUX_UNIT_MAP, _launchd_target, _resolve_tool, iso_now, unit_for, ConvergerError
+from .security import TrustError
+from .core import DOCKER_TOKENS, LINUX_UNIT_MAP, _launchd_target, _resolve_tool, iso_now, unit_for, ConvergerError, Transport, new_ulid
 
 
 DEFAULT_ALLOWLIST = ["chief-node", "chief-loop-watchdog", "chief-core"]
 WINDOW_S = 600
 MAX_RESTARTS = 5
-EXPECTED_INTERVAL_S = 15
+EXPECTED_INTERVAL_S = 300
 
 
-class SupervisorTransport:
-    def __init__(self, core: str, node_id: str, token_path: pathlib.Path):
-        self.core = core.rstrip("/")
-        self.node_id = node_id
-        self.token_path = token_path
+def mutation_allowed() -> bool:
+    return True
 
+
+class SupervisorTransport(Transport):
     def emit_health(self, payload: dict[str, Any]) -> None:
-        headers = {"Content-Type": "application/json", "X-Chief-Node-ID": self.node_id}
-        try:
-            token = self.token_path.read_text().strip()
-        except FileNotFoundError:
-            token = ""
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        body = json.dumps({"type": "hermes.fleet.process.health", **payload}).encode("utf-8")
-        req = urllib.request.Request(f"{self.core}/v1/fleet/events", data=body, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            resp.read()
+        token = next((t for t, legacy in LINUX_UNIT_MAP.items() if payload["process_id"] == legacy), payload["process_id"])
+        status = payload["status"]
+        data = {
+            "node_id": self.node_id, "process_id": payload["process_id"],
+            "manager": "supervisor:" + payload["manager"],
+            "artifact": {"chief-node": "hermes-node", "chief-core": "chief", "chief-loop-watchdog": "harness"}.get(token, "unknown"),
+            "loaded_ref": "unknown",  # A service-manager observation is not runtime-ref proof.
+            "status": "unhealthy" if status in {"dead", "restarting"} else status,
+            "steady_for_s": 0, "restart_count": payload["manager_restart_count"],
+            "heartbeat_age_s": 0, "crash_loop": status == "crash_looping",
+            "last_exit": None, "observed_at": payload["observed_at"],
+        }
+        self.emit({
+            "specversion": "1.0", "id": new_ulid(), "type": "hermes.fleet.process.health",
+            "source": f"chief-supervisor://{self.node_id}", "time": payload["observed_at"],
+            "contextid": "ctx_fleet", "entityid": f"ent_node_{self.node_id}",
+            "actorid": f"act_node_{self.node_id}", "confidence": 1.0,
+            "sensitivity": "internal", "sourceref": f"supervisor://{self.node_id}/{token}",
+            "schemaversion": 1, "data": data,
+        })
 
 
 def load_allowlist(path: pathlib.Path) -> list[str]:
@@ -44,7 +52,7 @@ def load_allowlist(path: pathlib.Path) -> list[str]:
         units = data if isinstance(data, list) else data.get("units", [])
         return [str(u) for u in units if u]
     except FileNotFoundError:
-        return DEFAULT_ALLOWLIST
+        return DEFAULT_ALLOWLIST if os.environ.get("CHIEF_NODE_ID") == "h-do1" else ["chief-node"]
 
 
 def systemd_status(unit: str) -> dict[str, Any]:
@@ -167,32 +175,35 @@ def supervise_once(args: argparse.Namespace) -> int:
     allowlist = load_allowlist(pathlib.Path(args.allowlist))
     limiter = RestartLimiter(pathlib.Path(args.state_dir) / "supervisor-restarts.json")
     tx = SupervisorTransport(args.core, args.node_id, pathlib.Path(args.auth_token_path))
+    targets = []
     for unit in allowlist:
         try:
             status = process_status(unit)
-        except ConvergerError as exc:
-            if not str(exc).startswith("launchd_user_uid_not_found:"):
-                raise
-            print(f"chief supervisor deferred: {exc}", flush=True)
-            continue
-        target = status["target"]
-        if status.get("deferred"):
-            print(f"chief supervisor deferred: {target}: {status['deferred']}", flush=True)
-            continue
-        limiter_id = f"{status['manager']}:{target}" if sys_platform() == "darwin" else LINUX_UNIT_MAP.get(unit, unit)
-        status_value = "healthy" if status.get("active") else "dead"
-        restart_count = limiter.count(limiter_id)
-        if restart_count >= MAX_RESTARTS:
-            status_value = "crash_looping"
-            enter_crash_looping(target, status["manager"])
-        elif not status.get("active"):
-            if limiter.allowed(limiter_id):
-                restart(target, status["manager"])
-                limiter.record(limiter_id)
-                status_value = "restarting"
-            else:
+            target = status["target"]
+            if not status.get("deferred"):
+                targets.append(f"{status['manager']} {target}\n")
+            limiter_id = f"{status['manager']}:{target}" if sys_platform() == "darwin" else LINUX_UNIT_MAP.get(unit, unit)
+            status_value = "healthy" if status.get("active") else "dead"
+            restart_count = limiter.count(limiter_id)
+            if status.get("deferred"):
+                status_value = "unknown"
+            elif not mutation_allowed():
+                status["deferred"] = "dark_unknown_or_unqualified_wake"
+            elif not status.get("active") and restart_count >= MAX_RESTARTS:
                 status_value = "crash_looping"
                 enter_crash_looping(target, status["manager"])
+            elif not status.get("active"):
+                if limiter.allowed(limiter_id):
+                    restart(target, status["manager"])
+                    limiter.record(limiter_id)
+                    status_value = "restarting"
+                else:
+                    status_value = "crash_looping"
+                    enter_crash_looping(target, status["manager"])
+        except (ConvergerError, TrustError, OSError, ValueError, subprocess.SubprocessError) as exc:
+            status = {"target": unit, "manager": "unknown", "deferred": str(exc)}
+            limiter_id = unit
+            status_value = "unknown"
         payload = {
             "node_id": args.node_id,
             "process_id": unit,
@@ -202,13 +213,18 @@ def supervise_once(args: argparse.Namespace) -> int:
             "manager_restart_count": status.get("restart_count", 0),
             "expected_interval_s": EXPECTED_INTERVAL_S,
             "observed_at": iso_now(),
-            "raw": {k: v for k, v in status.items() if k in {"ActiveState", "SubState", "ExecMainStatus", "ExecMainCode", "Status"}},
+            "raw": {k: v for k, v in status.items() if k in {"ActiveState", "SubState", "ExecMainStatus", "ExecMainCode", "Status", "deferred"}},
         }
         try:
             tx.emit_health(payload)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"chief health emit failed: {unit}: {exc}", flush=True)
     limiter.save()
+    if getattr(args, "targets_file", None):
+        path = pathlib.Path(args.targets_file)
+        temp = path.with_suffix(".new")
+        temp.write_text("".join(targets))
+        temp.replace(path)
     return 0
 
 
@@ -225,8 +241,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--auth-token-path", default=os.environ.get("CHIEF_NODE_AUTH_TOKEN", "/etc/chief/node-auth.token"))
     parser.add_argument("--allowlist", default="/etc/chief/supervisor-allowlist.json")
     parser.add_argument("--state-dir", default="/var/lib/chief/converger")
+    parser.add_argument("--targets-file")
     parser.add_argument("--loop", action="store_true")
-    parser.add_argument("--interval", type=int, default=15)
+    parser.add_argument("--interval", type=int, default=60)
     args = parser.parse_args(argv)
     if not args.node_id or not args.core:
         parser.error("missing_node_config: CHIEF_NODE_ID and CHIEF_CORE_URL required")

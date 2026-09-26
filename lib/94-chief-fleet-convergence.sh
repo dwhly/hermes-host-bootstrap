@@ -21,13 +21,14 @@ src=$1
 # shellcheck source=hermes_converger/step0/trust.sh
 . "$src/hermes_converger/step0/trust.sh"
 trusted_tree "$src"
-trusted_path /usr/local
-for dir in /usr/local/bin /usr/local/lib /usr/local/lib/hermes-host-bootstrap; do
+trusted_path /
+for dir in /opt /opt/chief /opt/chief/bin /opt/chief/lib /opt/chief/lib/hermes-host-bootstrap; do
     [ ! -e "$dir" ] || trusted_path "$dir"
     /usr/bin/install -d -o root -m 0755 "$dir"
 done
-/bin/rm -rf /usr/local/lib/hermes-host-bootstrap/hermes_converger
-/bin/cp -R "$src/hermes_converger" /usr/local/lib/hermes-host-bootstrap/
-exec /bin/sh /usr/local/lib/hermes-host-bootstrap/hermes_converger/step0/close.sh
+/bin/rm -rf /opt/chief/lib/hermes-host-bootstrap/hermes_converger
+/bin/cp -R "$src/hermes_converger" /opt/chief/lib/hermes-host-bootstrap/
+/bin/rm -f /var/lib/chief/currency-step0/prepared /var/lib/chief/currency-step0/grants-removed
+exec /bin/sh /opt/chief/lib/hermes-host-bootstrap/hermes_converger/step0/close.sh
 INSTALL
 ok "Step 0 closure completed; inspect closure-status and visudo evidence"

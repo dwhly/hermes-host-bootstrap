@@ -6,7 +6,7 @@
 	<string>com.chief.node-supervisor</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/local/bin/chief-node-supervisor</string>
+		<string>/opt/chief/bin/chief-node-supervisor</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -15,8 +15,8 @@
 	<key>StandardOutPath</key>
 	<string>/var/log/com.chief.node-supervisor.log</string>
 	<key>StartInterval</key>
-	<integer>15</integer>
+	<integer>60</integer>
 	<key>ThrottleInterval</key>
-	<integer>15</integer>
+	<integer>60</integer>
 </dict>
 </plist>

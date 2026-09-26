@@ -17,6 +17,7 @@ from .security import trusted_path
 import re
 import secrets
 import signal
+import stat as stat_module
 import shutil
 import subprocess
 import sys
@@ -110,6 +111,11 @@ def guard_mutation() -> None:
 
 
 def _resolve_tool(name: str) -> str:
+    if IS_MACOS and name == "git":
+        tool = pathlib.Path("/Library/Developer/CommandLineTools/usr/bin/git")
+        trusted_path(tool)
+        trusted_path(pathlib.Path("/Library/Developer/CommandLineTools/usr/libexec/git-core"), tree=True)
+        return str(tool)
     found = shutil.which(name, path=":".join(_tool_fallback_dirs()))
     if found:
         trusted_path(pathlib.Path(found))
@@ -978,9 +984,17 @@ def read_runtime_proof(artifact: str, target_ref: str, signal_at: str | None = N
             continue
         for stamp in root.glob(f"*/{artifact}.json"):
             try:
-                data = json.loads(stamp.read_text())
-                stat = stamp.stat()
-            except (OSError, json.JSONDecodeError):
+                fd = os.open(stamp, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                try:
+                    stat = os.fstat(fd)
+                    if not stat_module.S_ISREG(stat.st_mode) or stat.st_size > 65536:
+                        continue
+                    data = json.loads(os.read(fd, 65537))
+                    if not isinstance(data, dict):
+                        continue
+                finally:
+                    os.close(fd)
+            except (OSError, ValueError):
                 continue
             observed = data.get("observed_at") or data.get("written_at")
             if data.get("loaded_ref") != target_ref or data.get("health") not in {None, "healthy"}:
@@ -1205,6 +1219,24 @@ def converge(args: argparse.Namespace, reconcile_mode: bool = False) -> int:
         watermarks=state.load_watermarks(),
         target_artifact=getattr(args, "target_artifact", None),
     )
+    if getattr(args, "step0", False):
+        from .runtime import full_wake, qualified_plan, wake_identity
+        global mutation_allowed
+        # Recheck wake epoch and freshness at each mutation boundary. A sleep
+        # during the run requires the next pulse to fetch new authorization.
+        expected_wake = args.step0_wake_id
+        def admitted():
+            if expected_wake == "unknown" or wake_identity() != expected_wake:
+                return False
+            try:
+                verify_plan(plan, node_id=args.node_id,
+                            key_lookup=default_key_lookup(args.node_id, pathlib.Path(args.plan_key_path)),
+                            watermarks=state.load_watermarks())
+            except VerificationError:
+                return False
+            return full_wake(qualified_plan(plan))
+        mutation_allowed = admitted
+        args.report_only = not mutation_allowed()
     idle = evaluate_idle(idle_snapshot) if verified.apply_mode == "restart_required" else None
     if getattr(args, "report_only", False):
         HostOps(state, transport).emit("deferred", verified, reason="dark_or_unknown_wake")

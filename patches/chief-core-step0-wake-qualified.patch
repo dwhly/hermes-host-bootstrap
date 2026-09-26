@@ -1,0 +1,11 @@
+--- a/chief_core/service.py
++++ b/chief_core/service.py
+@@ -4892,6 +4892,8 @@
+         "node_id": node_id,
+         "issued_at": issued_at,
+         "desired": rows,
++        # Step 0: operator-qualified wake policy is covered by the plan HMAC.
++        "wake_qualified": node_id in os.environ.get("CHIEF_WAKE_QUALIFIED_NODES", "").split(","),
+     }
+ 
+ 

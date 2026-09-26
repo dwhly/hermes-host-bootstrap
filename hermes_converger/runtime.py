@@ -6,31 +6,45 @@ import grp
 import json
 import os
 import pathlib
-import socket
+import signal
+import subprocess
+import re
 import stat
 import time
 
-from .security import install_config, load_config, trusted_path, TrustError
+from .security import load_config, trusted_path, TrustError
 
-BASE = pathlib.Path("/usr/local/lib/hermes-host-bootstrap")
 STATE = pathlib.Path("/var/lib/chief/currency-step0")
 HINTS = pathlib.Path("/var/lib/chief/requests")
 
 
 def configure():
-    install_config(socket.gethostname(), BASE / "hermes_converger/step0/host-contracts.json",
-                   pathlib.Path("/etc/chief/node.env"), grp.getgrnam("chief").gr_gid)
-    user = load_config()["CHIEF_RUNTIME_USER"]
+    config = load_config()
+    user = config["CHIEF_RUNTIME_USER"]
     allow = pathlib.Path("/etc/chief/supervisor-allowlist.json")
-    if not allow.exists():
-        node = load_config()["CHIEF_NODE_ID"]
+    node = config["CHIEF_NODE_ID"]
+    if node in {"h-af", "h-btp"}:
+        # Validate only; their owner allowlist and group memberships are retained.
+        if allow.exists():
+            trusted_path(allow)
+        return
+    legacy = ["chief-node.service", "chief-loop-watchdog.service", "chief-stack-core-1"]
+    repair = False
+    if allow.exists():
+        trusted_path(allow)
+        data = json.loads(allow.read_text())
+        repair = os.uname().sysname == "Darwin" and (data == legacy or data == {"units": legacy})
+    if not allow.exists() or repair:
+        node = config["CHIEF_NODE_ID"]
         units = ["chief-node", "chief-loop-watchdog", "chief-core"] if node == "h-do1" else ["chief-node"]
-        allow.write_text(json.dumps({"units": units}) + "\n")
-        os.chown(allow, 0, grp.getgrnam("chief").gr_gid)
-        allow.chmod(0o640)
+        temp = allow.with_suffix(".step0-new")
+        temp.write_text(json.dumps({"units": units}) + "\n")
+        os.chown(temp, 0, grp.getgrnam("chief").gr_gid)
+        temp.chmod(0o640)
+        temp.replace(allow)
+        print(json.dumps({"repair": "supervisor_allowlist", "units": units}), flush=True)
     trusted_path(allow)
     # Add only the trusted registry runtime user, never SUDO_USER/caller input.
-    import subprocess
     if os.uname().sysname == "Darwin":
         subprocess.run(["/usr/sbin/dseditgroup", "-o", "edit", "-a", user, "-t", "user", "chief"], check=True)
     elif user != "root":
@@ -57,21 +71,64 @@ def consume_hints(directory: pathlib.Path = HINTS) -> list[str]:
     return hints
 
 
-def full_wake() -> bool:
+def wake_identity() -> str:
+    if os.uname().sysname != "Darwin":
+        return "linux"
+    result = subprocess.run(["/usr/sbin/sysctl", "-n", "kern.waketime"], capture_output=True,
+                            text=True, timeout=5, check=False)
+    return result.stdout.strip() if result.returncode == 0 else "unknown"
+
+
+def full_wake(qualified: bool = False) -> bool:
     if os.uname().sysname != "Darwin":
         return True
-    marker = pathlib.Path("/etc/chief/wake-qualified")
-    if not marker.exists():
+    if not qualified:
         return False
-    trusted_path(marker)
-    import re
-    import subprocess
-    result = subprocess.run(["/usr/sbin/ioreg", "-r", "-n", "IODisplayWrangler", "-d", "1"],
+    # IOPMrootDomain graphics capability is independent of display power and
+    # permits headless classification. Unknown output fails closed. Q6 must qualify
+    # this candidate on each hardware class before signing wake_qualified.
+    result = subprocess.run(["/usr/sbin/ioreg", "-r", "-n", "IOPMrootDomain", "-d", "1"],
                             capture_output=True, text=True, timeout=5, check=False)
-    return result.returncode == 0 and bool(re.search(r'"CurrentPowerState"\s*=\s*4', result.stdout))
+    match = re.search(r'"SystemPowerStateCapabilities"\s*=\s*(\d+)', result.stdout)
+    return result.returncode == 0 and match is not None and int(match[1]) & 3 == 3
+
+
+def qualified_plan(plan) -> bool:
+    # Field is within the plan digest, verified before this is called.
+    return plan.get("wake_qualified") is True
+
+
+def supervisor_admission(config) -> bool:
+    if os.uname().sysname != "Darwin":
+        return True
+    from . import core
+    try:
+        state = core.LocalState(pathlib.Path("/"))
+        plan = core.load_cached_plan(state)
+        core.verify_plan(plan, node_id=config["CHIEF_NODE_ID"],
+                         key_lookup=core.default_key_lookup(config["CHIEF_NODE_ID"], pathlib.Path(config["CHIEF_NODE_PLAN_KEY"])),
+                         watermarks=state.load_watermarks())
+        return full_wake(qualified_plan(plan))
+    except (core.ConvergerError, OSError, ValueError, KeyError):
+        return False
 
 
 def run(mode: str) -> int:
+    # SIGALRM is independent of blocked file/network reads. BaseException avoids
+    # legacy broad Exception handlers swallowing the overall deadline.
+    def deadline(signum, frame):
+        raise SystemExit("step0_runtime_deadline")
+    previous = signal.signal(signal.SIGALRM, deadline)
+    signal.alarm(1800 if mode == "converge" else 50)
+    try:
+        return _run(mode)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def _run(mode: str) -> int:
+    initial_wake = wake_identity()
     config = load_config()
     os.environ.update(config)
     trusted_path(STATE)
@@ -89,13 +146,16 @@ def run(mode: str) -> int:
             print('{"deferred":"step0_already_running","pending":"retained"}')
             return 0
         if mode == "supervisor":
-            if not full_wake():
-                print('{"deferred":"dark_or_unknown_wake","component":"supervisor"}')
-                return 0
             from . import supervisor
             allow = pathlib.Path("/etc/chief/supervisor-allowlist.json")
-            trusted_path(allow)
-            return supervisor.main([])
+            if allow.exists():
+                trusted_path(allow)
+            supervisor.mutation_allowed = lambda: initial_wake != "unknown" and wake_identity() == initial_wake and supervisor_admission(config)
+            result = supervisor.main(["--targets-file", str(STATE / "supervisor-targets")])
+            temp = STATE / "last-health.new"
+            temp.write_text(str(int(time.time())) + "\n")
+            temp.replace(STATE / "last-health")
+            return result
         if mode != "converge":
             raise TrustError("unknown_root_entry")
         hints = consume_hints()
@@ -111,9 +171,8 @@ def run(mode: str) -> int:
             temp.replace(path)
         from . import core
         args = core.build_parser().parse_args(["reconcile", "--trigger", os.environ.get("CHIEF_PULSE_TRIGGER", "periodic")])
-        args.report_only = not full_wake()
-        # Admission is rechecked immediately before every root mutation too.
-        core.mutation_allowed = full_wake
+        args.step0 = True
+        args.step0_wake_id = initial_wake
         return core.reconcile(args)
     finally:
         os.close(fd)

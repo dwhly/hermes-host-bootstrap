@@ -6,6 +6,7 @@ import os
 import pathlib
 import re
 import stat
+import socket
 import subprocess
 import sys
 import urllib.parse
@@ -58,6 +59,12 @@ def read_env(path: pathlib.Path) -> dict[str, str]:
 
 
 def validate_config(data: dict[str, str]) -> dict[str, str]:
+    allowed = {"CHIEF_NODE_ID", "CHIEF_CORE_URL", "CHIEF_NODE_PLAN_KEY", "CHIEF_NODE_AUTH_TOKEN", "CHIEF_RUNTIME_USER"}
+    if data.keys() - allowed:
+        raise TrustError("unexpected_node_config_key")
+    for key, fixed in (("CHIEF_NODE_PLAN_KEY", "/etc/chief/node-plan.key"), ("CHIEF_NODE_AUTH_TOKEN", "/etc/chief/node-auth.token")):
+        if key in data and data[key] != fixed:
+            raise TrustError("unexpected_secret_path")
     node = data.get("CHIEF_NODE_ID", "")
     url = urllib.parse.urlsplit(data.get("CHIEF_CORE_URL", ""))
     if not re.fullmatch(r"h-[a-z0-9]+", node) or url.scheme not in {"http", "https"} or not url.hostname:
@@ -79,7 +86,7 @@ def resolve_config(existing: dict[str, str] | None, hostname: str, registry: dic
     if len(matches) != 1:
         raise TrustError(f"host_not_in_trusted_registry:{hostname}")
     record = matches[0]
-    expected = validate_config(record)
+    expected = validate_config({k: v for k, v in record.items() if k.startswith("CHIEF_")})
     if existing:
         actual = validate_config(existing)
         if actual["CHIEF_NODE_ID"] != expected["CHIEF_NODE_ID"]:
@@ -95,31 +102,6 @@ def load_config(path: pathlib.Path = pathlib.Path("/etc/chief/node.env")) -> dic
         raise TrustError("missing_node_env:/etc/chief/node.env")
     trusted_path(path)
     data = read_env(path)
-    valid = validate_config(data)
-    user = data.get("CHIEF_RUNTIME_USER", "")
-    if not re.fullmatch(r"[a-z_][a-z0-9_-]*", user):
-        raise TrustError("missing_trusted_runtime_user")
-    valid["CHIEF_RUNTIME_USER"] = user
-    return valid
-
-
-def install_config(hostname: str, registry_path: pathlib.Path, destination: pathlib.Path, gid: int) -> None:
+    registry_path = pathlib.Path(__file__).parent / "step0/host-contracts.json"
     trusted_path(registry_path)
-    trusted_path(destination.parent)
-    existing = None
-    if destination.exists() or destination.is_symlink():
-        trusted_path(destination)
-        existing = read_env(destination)
-    data = resolve_config(existing, hostname, json.loads(registry_path.read_text()))
-    # The parent is root-only writable; replace never follows a destination link.
-    temp = destination.with_suffix(".env.step0")
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640)
-    try:
-        os.fchown(fd, 0, gid)
-        with os.fdopen(fd, "w") as stream:
-            stream.write("".join(f"{k}={v}\n" for k, v in data.items()))
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temp, destination)
-    finally:
-        temp.unlink(missing_ok=True)
+    return resolve_config(data, socket.gethostname(), json.loads(registry_path.read_text()))

@@ -3,7 +3,7 @@ Description=Chief coalesced request pulse
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/hermes-converger
-TimeoutStartSec=300
+ExecStart=/opt/chief/bin/hermes-converger
+TimeoutStartSec=1860
 User=root
 Group=chief

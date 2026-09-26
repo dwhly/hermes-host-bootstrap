@@ -6,7 +6,7 @@
 	<string>com.chief.update-login</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/local/bin/chief-update-request</string>
+		<string>/opt/chief/bin/chief-update-request</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

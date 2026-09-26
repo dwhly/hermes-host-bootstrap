@@ -3,7 +3,7 @@ Description=Chief login-equivalent hint (user-manager start; linger means boot)
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/chief-update-request
+ExecStart=/opt/chief/bin/chief-update-request
 
 [Install]
 WantedBy=default.target

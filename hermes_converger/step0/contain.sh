@@ -50,6 +50,34 @@ END { if (record != "") flush() }
     /bin/mv -f "$stage/main" /etc/sudoers
     /usr/sbin/visudo -c
     /bin/rm -rf "$stage"
+    # Effective policy catches aliases, wildcards and directory grants that a
+    # literal rule rewrite cannot safely remove. Root is already unrestricted.
+    for user in dano danz; do # generated runtime users
+        [ "$user" != root ] || continue
+        /usr/bin/id -u "$user" >/dev/null 2>&1 || continue
+        listing=$(/usr/bin/sudo -ll -U "$user") || return 1
+        # sudo -ll expands aliases and prints per-rule Options and Commands.
+        patterns=$(printf '%s\n' "$listing" | /usr/bin/awk '
+            /^Sudoers entry:/ { free=0; commands=0 }
+            /Options:/ { free=($0 ~ /!authenticate/) }
+            /Commands:/ { commands=1; next }
+            commands && free { sub(/^[ \t]+/, ""); print }
+        ')
+        while IFS= read -r rule; do
+            [ -n "$rule" ] || continue
+            case "$rule" in !*) continue;; esac
+            pattern=${rule%% *}
+            for command in /opt/chief/bin/hermes-converger /opt/chief/bin/chief-node-supervisor /opt/chief/bin/chief-update /usr/local/bin/hermes-converger /usr/local/bin/chief-node-supervisor /usr/local/bin/chief-update; do
+                case "$pattern" in ALL) hold "remaining_passwordless_grant:$user:$pattern"; return 1;; esac
+                # sudo command patterns deliberately retain glob semantics.
+                # shellcheck disable=SC2254
+                case "$command" in $pattern) hold "remaining_passwordless_grant:$user:$pattern"; return 1;; esac
+                case "$pattern" in */) case "$command" in "$pattern"*) hold "remaining_passwordless_grant:$user:$pattern"; return 1;; esac;; esac
+            done
+        done <<EOF
+$patterns
+EOF
+    done
 }
 
 stop_jobs() {
@@ -71,4 +99,14 @@ contain() {
     stop_jobs
     remove_grants
     exit 1
+}
+
+refuse() {
+    # Transient post-preparation faults must leave the safe readers enabled so
+    # the next pulse retries. Containment is only for the initial unsafe state.
+    if { [ -f /var/lib/chief/currency-step0/prepared ] && trusted_path /var/lib/chief/currency-step0/prepared; } ||
+       { [ -f /var/lib/chief/currency-step0/grants-removed ] && trusted_path /var/lib/chief/currency-step0/grants-removed; }; then
+        hold "$*"; exit 1
+    fi
+    contain "$@"
 }

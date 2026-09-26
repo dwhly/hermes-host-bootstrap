@@ -2,7 +2,7 @@
 # A0 pulse: shell only on no-op. Phase A's Go updater is deliberately not here.
 # Invoked in an empty environment by a zero-argument root entry point.
 set -eu
-BASE=/usr/local/lib/hermes-host-bootstrap/hermes_converger/step0
+BASE=/opt/chief/lib/hermes-host-bootstrap/hermes_converger/step0
 # shellcheck source=hermes_converger/step0/trust.sh
 . "$BASE/trust.sh"
 STATE=/var/lib/chief/currency-step0
@@ -22,12 +22,9 @@ if [ "$(/usr/bin/uname -s)" = Darwin ]; then
     boot=$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null || echo unknown)
     wake=$(/usr/sbin/sysctl -n kern.waketime 2>/dev/null || echo unknown)
     full=no
-    # Default remains report-only until the paired Q6 field measurements pass.
-    # Display-on is necessary, never a stamp alone or a caller hint.
-    if [ -f /etc/chief/wake-qualified ]; then
-        trusted_path /etc/chief/wake-qualified
-        if /usr/sbin/ioreg -r -n IODisplayWrangler -d 1 | /usr/bin/grep -Eq '"CurrentPowerState"[[:space:]]*=[[:space:]]*4'; then full=yes; fi
-    fi
+    caps=$(/usr/sbin/ioreg -r -n IOPMrootDomain -d 1 | /usr/bin/sed -n 's/.*"SystemPowerStateCapabilities"[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+    case "$caps" in ''|*[!0-9]*) ;; *) [ $((caps & 3)) -ne 3 ] || full=yes;; esac
+
 else
     boot=$(/bin/cat /proc/sys/kernel/random/boot_id)
 fi
@@ -69,8 +66,7 @@ if [ -f "$STATE/full" ]; then trusted_path "$STATE/full"; read -r old_full < "$S
 # survive a busy worker because only its lock holder commits these stamps.
 if [ $((now - last)) -ge 0 ] && [ $((now - last)) -lt 60 ]; then printf 'chief-pulse at=%s decision=noop python=0 full=%s online=%s\n' "$now" "$full" "$online"; exit 0; fi
 if [ "$trigger" = periodic ] && [ $((now - last)) -ge 0 ] && [ $((now - last)) -lt 300 ]; then printf 'chief-pulse at=%s decision=noop python=0 full=%s online=%s\n' "$now" "$full" "$online"; exit 0; fi
-trusted_tree /usr/local/lib/hermes-host-bootstrap/hermes_converger
-trusted_python
+trusted_runtime
 printf 'chief-pulse at=%s decision=check trigger=%s full=%s online=%s\n' "$now" "$trigger" "$full" "$online"
 export CHIEF_PULSE_BOOT=$boot CHIEF_PULSE_TRIGGER=$trigger CHIEF_PULSE_WAKE=$wake CHIEF_PULSE_ONLINE=$online CHIEF_PULSE_FULL=$full
-exec "$PY" -I -S -B -c 'import sys; sys.path.insert(0,"/usr/local/lib/hermes-host-bootstrap"); from hermes_converger.runtime import run; raise SystemExit(run("converge"))'
+exec "$PY" -I -S -B -c 'import sys; sys.path.append("/opt/chief/lib/hermes-host-bootstrap"); from hermes_converger.runtime import run; raise SystemExit(run("converge"))'

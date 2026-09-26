@@ -6,7 +6,7 @@
 	<string>com.chief.node-reconcile</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/local/bin/hermes-converger</string>
+		<string>/opt/chief/bin/hermes-converger</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

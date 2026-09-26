@@ -1,6 +1,8 @@
 #!/bin/sh
 # Reviewed closure carried INSIDE hermes_converger by the old chief-update.
 set -eu
+umask 027
+trap '' HUP PIPE
 if [ "${1:-}" = --plan ]; then
     case "${2:-}" in macos|linux) platform=$2;; *) echo 'usage: close.sh --plan macos|linux' >&2; exit 2;; esac
     [ "$#" = 2 ] || exit 2
@@ -9,8 +11,8 @@ if [ "${1:-}" = --plan ]; then
         printf '%s\n' '1. Existing access: sudo -n /usr/local/bin/chief-update (old updater installs origin/main package + two launchers).' \
           '2. Final privileged invocation: sudo -n /usr/local/bin/hermes-converger (no arguments).'
     else
-        printf '%s\n' '1. Plain root: install the reviewed hermes_converger payload in /usr/local/lib/hermes-host-bootstrap.' \
-          '2. In the same root session: /bin/sh /usr/local/lib/hermes-host-bootstrap/hermes_converger/step0/close.sh.'
+        printf '%s\n' '1. Plain root: install the reviewed hermes_converger payload in /opt/chief/lib/hermes-host-bootstrap.' \
+          '2. In the same root session: /bin/sh /opt/chief/lib/hermes-host-bootstrap/hermes_converger/step0/close.sh.'
     fi
     printf '%s\n' \
       '   Validate root ownership and every parent; stop old convergence jobs; install hardened entry points.' \
@@ -30,22 +32,84 @@ fi
 [ "$#" = 0 ] || { echo 'chief closure: arguments refused' >&2; exit 2; }
 # The public launcher has already checked the full payload tree. Direct root
 # installation must use the reviewed root-owned tree, never a login checkout.
-BASE=/usr/local/lib/hermes-host-bootstrap/hermes_converger/step0
+BASE=/opt/chief/lib/hermes-host-bootstrap/hermes_converger/step0
 # shellcheck source=hermes_converger/step0/trust.sh
 . "$BASE/trust.sh"
 [ "$(/usr/bin/id -u)" = 0 ] || { hold 'root required'; exit 1; }
-trusted_tree /usr/local/lib/hermes-host-bootstrap/hermes_converger || exit 1
-trusted_path /usr/local/bin || exit 1
+trusted_tree /opt/chief/lib/hermes-host-bootstrap/hermes_converger || exit 1
+trusted_path /opt/chief/bin || exit 1
 OS=$(/usr/bin/uname -s)
 STATE=/var/lib/chief/currency-step0
 
 # shellcheck source=hermes_converger/step0/contain.sh
 . "$BASE/contain.sh"
 
-# Stop vulnerable readers FIRST. If any later preparation fails, the EXIT trap
-# still closes their sudo access. A failed closure never reenables old jobs.
+# Keep all output in a root log even after the SSH pipe disappears. A final
+# receipt is also sent to the original caller when that fd remains available.
+trusted_path /var/run
+lock=/var/run/chief-currency-closure.lock
+if ! /bin/mkdir "$lock" 2>/dev/null; then
+    trusted_path "$lock"
+    # mkdir and pid publication are separate syscalls. Give a new holder time.
+    [ -s "$lock/pid" ] || /bin/sleep 1
+    holder=0
+    [ ! -f "$lock/pid" ] || read -r holder < "$lock/pid" || holder=0
+    case "$holder" in ''|*[!0-9]*) holder=0;; esac
+    if [ "$holder" != 0 ] && kill -0 "$holder" 2>/dev/null; then
+        printf 'closure already running; revocation pending\n'
+        exit 0
+    fi
+    /bin/rm -rf "$lock"
+    /bin/mkdir "$lock" || exit 1
+fi
+printf '%s\n' "$$" > "$lock/pid"
+cleanup() { /bin/rm -rf "$lock"; }
+trusted_path /var/log
+[ ! -L /var/log/chief-closure.log ] || exit 1
+[ ! -e /var/log/chief-closure.log ] || trusted_path /var/log/chief-closure.log
+exec 3>&1
+exec >>/var/log/chief-closure.log 2>&1
+trap 'cleanup' EXIT
+
+activate_jobs() {
+    if [ "$OS" = Darwin ]; then
+        for label in com.chief.node-reconcile com.chief.node-supervisor com.chief.update-request; do
+            /bin/launchctl enable "system/$label"
+            if /bin/launchctl print "system/$label" >/dev/null 2>&1; then continue; fi
+            attempt=0
+            until /bin/launchctl bootstrap system "/Library/LaunchDaemons/$label.plist"; do
+                attempt=$((attempt + 1))
+                [ "$attempt" -lt 5 ] || return 1
+                /bin/sleep 1
+                /bin/launchctl print "system/$label" >/dev/null 2>&1 && break
+            done
+        done
+    else
+        /usr/bin/systemctl enable chief-node-reconcile.service chief-node-supervisor.timer chief-update.timer chief-update-request.path
+        /usr/bin/systemctl start chief-node-supervisor.timer chief-update.timer chief-update-request.path
+    fi
+}
+
+# A prepared reader may finish an interrupted revocation itself. Do not bootout
+# the job currently running closure, and never trust prepared as a success receipt.
+if [ -f "$STATE/prepared" ] && [ "$(/bin/cat "$STATE/prepared")" = fix1 ]; then
+    trusted_path "$STATE/prepared"
+    printf 'grants: pending\nhold: revocation_pending\n' > "$STATE/closure-status"
+    activate_jobs
+    remove_grants
+    /bin/sync
+    printf 'grants: removed\nhold: none\njobs: enabled\n' > "$STATE/closure-status.new"
+    /bin/chmod 0644 "$STATE/closure-status.new"
+    /bin/mv -f "$STATE/closure-status.new" "$STATE/closure-status"
+    : > "$STATE/grants-removed.new"
+    /bin/mv -f "$STATE/grants-removed.new" "$STATE/grants-removed"
+    /bin/cat "$STATE/closure-status" >&3 || true
+    exit 0
+fi
+
+# Initial unsafe jobs only; later holds never disable a prepared safe reader.
 stop_jobs
-trap 'trap - EXIT; contain preparation_failed' EXIT
+trap 'trap - EXIT; cleanup; contain preparation_failed' EXIT
 if [ "$OS" = Darwin ]; then
     /usr/bin/dscl . -read /Groups/chief >/dev/null 2>&1 || /usr/sbin/dseditgroup -o create chief
 else
@@ -68,9 +132,9 @@ for hint in login wake network request; do
     /usr/bin/install -o root -g chief -m 0620 /dev/null "/var/lib/chief/requests/$hint"
 done
 for name in hermes-converger chief-node-supervisor chief-update chief-update-request; do
-    [ ! -e "/usr/local/bin/$name" ] || trusted_path "/usr/local/bin/$name"
-    [ ! -L "/usr/local/bin/$name" ] || exit 1
-    /usr/bin/install -o root -m 0755 "$BASE/bin/$name" "/usr/local/bin/$name"
+    [ ! -e "/opt/chief/bin/$name" ] || trusted_path "/opt/chief/bin/$name"
+    [ ! -L "/opt/chief/bin/$name" ] || exit 1
+    /usr/bin/install -o root -m 0755 "$BASE/bin/$name" "/opt/chief/bin/$name"
 done
 safe_install() {
     source=$1 destination=$2 permissions=${3:-0644}
@@ -85,7 +149,7 @@ reason=''
 if ! configure_node_env; then reason=node_config_invalid; fi
 if ! trusted_python; then reason="${reason:+$reason,}trusted_python_unavailable"; fi
 if [ -z "$reason" ]; then
-    if ! "$PY" -I -S -B -c 'import sys; sys.path.insert(0,"/usr/local/lib/hermes-host-bootstrap"); from hermes_converger.runtime import configure; configure()'; then
+    if ! "$PY" -I -S -B -c 'import sys; sys.path.append("/opt/chief/lib/hermes-host-bootstrap"); from hermes_converger.runtime import configure; configure()'; then
         reason=node_config_invalid
     fi
 fi
@@ -140,23 +204,27 @@ else
     /usr/bin/systemctl --global enable chief-update-login.service
 fi
 # Receipt precedes revocation; sudoers.closed is intentionally NOT asserted here.
-printf '%s\n' "prepared: $OS" "hold: ${reason:-none}" > "$STATE/closure-status"
+printf '%s\n' "prepared: $OS" "hold: ${reason:-revocation_pending}" "grants: pending" > "$STATE/closure-status"
 if [ -z "$reason" ]; then
     # Marker only selects hardened execution; never makes a caller authoritative.
     [ ! -L "$STATE/prepared" ] || exit 1
-    : > "$STATE/prepared"
-    if [ "$OS" = Darwin ]; then
-        for label in com.chief.node-reconcile com.chief.node-supervisor com.chief.update-request; do
-            /bin/launchctl enable "system/$label"
-            /bin/launchctl bootstrap system "/Library/LaunchDaemons/$label.plist"
-        done
-    else
-        /usr/bin/systemctl enable chief-node-reconcile.service chief-node-supervisor.timer chief-update.timer chief-update-request.path
-        /usr/bin/systemctl start chief-node-supervisor.timer chief-update.timer chief-update-request.path
-    fi
+    printf 'fix1\n' > "$STATE/prepared"
+    # From here, errors retain enabled safe readers and visible pending status.
+    trap 'cleanup' EXIT
+    trusted_runtime
+    activate_jobs
 else
     printf 'chief Step 0 HOLD: %s; root jobs remain disabled\n' "$reason" >&2
 fi
-trap - EXIT
+trap 'cleanup' EXIT
 remove_grants
+/bin/sync
+printf 'grants: removed\nhold: %s\n' "${reason:-none}" > "$STATE/closure-status.new"
+if [ -z "$reason" ]; then printf 'jobs: enabled\n'; else printf 'jobs: disabled\n'; fi >> "$STATE/closure-status.new"
+/bin/chmod 0644 "$STATE/closure-status.new"
+/bin/mv -f "$STATE/closure-status.new" "$STATE/closure-status"
+: > "$STATE/grants-removed.new"
+/bin/mv -f "$STATE/grants-removed.new" "$STATE/grants-removed"
+/bin/cat "$STATE/closure-status" >&3 || true
 printf 'chief Step 0: grants removed; hold=%s\n' "${reason:-none}"
+[ -z "$reason" ]
