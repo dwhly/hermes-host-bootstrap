@@ -1,12 +1,71 @@
 #!/bin/sh
 # Sourced only after the dispatcher has checked this file and all its parents.
 # No caller-controlled executable lookup, Python startup, or shell evaluation.
+# HOLD_REASON and read_state's value are outputs to the sourcing dispatcher.
+# shellcheck disable=SC2034
 set -eu
 TRUST_OS=$(/usr/bin/uname -s)
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 
-hold() { printf 'chief Step 0 HOLD: %s\n' "$*" >&2; return 1; }
+hold() { HOLD_REASON=$*; printf 'chief Step 0 HOLD: %s\n' "$*" >&2; return 1; }
+
+# Installed entries use a fixed, symlink-free chain. Check all of it in one stat
+# and (on macOS) one ACL listing, before sourcing any file. No recursive forks.
+# Darwin's state/config paths use /private directly, avoiding /var and /etc links.
+trusted_entries() {
+    STATE=/var/lib/chief/currency-step0
+    CONFIG=/etc/chief/node.env
+    REQUESTS=/var/lib/chief/requests
+    if [ "$TRUST_OS" = Darwin ]; then
+        STATE=/private/var/lib/chief/currency-step0
+        CONFIG=/private/etc/chief/node.env
+        REQUESTS=/private/var/lib/chief/requests
+    fi
+    # These are the complete fixed chains, not caller-supplied paths. stat uses
+    # lstat (no -L); type bits reject links without one extra syscall per path.
+    set -- / /opt /opt/chief /opt/chief/bin /opt/chief/lib \
+        /opt/chief/lib/hermes-host-bootstrap "$BASE/.." "$BASE" \
+        "$BASE/trust.sh" "$BASE/pulse.sh" "$BASE/supervise.sh" \
+        /opt/chief/bin/hermes-converger /opt/chief/bin/chief-node-supervisor /opt/chief/bin/chief-update \
+        "$STATE" "$CONFIG" "$REQUESTS"
+    if [ "$TRUST_OS" = Darwin ]; then
+        set -- "$@" /private /private/var /private/var/lib /private/var/lib/chief /private/etc /private/etc/chief
+    else
+        set -- "$@" /var /var/lib /var/lib/chief /etc /etc/chief
+    fi
+    if [ "$TRUST_OS" = Darwin ]; then
+        mode_base=0
+        meta=$(/usr/bin/stat -f '%u %p' "$@") || return 1
+        acl=$(/bin/ls -lde "$@") || return 1
+        # ACL records start with a numbered entry; '+' also marks an ACL.
+        while IFS= read -r row; do
+            row=${row#"${row%%[![:space:]]*}"}
+            case "$row" in ??????????+*|[0-9]*:*) hold entry_acl; return 1;; esac
+        done <<EOF
+$acl
+EOF
+    else
+        mode_base=0x
+        meta=$(/usr/bin/stat -c '%u %f' "$@") || return 1
+    fi
+    while read -r uid mode; do
+        permissions=$(( ${mode_base}${mode} ))
+        [ "$uid" = 0 ] && [ $((permissions & 0022)) -eq 0 ] &&
+            [ $((permissions & 0170000)) -ne $((0120000)) ] || { hold unsafe_entry_chain; return 1; }
+    done <<EOF
+$meta
+EOF
+}
+
+# State is root-written data beneath a verified directory, never shell code.
+# Avoid forks, symlinks and special files on the minute path.
+read_state() {
+    value=$2
+    if [ -f "$STATE/$1" ] && [ ! -L "$STATE/$1" ]; then
+        IFS= read -r value < "$STATE/$1" || value=$2
+    fi
+}
 
 # Check both sides of every symlink, including directory symlinks (/var on Macs).
 # Root-owned symlinks may have mode 0777; their parents must not be writable.
@@ -107,10 +166,10 @@ trusted_runtime() {
     trusted_path "$BASE" || return 1
     if [ "$TRUST_OS" = Darwin ]; then
         boot_id=$(/usr/sbin/sysctl -n kern.boottime) || return 1
-        identity=$(/usr/bin/stat -L -f '%d:%i:%u:%g:%p:%z:%m:%c' "$PY" "$PY_TREE" "$BASE" "$BASE/.." "$BASE/trust.sh") || return 1
+        identity=$(/usr/bin/stat -L -f '%d:%i:%u:%g:%p:%z:%m:%c' "$PY" "$PY_TREE" "$BASE" "$BASE/.." "$BASE/trust.sh" "$BASE/pulse.sh" "$BASE/supervise.sh") || return 1
     else
         boot_id=$(/bin/cat /proc/sys/kernel/random/boot_id) || return 1
-        identity=$(/usr/bin/stat -L -c '%d:%i:%u:%g:%f:%s:%y:%z' "$PY" "$PY_TREE" "$BASE" "$BASE/.." "$BASE/trust.sh") || return 1
+        identity=$(/usr/bin/stat -L -c '%d:%i:%u:%g:%f:%s:%y:%z' "$PY" "$PY_TREE" "$BASE" "$BASE/.." "$BASE/trust.sh" "$BASE/pulse.sh" "$BASE/supervise.sh") || return 1
     fi
     key="$boot_id
 $PY

@@ -55,7 +55,7 @@ END { if (record != "") flush() }
     for user in dano danz; do # generated runtime users
         [ "$user" != root ] || continue
         /usr/bin/id -u "$user" >/dev/null 2>&1 || continue
-        listing=$(/usr/bin/sudo -ll -U "$user") || return 1
+        listing=$(/usr/bin/sudo -ll -U "$user") || { hold "effective_policy_query_failed:$user"; return 1; }
         # sudo -ll expands aliases and prints per-rule Options and Commands.
         patterns=$(printf '%s\n' "$listing" | /usr/bin/awk '
             /^Sudoers entry:/ { free=0; commands=0 }
@@ -93,11 +93,38 @@ stop_jobs() {
     fi
 }
 
+receipt() {
+    # Usable even if preparation failed before creating the chief group/state.
+    STATE=/var/lib/chief/currency-step0
+    for dir in /var/lib /var/lib/chief "$STATE"; do
+        if [ ! -e "$dir" ]; then
+            trusted_path "${dir%/*}" || return 1
+            /usr/bin/install -d -o root -m 0755 "$dir" || return 1
+        fi
+        trusted_path "$dir" || return 1
+    done
+    receipt_tmp=$(/usr/bin/mktemp "$STATE/.receipt.XXXXXX") || return 1
+    printf 'hold: %s\njobs: %s\ngrants: %s\n' "$1" "$2" "$3" > "$receipt_tmp"
+    /bin/chmod 0644 "$receipt_tmp"
+    /bin/mv -f "$receipt_tmp" "$STATE/closure-status"
+}
+
+send_receipt() {
+    # A closed SSH pipe must not interrupt containment or revocation.
+    ( /bin/cat "$STATE/closure-status" >&3 ) 2>/dev/null || true
+}
+
 contain() {
+    containment_reason=$*
     printf 'chief Step 0 HOLD: %s; disabling root jobs and retiring sudo grants\n' "$*" >&2
     OS=$(/usr/bin/uname -s)
     stop_jobs
+    receipt "contained:$containment_reason" disabled pending
+    trap 'receipt "contained:$containment_reason:${HOLD_REASON:-revocation_failed}" disabled pending; send_receipt' EXIT
     remove_grants
+    receipt "contained:$containment_reason" disabled removed
+    trap - EXIT
+    send_receipt
     exit 1
 }
 

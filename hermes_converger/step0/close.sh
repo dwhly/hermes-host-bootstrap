@@ -71,6 +71,31 @@ exec 3>&1
 exec >>/var/log/chief-closure.log 2>&1
 trap 'cleanup' EXIT
 
+revocation_failed() {
+    receipt "${reason:+$reason,}${HOLD_REASON:-revocation_failed}" "$jobs" pending
+    # A killed process leaves no stamp and resumes immediately. Persistent,
+    # completed failures retry once per 15 minutes while safe readers continue.
+    if [ -f "$STATE/prepared" ]; then
+        retry=$(( $(/bin/date +%s) + 900 ))
+        printf '%s\n' "$retry" > "$STATE/revocation-retry.new"
+        /bin/mv -f "$STATE/revocation-retry.new" "$STATE/revocation-retry"
+    fi
+    send_receipt
+    cleanup
+}
+
+finish_revocation() {
+    trap 'revocation_failed' EXIT
+    remove_grants
+    /bin/sync
+    receipt "${reason:-none}" "$jobs" removed
+    : > "$STATE/grants-removed.new"
+    /bin/mv -f "$STATE/grants-removed.new" "$STATE/grants-removed"
+    /bin/rm -f "$STATE/revocation-retry"
+    trap 'cleanup' EXIT
+    send_receipt
+}
+
 activate_jobs() {
     if [ "$OS" = Darwin ]; then
         for label in com.chief.node-reconcile com.chief.node-supervisor com.chief.update-request; do
@@ -94,22 +119,22 @@ activate_jobs() {
 # the job currently running closure, and never trust prepared as a success receipt.
 if [ -f "$STATE/prepared" ] && [ "$(/bin/cat "$STATE/prepared")" = fix1 ]; then
     trusted_path "$STATE/prepared"
-    printf 'grants: pending\nhold: revocation_pending\n' > "$STATE/closure-status"
+    reason=''
+    jobs=activation_pending
+    receipt revocation_pending "$jobs" pending
+    trap 'revocation_failed' EXIT
     activate_jobs
-    remove_grants
-    /bin/sync
-    printf 'grants: removed\nhold: none\njobs: enabled\n' > "$STATE/closure-status.new"
-    /bin/chmod 0644 "$STATE/closure-status.new"
-    /bin/mv -f "$STATE/closure-status.new" "$STATE/closure-status"
-    : > "$STATE/grants-removed.new"
-    /bin/mv -f "$STATE/grants-removed.new" "$STATE/grants-removed"
-    /bin/cat "$STATE/closure-status" >&3 || true
+    jobs=enabled
+    finish_revocation
     exit 0
 fi
 
 # Initial unsafe jobs only; later holds never disable a prepared safe reader.
 stop_jobs
 trap 'trap - EXIT; cleanup; contain preparation_failed' EXIT
+receipt preparing disabled pending
+# Old success markers must never survive an interrupted re-closure.
+/bin/rm -f "$STATE/grants-removed"
 if [ "$OS" = Darwin ]; then
     /usr/bin/dscl . -read /Groups/chief >/dev/null 2>&1 || /usr/sbin/dseditgroup -o create chief
 else
@@ -204,27 +229,21 @@ else
     /usr/bin/systemctl --global enable chief-update-login.service
 fi
 # Receipt precedes revocation; sudoers.closed is intentionally NOT asserted here.
-printf '%s\n' "prepared: $OS" "hold: ${reason:-revocation_pending}" "grants: pending" > "$STATE/closure-status"
+jobs=disabled
+receipt "${reason:-revocation_pending}" disabled pending
 if [ -z "$reason" ]; then
     # Marker only selects hardened execution; never makes a caller authoritative.
     [ ! -L "$STATE/prepared" ] || exit 1
     printf 'fix1\n' > "$STATE/prepared"
     # From here, errors retain enabled safe readers and visible pending status.
-    trap 'cleanup' EXIT
+    jobs=activation_pending
+    trap 'revocation_failed' EXIT
     trusted_runtime
     activate_jobs
+    jobs=enabled
 else
     printf 'chief Step 0 HOLD: %s; root jobs remain disabled\n' "$reason" >&2
 fi
-trap 'cleanup' EXIT
-remove_grants
-/bin/sync
-printf 'grants: removed\nhold: %s\n' "${reason:-none}" > "$STATE/closure-status.new"
-if [ -z "$reason" ]; then printf 'jobs: enabled\n'; else printf 'jobs: disabled\n'; fi >> "$STATE/closure-status.new"
-/bin/chmod 0644 "$STATE/closure-status.new"
-/bin/mv -f "$STATE/closure-status.new" "$STATE/closure-status"
-: > "$STATE/grants-removed.new"
-/bin/mv -f "$STATE/grants-removed.new" "$STATE/grants-removed"
-/bin/cat "$STATE/closure-status" >&3 || true
+finish_revocation
 printf 'chief Step 0: grants removed; hold=%s\n' "${reason:-none}"
 [ -z "$reason" ]

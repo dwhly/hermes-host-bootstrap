@@ -180,8 +180,6 @@ def supervise_once(args: argparse.Namespace) -> int:
         try:
             status = process_status(unit)
             target = status["target"]
-            if not status.get("deferred"):
-                targets.append(f"{status['manager']} {target}\n")
             limiter_id = f"{status['manager']}:{target}" if sys_platform() == "darwin" else LINUX_UNIT_MAP.get(unit, unit)
             status_value = "healthy" if status.get("active") else "dead"
             restart_count = limiter.count(limiter_id)
@@ -204,6 +202,12 @@ def supervise_once(args: argparse.Namespace) -> int:
             status = {"target": unit, "manager": "unknown", "deferred": str(exc)}
             limiter_id = unit
             status_value = "unknown"
+        # Cache the observed state, including dead/report-only/GUI-absent jobs.
+        # The shell reports transitions immediately and stable states every 300s.
+        if status["manager"] != "unknown":
+            active = "yes" if status.get("active") else "no"
+            retry = int(time.time()) + 60 if status_value == "restarting" and limiter.allowed(limiter_id) else 0
+            targets.append(f"{status['manager']} {status['target']} {active} {retry}\n")
         payload = {
             "node_id": args.node_id,
             "process_id": unit,

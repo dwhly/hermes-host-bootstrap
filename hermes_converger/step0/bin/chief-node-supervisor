@@ -5,12 +5,75 @@ exec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/empty LANG=C /
 umask 027
 # Sourced only after the dispatcher has checked this file and all its parents.
 # No caller-controlled executable lookup, Python startup, or shell evaluation.
+# HOLD_REASON and read_state'"'"'s value are outputs to the sourcing dispatcher.
+# shellcheck disable=SC2034
 set -eu
-TRUST_OS=$(/usr/bin/uname -s)
+case ${OSTYPE:-} in
+    darwin*) TRUST_OS=Darwin;;
+    linux*) TRUST_OS=Linux;;
+    *) TRUST_OS=$(/usr/bin/uname -s);;
+esac
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 
-hold() { printf '"'"'chief Step 0 HOLD: %s\n'"'"' "$*" >&2; return 1; }
+hold() { HOLD_REASON=$*; printf '"'"'chief Step 0 HOLD: %s\n'"'"' "$*" >&2; return 1; }
+
+# Installed entries use a fixed, symlink-free chain. Check all of it in one stat
+# and (on macOS) one ACL listing, before sourcing any file. No recursive forks.
+# Darwin'"'"'s state/config paths use /private directly, avoiding /var and /etc links.
+trusted_entries() {
+    STATE=/var/lib/chief/currency-step0
+    CONFIG=/etc/chief/node.env
+    REQUESTS=/var/lib/chief/requests
+    if [ "$TRUST_OS" = Darwin ]; then
+        STATE=/private/var/lib/chief/currency-step0
+        CONFIG=/private/etc/chief/node.env
+        REQUESTS=/private/var/lib/chief/requests
+    fi
+    # These are the complete fixed chains, not caller-supplied paths. stat uses
+    # lstat (no -L); type bits reject links without one extra syscall per path.
+    set -- / /opt /opt/chief /opt/chief/bin /opt/chief/lib \
+        /opt/chief/lib/hermes-host-bootstrap "$BASE/.." "$BASE" \
+        "$BASE/trust.sh" "$BASE/pulse.sh" "$BASE/supervise.sh" \
+        /opt/chief/bin/hermes-converger /opt/chief/bin/chief-node-supervisor /opt/chief/bin/chief-update \
+        "$STATE" "$CONFIG" "$REQUESTS"
+    if [ "$TRUST_OS" = Darwin ]; then
+        set -- "$@" /private /private/var /private/var/lib /private/var/lib/chief /private/etc /private/etc/chief
+    else
+        set -- "$@" /var /var/lib /var/lib/chief /etc /etc/chief
+    fi
+    if [ "$TRUST_OS" = Darwin ]; then
+        mode_base=0
+        meta=$(/usr/bin/stat -f '"'"'%u %p'"'"' "$@") || return 1
+        acl=$(/bin/ls -lde "$@") || return 1
+        # ACL records start with a numbered entry; '"'"'+'"'"' also marks an ACL.
+        while IFS= read -r row; do
+            row=${row#"${row%%[![:space:]]*}"}
+            case "$row" in ??????????+*|[0-9]*:*) hold entry_acl; return 1;; esac
+        done <<EOF
+$acl
+EOF
+    else
+        mode_base=0x
+        meta=$(/usr/bin/stat -c '"'"'%u %f'"'"' "$@") || return 1
+    fi
+    while read -r uid mode; do
+        permissions=$(( ${mode_base}${mode} ))
+        [ "$uid" = 0 ] && [ $((permissions & 0022)) -eq 0 ] &&
+            [ $((permissions & 0170000)) -ne $((0120000)) ] || { hold unsafe_entry_chain; return 1; }
+    done <<EOF
+$meta
+EOF
+}
+
+# State is root-written data beneath a verified directory, never shell code.
+# Avoid forks, symlinks and special files on the minute path.
+read_state() {
+    value=$2
+    if [ -f "$STATE/$1" ] && [ ! -L "$STATE/$1" ]; then
+        IFS= read -r value < "$STATE/$1" || value=$2
+    fi
+}
 
 # Check both sides of every symlink, including directory symlinks (/var on Macs).
 # Root-owned symlinks may have mode 0777; their parents must not be writable.
@@ -111,10 +174,10 @@ trusted_runtime() {
     trusted_path "$BASE" || return 1
     if [ "$TRUST_OS" = Darwin ]; then
         boot_id=$(/usr/sbin/sysctl -n kern.boottime) || return 1
-        identity=$(/usr/bin/stat -L -f '"'"'%d:%i:%u:%g:%p:%z:%m:%c'"'"' "$PY" "$PY_TREE" "$BASE" "$BASE/.." "$BASE/trust.sh") || return 1
+        identity=$(/usr/bin/stat -L -f '"'"'%d:%i:%u:%g:%p:%z:%m:%c'"'"' "$PY" "$PY_TREE" "$BASE" "$BASE/.." "$BASE/trust.sh" "$BASE/pulse.sh" "$BASE/supervise.sh") || return 1
     else
         boot_id=$(/bin/cat /proc/sys/kernel/random/boot_id) || return 1
-        identity=$(/usr/bin/stat -L -c '"'"'%d:%i:%u:%g:%f:%s:%y:%z'"'"' "$PY" "$PY_TREE" "$BASE" "$BASE/.." "$BASE/trust.sh") || return 1
+        identity=$(/usr/bin/stat -L -c '"'"'%d:%i:%u:%g:%f:%s:%y:%z'"'"' "$PY" "$PY_TREE" "$BASE" "$BASE/.." "$BASE/trust.sh" "$BASE/pulse.sh" "$BASE/supervise.sh") || return 1
     fi
     key="$boot_id
 $PY
@@ -186,7 +249,7 @@ END { if (record != "") flush() }
     for user in dano danz; do # generated runtime users
         [ "$user" != root ] || continue
         /usr/bin/id -u "$user" >/dev/null 2>&1 || continue
-        listing=$(/usr/bin/sudo -ll -U "$user") || return 1
+        listing=$(/usr/bin/sudo -ll -U "$user") || { hold "effective_policy_query_failed:$user"; return 1; }
         # sudo -ll expands aliases and prints per-rule Options and Commands.
         patterns=$(printf '"'"'%s\n'"'"' "$listing" | /usr/bin/awk '"'"'
             /^Sudoers entry:/ { free=0; commands=0 }
@@ -224,11 +287,38 @@ stop_jobs() {
     fi
 }
 
+receipt() {
+    # Usable even if preparation failed before creating the chief group/state.
+    STATE=/var/lib/chief/currency-step0
+    for dir in /var/lib /var/lib/chief "$STATE"; do
+        if [ ! -e "$dir" ]; then
+            trusted_path "${dir%/*}" || return 1
+            /usr/bin/install -d -o root -m 0755 "$dir" || return 1
+        fi
+        trusted_path "$dir" || return 1
+    done
+    receipt_tmp=$(/usr/bin/mktemp "$STATE/.receipt.XXXXXX") || return 1
+    printf '"'"'hold: %s\njobs: %s\ngrants: %s\n'"'"' "$1" "$2" "$3" > "$receipt_tmp"
+    /bin/chmod 0644 "$receipt_tmp"
+    /bin/mv -f "$receipt_tmp" "$STATE/closure-status"
+}
+
+send_receipt() {
+    # A closed SSH pipe must not interrupt containment or revocation.
+    ( /bin/cat "$STATE/closure-status" >&3 ) 2>/dev/null || true
+}
+
 contain() {
+    containment_reason=$*
     printf '"'"'chief Step 0 HOLD: %s; disabling root jobs and retiring sudo grants\n'"'"' "$*" >&2
     OS=$(/usr/bin/uname -s)
     stop_jobs
+    receipt "contained:$containment_reason" disabled pending
+    trap '"'"'receipt "contained:$containment_reason:${HOLD_REASON:-revocation_failed}" disabled pending; send_receipt'"'"' EXIT
     remove_grants
+    receipt "contained:$containment_reason" disabled removed
+    trap - EXIT
+    send_receipt
     exit 1
 }
 
@@ -242,7 +332,7 @@ refuse() {
     contain "$@"
 }
 
-[ "$(/usr/bin/id -u)" = 0 ] || { hold '"'"'root service entry point'"'"'; exit 1; }
+[ "${EUID:-$(/usr/bin/id -u)}" = 0 ] || { hold '"'"'root service entry point'"'"'; exit 1; }
 BASE=/opt/chief/lib/hermes-host-bootstrap/hermes_converger/step0
 if [ ! -d "$BASE" ]; then
     # One-time bridge from the legacy updater'"'"'s fixed copy destinations. On an
@@ -253,19 +343,33 @@ if [ ! -d "$BASE" ]; then
         if [ ! -e "$dir" ]; then /usr/bin/install -d -o root -m 0755 "$dir"; fi
         trusted_path "$dir" || refuse unsafe_destination
     done
-    /bin/cp -R /usr/local/lib/hermes-host-bootstrap/hermes_converger /opt/chief/lib/hermes-host-bootstrap/
+    bridge=$(/usr/bin/mktemp -d /opt/chief/lib/hermes-host-bootstrap/.bridge.XXXXXX)
+    trap '"'"'/bin/rm -rf "$bridge"'"'"' EXIT
+    /bin/cp -R /usr/local/lib/hermes-host-bootstrap/hermes_converger "$bridge/"
+    trusted_tree "$bridge/hermes_converger" || refuse unsafe_bridge
+    /bin/mv "$bridge/hermes_converger" /opt/chief/lib/hermes-host-bootstrap/hermes_converger
+    /bin/rm -rf "$bridge"
+    trap - EXIT
 fi
-# Only fixed /opt jobs execute after closure. The legacy copies are no longer
-# passwordless and are never referenced by a daemon.
-if [ -e /opt/chief/bin/chief-node-supervisor ]; then
-    trusted_path /opt/chief/bin/chief-node-supervisor || refuse unsafe_launcher_path
-fi
-trusted_path "$BASE/trust.sh" || refuse unsafe_payload_path
-if [ ! -f /var/lib/chief/currency-step0/grants-removed ] || [ ! -f /var/lib/chief/currency-step0/prepared ]; then
+# Only the installed fixed entries use the batched check. During initial closure
+# use the full tree check; no root-owned state or config is assumed to exist yet.
+STATE=/var/lib/chief/currency-step0
+if [ -f "$STATE/prepared" ]; then
+    trusted_entries || refuse unsafe_entry_chain
+else
+    trusted_path "$BASE/trust.sh" || refuse unsafe_payload_path
     trusted_tree "$BASE/.." || refuse unsafe_payload_tree
     exec /bin/sh "$BASE/close.sh"
 fi
-trusted_path /var/lib/chief/currency-step0/grants-removed || refuse unsafe_state
-trusted_path "$BASE/supervise.sh" || refuse unsafe_entry
-exec /bin/sh "$BASE/supervise.sh"
+if [ ! -f "$STATE/grants-removed" ]; then
+    read_state revocation-retry 0
+    case "$value" in '"'"''"'"'|*[!0-9]*) value=0;; esac
+    now=$(/bin/date +%s)
+    if [ "$now" -ge "$value" ] || [ "$value" -gt "$((now + 900))" ]; then
+        trusted_tree "$BASE/.." || refuse unsafe_payload_tree
+        exec /bin/sh "$BASE/close.sh"
+    fi
+    # Safe readers still check in and report health during a revocation hold.
+fi
+. "$BASE/supervise.sh"
 '

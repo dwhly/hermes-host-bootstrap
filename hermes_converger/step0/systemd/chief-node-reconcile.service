@@ -1,12 +1,11 @@
 [Unit]
-Description=Chief boot reconcile (Core startup is independent)
-Wants=network-online.target
-After=network-online.target
+Description=Chief boot reconcile (node and Core startup are independent)
 
 [Service]
-Type=oneshot
+Type=exec
 ExecStart=/opt/chief/bin/hermes-converger
-TimeoutStartSec=1860
+TimeoutStartSec=10
+RuntimeMaxSec=1860
 User=root
 Group=chief
 

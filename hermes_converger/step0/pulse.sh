@@ -1,71 +1,73 @@
 #!/bin/sh
-# A0 pulse: shell only on no-op. Phase A's Go updater is deliberately not here.
-# Invoked in an empty environment by a zero-argument root entry point.
+# Sourced by the clean fixed launcher after trusted_entries; no no-op Python.
 set -eu
-BASE=/opt/chief/lib/hermes-host-bootstrap/hermes_converger/step0
-# shellcheck source=hermes_converger/step0/trust.sh
-. "$BASE/trust.sh"
-STATE=/var/lib/chief/currency-step0
-trusted_path "$STATE"
-trusted_path /etc/chief/node.env
 now=$(/bin/date +%s)
-last=0
-if [ -f "$STATE/last-check" ]; then
-    trusted_path "$STATE/last-check"
-    read -r last < "$STATE/last-check" || last=0
-fi
+read_state last-check 0
+last=$value
 case "$last" in ''|*[!0-9]*) last=0;; esac
 trigger=periodic
+pending=no
 wake=linux
 full=yes
-if [ "$(/usr/bin/uname -s)" = Darwin ]; then
-    boot=$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null || echo unknown)
-    wake=$(/usr/sbin/sysctl -n kern.waketime 2>/dev/null || echo unknown)
+if [ "$TRUST_OS" = Darwin ]; then
+    # One sysctl, no sed/grep pipelines or second uname.
+    epochs=$(/usr/sbin/sysctl -n kern.boottime kern.waketime 2>/dev/null) || epochs='unknown
+unknown'
+    boot=${epochs%%'
+'*}
+    wake=${epochs#*'
+'}
     full=no
-    caps=$(/usr/sbin/ioreg -r -n IOPMrootDomain -d 1 | /usr/bin/sed -n 's/.*"SystemPowerStateCapabilities"[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p')
-    case "$caps" in ''|*[!0-9]*) ;; *) [ $((caps & 3)) -ne 3 ] || full=yes;; esac
-
+    power=$(/usr/sbin/ioreg -r -n IOPMrootDomain -d 1) || power=''
+    case "$power" in
+        *'"SystemPowerStateCapabilities" = '*)
+            caps=${power#*'"SystemPowerStateCapabilities" = '}
+            caps=${caps%%[!0-9]*}
+            case "$caps" in ''|*[!0-9]*) ;; *) [ $((caps & 3)) -ne 3 ] || full=yes;; esac;;
+    esac
 else
-    boot=$(/bin/cat /proc/sys/kernel/random/boot_id)
+    IFS= read -r boot < /proc/sys/kernel/random/boot_id
 fi
-old_boot=''
-if [ -f "$STATE/boot" ]; then trusted_path "$STATE/boot"; old_boot=$(/bin/cat "$STATE/boot"); fi
-previous=''
-if [ -f "$STATE/wake" ]; then trusted_path "$STATE/wake"; previous=$(/bin/cat "$STATE/wake"); fi
+read_state boot ''; old_boot=$value
+read_state wake ''; previous=$value
 [ "$wake" = "$previous" ] || trigger=wake
 [ "$last" != 0 ] || trigger=boot
-# Fixed files under a root-owned non-writable directory; readers never follow a
-# link and never read more than 257 bytes. Python consumes under the shared lock.
 for hint in login wake network request; do
-    [ ! -s "/var/lib/chief/requests/$hint" ] || trigger=$hint
+    if [ -s "$REQUESTS/$hint" ]; then trigger=$hint; pending=yes; fi
 done
-url=$(/usr/bin/sed -n 's/^CHIEF_CORE_URL=//p' /etc/chief/node.env)
+url=''
+while IFS='=' read -r name value; do
+    [ "$name" != CHIEF_CORE_URL ] || url=$value
+done < "$CONFIG"
 [ -n "$url" ] || { hold missing_core_url; exit 1; }
 online=no
 /usr/bin/curl --silent --max-time 1 --connect-timeout 1 --noproxy '*' --output /dev/null -- "$url/health" && online=yes
-old_online=no
-if [ -f "$STATE/online" ]; then trusted_path "$STATE/online"; read -r old_online < "$STATE/online" || old_online=no; fi
+read_state online no; old_online=$value
 if [ "$online" != "$old_online" ]; then
     if [ "$online" = yes ]; then
-        # Persist return independently of the worker lock. A busy worker cannot
-        # erase the observation merely by coalescing this pulse.
-        [ -f /var/lib/chief/requests/network ] && [ ! -L /var/lib/chief/requests/network ] || exit 1
-        printf 'network\n' > /var/lib/chief/requests/network
+        [ -f "$REQUESTS/network" ] && [ ! -L "$REQUESTS/network" ] || exit 1
+        printf 'network\n' > "$REQUESTS/network"
         trigger=network
     fi
     observation=$(/usr/bin/mktemp "$STATE/.online.XXXXXX")
     printf '%s\n' "$online" > "$observation"
     /bin/mv -f "$observation" "$STATE/online"
 fi
-# A return to full wake must not wait for the next five-minute report interval.
-old_full=no
-if [ -f "$STATE/full" ]; then trusted_path "$STATE/full"; read -r old_full < "$STATE/full" || old_full=no; fi
+read_state full no; old_full=$value
 [ "$full" != yes ] || [ "$old_full" = yes ] || trigger=wake
 [ "$boot" = "$old_boot" ] || trigger=boot
-# Spool flooding cannot force Python more than once/minute. Wake and reconnect
-# survive a busy worker because only its lock holder commits these stamps.
-if [ $((now - last)) -ge 0 ] && [ $((now - last)) -lt 60 ]; then printf 'chief-pulse at=%s decision=noop python=0 full=%s online=%s\n' "$now" "$full" "$online"; exit 0; fi
-if [ "$trigger" = periodic ] && [ $((now - last)) -ge 0 ] && [ $((now - last)) -lt 300 ]; then printf 'chief-pulse at=%s decision=noop python=0 full=%s online=%s\n' "$now" "$full" "$online"; exit 0; fi
+# Worker commits stamps under the shared lock. Pending wake/return survives a
+# busy worker. Offline periodic checks do not start Python; explicit hints do.
+noop=no
+[ "$online" != no ] || [ "$trigger" != periodic ] || [ "$pending" != no ] || noop=yes
+if [ $((now - last)) -ge 0 ]; then
+    [ $((now - last)) -ge 60 ] || noop=yes
+    [ "$trigger" != periodic ] || [ $((now - last)) -ge 300 ] || noop=yes
+fi
+if [ "$noop" = yes ]; then
+    printf 'chief-pulse at=%s decision=noop python=0 full=%s online=%s\n' "$now" "$full" "$online"
+    exit 0
+fi
 trusted_runtime
 printf 'chief-pulse at=%s decision=check trigger=%s full=%s online=%s\n' "$now" "$trigger" "$full" "$online"
 export CHIEF_PULSE_BOOT=$boot CHIEF_PULSE_TRIGGER=$trigger CHIEF_PULSE_WAKE=$wake CHIEF_PULSE_ONLINE=$online CHIEF_PULSE_FULL=$full

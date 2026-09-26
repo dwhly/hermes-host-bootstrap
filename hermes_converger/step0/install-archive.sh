@@ -1,15 +1,33 @@
 #!/bin/sh
-# Run this reviewed script in a clean root shell AFTER verifying archive SHA256.
+# Run a private root-owned copy of this script AFTER pinning its own SHA256.
 # argv is administrator-only, never a sudoers command or daemon entry point.
 set -eu
-umask 022
-[ "$#" = 1 ] || { echo 'usage: install-archive.sh verified.tar' >&2; exit 2; }
+umask 077
+[ "$#" = 2 ] || { echo 'usage: install-archive.sh archive.tar expected-sha256' >&2; exit 2; }
 archive=$1
-stage=$(/usr/bin/mktemp -d /var/root-currency-step0.XXXXXX)
+expected=$2
+case "$expected" in ''|*[!0-9a-f]*) exit 2;; esac
+[ "${#expected}" = 64 ] || exit 2
+case "$(/usr/bin/uname -s)" in
+    Darwin) private=/var/root;;
+    Linux) private=/root;;
+    *) echo 'unsupported platform' >&2; exit 1;;
+esac
+stage=$(/usr/bin/mktemp -d "$private/currency-step0.XXXXXX")
 trap '/bin/rm -rf "$stage"' EXIT
 /bin/chmod 0700 "$stage"
+# Copy before hashing: the transfer account may replace the source at any time.
+# Neither tar nor imported code ever reads that source after this copy.
+/bin/cp "$archive" "$stage/payload.tar"
+if [ -x /usr/bin/shasum ]; then
+    actual=$(/usr/bin/shasum -a 256 "$stage/payload.tar")
+else
+    actual=$(/usr/bin/sha256sum "$stage/payload.tar")
+fi
+[ "${actual%% *}" = "$expected" ] || { echo 'archive digest mismatch' >&2; exit 1; }
+umask 022
 # --no-same-permissions is supported by GNU tar and macOS bsdtar. Do not use -p.
-/usr/bin/tar --no-same-permissions -xf "$archive" -C "$stage"
+/usr/bin/tar --no-same-permissions -xf "$stage/payload.tar" -C "$stage"
 # shellcheck source=hermes_converger/step0/trust.sh
 . "$stage/hermes_converger/step0/trust.sh"
 trusted_tree "$stage/hermes_converger"

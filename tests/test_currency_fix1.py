@@ -1,5 +1,6 @@
 """Review regressions: private host files, OS controls recorded, no live mutation."""
 from __future__ import annotations
+import hashlib
 import json
 import os
 import pathlib
@@ -95,13 +96,20 @@ supervisor.SupervisorTransport.emit_health = lambda self,payload: record('health
         wrapper.chmod(0o755)
         self.trust = f'''set -eu
 TRUST_OS={platform}
+trusted_entries() {{
+    STATE={shlex.quote(str(self.state))}
+    CONFIG={shlex.quote(str(self.root/'etc/chief/node.env'))}
+    REQUESTS={shlex.quote(str(self.root/'var/lib/chief/requests'))}
+}}
 trusted_path() {{ :; }}
 trusted_tree() {{ :; }}
 trusted_python() {{ PY={shlex.quote(str(wrapper))}; export PY; }}
 trusted_runtime() {{ trusted_python; }}
-hold() {{ echo "HOLD: $*" >&2; return 1; }}
+hold() {{ HOLD_REASON=$*; echo "HOLD: $*" >&2; return 1; }}
 '''
-        dirs = ('/opt/', '/usr/local/', '/etc/', '/var/', '/Library/', '/usr/lib/systemd', '/run/')
+        helpers = (PAYLOAD/'trust.sh').read_text()
+        self.trust += helpers[helpers.index('read_state() {'):helpers.index('# Check both sides')]
+        dirs = ('/opt/' , '/usr/local/', '/etc/', '/var/', '/Library/', '/usr/lib/systemd', '/run/')
         commands = ('/usr/bin/id', '/usr/bin/uname', '/bin/hostname', '/usr/bin/getent', '/usr/sbin/groupadd',
                     '/usr/bin/dscl', '/usr/sbin/dseditgroup', '/usr/bin/systemctl', '/bin/launchctl', '/bin/chown',
                     '/usr/sbin/chown', '/usr/sbin/visudo', '/usr/bin/sudo', '/bin/sync', '/usr/bin/install',
@@ -117,7 +125,9 @@ hold() {{ echo "HOLD: $*" >&2; return 1; }}
                 b = body.index('remove_grants() {', a)
                 body = body[:a] + self.trust + body[b:]
                 source = source[:start] + ' '.join(shlex.quote(v) for v in args[:-1]) + ' ' + shlex.quote(body) + '\n'
-            source = re.sub('|'.join(re.escape(d) for d in dirs), lambda m: str(self.root)+m[0], source)
+            source = source.replace(str(self.root), '@HOST@')
+            source = re.sub('|'.join(re.escape(d) for d in dirs), lambda m: '@HOST@'+m[0], source)
+            source = source.replace('@HOST@@HOST@', '@HOST@').replace('@HOST@', str(self.root))
             source = re.sub('|'.join(re.escape(c) for c in sorted(commands, key=len, reverse=True)), lambda m: str(self.bin/m[0].rsplit('/',1)[1]), source)
             path.write_text(source)
         (self.base/'trust.sh').write_text(self.trust)
@@ -326,7 +336,8 @@ def test_trusted_clt_python_and_framework_aliases(tmp_path):
 
 def test_runtime_trust_cache_hits_and_identity_invalidation(tmp_path):
     state=tmp_path/'state'; state.mkdir()
-    base=tmp_path/'package/step0'; base.mkdir(parents=True); (base/'trust.sh').touch()
+    base=tmp_path/'package/step0'; base.mkdir(parents=True)
+    for name in ('trust.sh','pulse.sh','supervise.sh'): (base/name).touch()
     runtime_tree=tmp_path/'runtime'; runtime_tree.mkdir()
     binary=runtime_tree/'python'; binary.write_text('first')
     scan=tmp_path/'scans'
@@ -345,6 +356,10 @@ trusted_runtime
     assert run().returncode==0 and scan.read_text()=='scan\nversion\n'
     binary.write_text('replaced interpreter bytes')
     assert run().returncode==0 and scan.read_text()=='scan\nversion\nscan\nversion\n'
+    for name in ('pulse.sh','supervise.sh'):
+        before=scan.read_text()
+        (base/name).write_text('new entry bytes')
+        assert run().returncode==0 and scan.read_text()==before+'scan\nversion\n'
 
 
 def test_signed_wake_field_cannot_be_added_after_signature():
@@ -358,7 +373,7 @@ def test_post_closure_transient_trust_failure_keeps_jobs_enabled(tmp_path):
     fixture=Host(tmp_path)
     result=fixture.run(); assert result.returncode==0,fixture.output(result)
     before=fixture.log.read_text()
-    trust=fixture.base/'trust.sh'
+    trust=fixture.root/'opt/chief/bin/hermes-converger'
     trust.write_text(trust.read_text().replace('trusted_runtime() { trusted_python; }','trusted_runtime() { hold unavailable; }'))
     result=fixture.run('hermes-converger')
     assert result.returncode!=0
@@ -392,12 +407,12 @@ def test_real_git_archive_installer_uses_safe_modes(tmp_path):
     tree=subprocess.check_output(['git','-C',str(repo),'write-tree'],text=True).strip()
     with archive.open('wb') as f:
         subprocess.run(['git','-C',str(repo),'-c','tar.umask=022','archive','--format=tar',tree,'hermes_converger'],stdout=f,check=True)
-    source=(PAYLOAD/'install-archive.sh').read_text().replace('/var/root-currency-step0.',str(host)+'/stage.')
+    source=(PAYLOAD/'install-archive.sh').read_text().replace('private=/var/root','private='+str(host)).replace('private=/root','private='+str(host))
     source=source.replace('/opt',str(host)+'/opt').replace('/var/lib/chief',str(host)+'/var/lib/chief')
     source=source.replace('/usr/bin/install -d -o root','/usr/bin/install -d')
     source=source.replace('/bin/sh "$base/hermes_converger/step0/close.sh"','trusted_tree "$base/hermes_converger"')
     script=tmp_path/'install.sh';script.write_text(source)
-    result=subprocess.run(['/bin/sh',str(script),str(archive)],text=True,capture_output=True)
+    result=subprocess.run(['/bin/sh',str(script),str(archive),hashlib.sha256(archive.read_bytes()).hexdigest()],env={**os.environ,'HOME':str(host)},text=True,capture_output=True)
     assert result.returncode==0,result.stderr
     installed=host/'opt/chief/lib/hermes-host-bootstrap/hermes_converger'
     assert installed.is_dir()
@@ -409,7 +424,7 @@ def test_core_policy_patch_field_is_inside_the_signed_digest():
     patch=(ROOT/'patches/chief-core-step0-wake-qualified.patch').read_text()
     line=next(line[1:].strip() for line in patch.splitlines() if line.startswith('+        "wake_qualified":'))
     node_id='h-mini2'
-    for setting, expected in [('',False),('h-mini2,h-air',True),('h-mini',False)]:
+    for setting, expected in [('',False),('h-mini2,h-air',True),(' h-mini2 , h-air ',True),('h-mini',False)]:
         data=eval('{'+line+'}', {'os':SimpleNamespace(environ={'CHIEF_WAKE_QUALIFIED_NODES':setting}), 'node_id':node_id})
         assert data['wake_qualified'] is expected
         plan=make_plan(); before=core.plan_digest_payload(plan)

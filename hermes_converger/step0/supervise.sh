@@ -1,35 +1,37 @@
 #!/bin/sh
+# Sourced by the clean fixed launcher after trusted_entries.
+# read_state sets value in the calling shell.
+# shellcheck disable=SC2154
 set -eu
-BASE=/opt/chief/lib/hermes-host-bootstrap/hermes_converger/step0
-# shellcheck source=hermes_converger/step0/trust.sh
-. "$BASE/trust.sh"
-STATE=/var/lib/chief/currency-step0
-trusted_path "$STATE"
 now=$(/bin/date +%s)
-last=0
-if [ -f "$STATE/last-health" ]; then
-    trusted_path "$STATE/last-health"
-    read -r last < "$STATE/last-health" || last=0
-fi
+read_state last-health 0
+last=$value
 case "$last" in ''|*[!0-9]*) last=0;; esac
-healthy=no
-if [ -f "$STATE/supervisor-targets" ]; then
-    trusted_path "$STATE/supervisor-targets"
-    healthy=yes
-    while read -r manager target; do
+changed=yes
+if [ -f "$STATE/supervisor-targets" ] && [ ! -L "$STATE/supervisor-targets" ]; then
+    changed=no
+    while read -r manager target previous retry; do
+        active=no
         case "$manager" in
             launchd)
-                if ! /bin/launchctl print "$target" 2>/dev/null | /usr/bin/grep -q 'state = running'; then healthy=no; fi;;
+                status=$(/bin/launchctl print "$target" 2>/dev/null) || status=''
+                case "$status" in *'state = running'*) active=yes;; esac;;
             systemd)
-                /usr/bin/systemctl is-active --quiet "$target" || healthy=no;;
+                /usr/bin/systemctl is-active --quiet "$target" && active=yes;;
             docker)
-                trusted_path /usr/bin/docker || { healthy=no; continue; }
-                [ "$(/usr/bin/docker inspect --format '{{.State.Running}}' "$target" 2>/dev/null)" = true ] || healthy=no;;
-            *) healthy=no;;
+                trusted_path /usr/bin/docker || { changed=yes; continue; }
+                status=$(/usr/bin/docker inspect --format '{{.State.Running}}' "$target" 2>/dev/null) || status=''
+                [ "$status" != true ] || active=yes;;
+            *) changed=yes;;
         esac
+        [ "$active" = "$previous" ] || changed=yes
+        case "$retry" in ''|*[!0-9]*) retry=0;; esac
+        if [ "$active" = no ] && [ "$retry" -gt 0 ] && [ "$now" -ge "$retry" ]; then changed=yes; fi
     done < "$STATE/supervisor-targets"
 fi
-if [ "$healthy" = yes ] && [ $((now - last)) -ge 0 ] && [ $((now - last)) -lt 300 ]; then
+# A stable dead/quarantined/report-only target is also a no-op. Fresh health and
+# admission/restart decisions are re-evaluated at least every five minutes.
+if [ "$changed" = no ] && [ $((now - last)) -ge 0 ] && [ $((now - last)) -lt 300 ]; then
     printf 'chief-supervisor decision=noop python=0\n'
     exit 0
 fi

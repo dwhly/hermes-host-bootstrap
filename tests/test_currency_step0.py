@@ -115,7 +115,7 @@ def test_dispatcher_clears_all_caller_environment(tmp_path):
     probe = tmp_path / "probe.sh"
     probe.write_text(prefix + shlex.quote("/usr/bin/env") + "\n")
     env = dict(os.environ, PYTHONPATH="/evil", CHIEF_CORE_URL="http://evil", CHIEF_CODE_ROOT="/evil",
-               SUDO_UID="501", GIT_CONFIG_COUNT="1", BASH_ENV="/evil", VIRTUAL_ENV="/evil")
+               SUDO_UID="501", GIT_CONFIG_COUNT="1", BASH_ENV="/evil", VIRTUAL_ENV="/evil", OSTYPE="evil", EUID="501")
     out = subprocess.run(["/bin/sh",str(probe)],env=env,text=True,capture_output=True,check=True)
     assert "evil" not in out.stdout and "SUDO_UID=" not in out.stdout
     assert "HOME=/var/empty" in out.stdout
@@ -330,9 +330,10 @@ def test_pulse_noop_never_starts_python_or_consumes_hints(tmp_path):
         (state/name).write_text(value+'\n')
     env=tmp_path/"node.env"; env.write_text('CHIEF_CORE_URL=http://fixture\n')
     curl=tmp_path/"curl"; curl.write_text('#!/bin/sh\nexit 0\n'); curl.chmod(0o755)
-    source=(PAYLOAD/"pulse.sh").read_text().replace('. "$BASE/trust.sh"',
-        'trusted_path() { :; }\ntrusted_tree() { echo python_would_start >&2; exit 99; }\ntrusted_runtime() { exit 99; }')
-    source=source.replace('/var/lib/chief/currency-step0',str(state)).replace('/var/lib/chief/requests',str(hints)).replace('/etc/chief/node.env',str(env)).replace('/usr/bin/curl',str(curl))
+    helpers = (PAYLOAD/'trust.sh').read_text()
+    source = f'STATE={shlex.quote(str(state))}\nCONFIG={shlex.quote(str(env))}\nREQUESTS={shlex.quote(str(hints))}\nTRUST_OS=Linux\n'
+    source += helpers[helpers.index('read_state() {'):helpers.index('# Check both sides')]
+    source += 'trusted_runtime() { exit 99; }\n' + (PAYLOAD/'pulse.sh').read_text().replace('/usr/bin/curl',str(curl))
     result=subprocess.run(["/bin/sh"],input=source,text=True,capture_output=True)
     assert result.returncode==0, result.stderr
     assert "python" not in result.stderr

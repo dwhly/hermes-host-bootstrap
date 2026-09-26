@@ -16,6 +16,13 @@ end = contain.index("' \"$f\"", start)
 contain = contain[:start] + (BASE / "sudoers.awk").read_text() + contain[end:]
 (BASE / "contain.sh").write_text(contain)
 TRUST = (BASE / "trust.sh").read_text().split("\n", 1)[1] + (BASE / "contain.sh").read_text().split("\n", 1)[1]
+# Inside env -i these are Bash's own variables (macOS /bin/sh), never caller
+# input. Other POSIX shells keep the portable uname/id fallback.
+TRUST = TRUST.replace('TRUST_OS=$(/usr/bin/uname -s)', '''case ${OSTYPE:-} in
+    darwin*) TRUST_OS=Darwin;;
+    linux*) TRUST_OS=Linux;;
+    *) TRUST_OS=$(/usr/bin/uname -s);;
+esac''', 1)
 # env -i is before any external helper or imported file. Noninteractive /bin/sh
 # reads no ENV/BASH_ENV; sudo also strips dynamic loader variables before exec.
 PREFIX = '''#!/bin/sh
@@ -24,7 +31,7 @@ PREFIX = '''#!/bin/sh
 '''
 for name, mode in (("hermes-converger", "converge"), ("chief-node-supervisor", "supervisor"), ("chief-update", "update")):
     body = "cd /\numask 027\n" + TRUST + '''
-[ "$(/usr/bin/id -u)" = 0 ] || { hold 'root service entry point'; exit 1; }
+[ "${EUID:-$(/usr/bin/id -u)}" = 0 ] || { hold 'root service entry point'; exit 1; }
 BASE=/opt/chief/lib/hermes-host-bootstrap/hermes_converger/step0
 if [ ! -d "$BASE" ]; then
     # One-time bridge from the legacy updater's fixed copy destinations. On an
@@ -35,25 +42,42 @@ if [ ! -d "$BASE" ]; then
         if [ ! -e "$dir" ]; then /usr/bin/install -d -o root -m 0755 "$dir"; fi
         trusted_path "$dir" || refuse unsafe_destination
     done
-    /bin/cp -R /usr/local/lib/hermes-host-bootstrap/hermes_converger /opt/chief/lib/hermes-host-bootstrap/
+    bridge=$(/usr/bin/mktemp -d /opt/chief/lib/hermes-host-bootstrap/.bridge.XXXXXX)
+    trap '/bin/rm -rf "$bridge"' EXIT
+    /bin/cp -R /usr/local/lib/hermes-host-bootstrap/hermes_converger "$bridge/"
+    trusted_tree "$bridge/hermes_converger" || refuse unsafe_bridge
+    /bin/mv "$bridge/hermes_converger" /opt/chief/lib/hermes-host-bootstrap/hermes_converger
+    /bin/rm -rf "$bridge"
+    trap - EXIT
 fi
-# Only fixed /opt jobs execute after closure. The legacy copies are no longer
-# passwordless and are never referenced by a daemon.
-if [ -e /opt/chief/bin/''' + name + ''' ]; then
-    trusted_path /opt/chief/bin/''' + name + ''' || refuse unsafe_launcher_path
-fi
-trusted_path "$BASE/trust.sh" || refuse unsafe_payload_path
-if [ ! -f /var/lib/chief/currency-step0/grants-removed ] || [ ! -f /var/lib/chief/currency-step0/prepared ]; then
+# Only the installed fixed entries use the batched check. During initial closure
+# use the full tree check; no root-owned state or config is assumed to exist yet.
+STATE=/var/lib/chief/currency-step0
+if [ -f "$STATE/prepared" ]; then
+    trusted_entries || refuse unsafe_entry_chain
+else
+    trusted_path "$BASE/trust.sh" || refuse unsafe_payload_path
     trusted_tree "$BASE/.." || refuse unsafe_payload_tree
     exec /bin/sh "$BASE/close.sh"
 fi
-trusted_path /var/lib/chief/currency-step0/grants-removed || refuse unsafe_state
+if [ ! -f "$STATE/grants-removed" ]; then
+    read_state revocation-retry 0
+    case "$value" in ''|*[!0-9]*) value=0;; esac
+    now=$(/bin/date +%s)
+    if [ "$now" -ge "$value" ] || [ "$value" -gt "$((now + 900))" ]; then
+        trusted_tree "$BASE/.." || refuse unsafe_payload_tree
+        exec /bin/sh "$BASE/close.sh"
+    fi
+    # Safe readers still check in and report health during a revocation hold.
+fi
 '''
     script = {"converge": "pulse", "supervisor": "supervise", "update": "update"}[mode]
-    body += f'trusted_path "$BASE/{script}.sh" || refuse unsafe_entry\n'
     if mode == "update":
         body += 'trusted_tree "$BASE/.." || refuse unsafe_payload_tree\n'
-    body += f'exec /bin/sh "$BASE/{script}.sh"\n'
+        body += 'exec /bin/sh "$BASE/update.sh"\n'
+    else:
+        # Keep the already checked embedded helpers and OS identity in this shell.
+        body += f'. "$BASE/{script}.sh"\n'
     rendered = PREFIX + "exec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/empty LANG=C /bin/sh -c " + shlex.quote(body) + "\n"
     (ROOT / "scripts" / name).write_text(rendered)
     (BASE / "bin").mkdir(exist_ok=True)
