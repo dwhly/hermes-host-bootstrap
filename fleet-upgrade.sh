@@ -22,7 +22,9 @@ set -uo pipefail
 
 CORE="${CHIEF_CORE_URL:-http://127.0.0.1:8088}"
 BOOTSTRAP_SRC="${CHIEF_BOOTSTRAP_SRC:-/root/projects/hermes-host-bootstrap}"
-HOSTS_DIR="${HERMES_HOME:-$HOME/.hermes}/hosts"
+HOSTS_DIR="${HERMES_FLEET_HOSTS_DIR:-${HERMES_HOME:-$HOME/.hermes}/hosts}"
+INTENT="${HERMES_FLEET_INTENT:-${HERMES_HOME:-$HOME/.hermes}/fleet/hosts.yaml}"
+POLICY_HELPER="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent / "scripts/desktop-fleet-policy.py")' "${BASH_SOURCE[0]}")"
 DEPLOY_NODE="$BOOTSTRAP_SRC/deploy-node.sh"
 
 log() { printf '\033[36m[fleet-upgrade %s]\033[0m %s\n' "$1" "$2" >&2; }
@@ -54,6 +56,39 @@ host_spec() {  # host_spec <host> -> echoes "ssh_target|oskind" or returns 2
   printf '%s|%s' "$ssh_target" "$oskind"
 }
 
+# Returns 3 for protected, 1 for indeterminate. No update or refresh precedes this.
+check_protection() {
+  local host="$1" policy spec ssh_target rc=0
+  policy="$(python3 "$POLICY_HELPER" policy --registry "$INTENT" --host "$host")" || {
+    err "$host" "indeterminate Intent policy — refusing update"; return 1;
+  }
+  if [[ "$policy" == protected ]]; then
+    log "$host" "protected (registry Intent); owner maintenance required"
+    return 3
+  fi
+  spec="$(host_spec "$host")" || return 1
+  ssh_target="${spec%%|*}"
+  if [[ -z "$ssh_target" ]]; then
+    if [[ -e /etc/hermes/image-provenance.json || -L /etc/hermes/image-provenance.json ]]; then
+      rc=3
+    elif [[ ! -r /etc || ! -x /etc || ( -d /etc/hermes && ( ! -r /etc/hermes || ! -x /etc/hermes ) ) ]]; then
+      rc=4
+    fi
+  else
+    # Presence (even malformed/unreadable) is protected. Failure to establish absence
+    # is indeterminate. No sudo, update, gateway refresh, or deploy-node in this probe.
+    ssh -o BatchMode=yes -o ConnectTimeout=12 "$ssh_target" \
+      'if test -e /etc/hermes/image-provenance.json || test -L /etc/hermes/image-provenance.json; then exit 3; elif test ! -r /etc || test ! -x /etc || { test -d /etc/hermes && { test ! -r /etc/hermes || test ! -x /etc/hermes; }; }; then exit 4; else exit 0; fi' || rc=$?
+  fi
+  if [[ "$rc" == 3 ]]; then
+    log "$host" "protected (image-provenance marker); owner maintenance required"
+    return 3
+  elif [[ "$rc" != 0 ]]; then
+    err "$host" "marker status indeterminate — refusing update"
+    return 1
+  fi
+}
+
 # Extract a comparable version token from a `hermes --version` line. Prefers the
 # v-prefixed token (v0.18.0 -> 0.18.0); the node collector's own regex currently DROPS
 # the leading 0. (emits 18.0) — tracked as a bug in EDD-fleet-upgrade-telemetry-
@@ -73,6 +108,7 @@ _ver_match() {  # tolerant compare: 0.18.0 ~= 18.0 (absorbs the collector leadin
 
 upgrade_one() {  # returns 0 ok, 1 problem
   local host="$1"
+  check_protection "$host" || return $?
   local spec; spec="$(host_spec "$host")" || return $?
   local ssh_target="${spec%%|*}" oskind="${spec##*|}"
 
@@ -132,22 +168,29 @@ main() {
   for a in "$@"; do [[ "$a" == "--include-self" ]] && include_self=1; done
   [[ -z "$target" ]] && { err "-" "usage: fleet-upgrade <host|all> [--include-self]"; exit 2; }
 
-  local rc=0
+  local rc=0 status=0
   if [[ "$target" == "all" ]]; then
     for y in "$HOSTS_DIR"/*.yaml; do
       [[ -e "$y" ]] || continue
       local h; h="$(basename "$y" .yaml)"
       [[ "$h" == *.live ]] && continue
-      [[ "$h" == "h-do1" ]] && continue   # control host handled separately
-      upgrade_one "$h" || rc=1
+      status=0
+      if [[ "$h" == "h-do1" ]]; then
+        check_protection "$h" || status=$?
+        [[ "$status" == 0 || "$status" == 3 ]] || rc=1
+        continue
+      fi
+      upgrade_one "$h" || status=$?
+      [[ "$status" == 0 || "$status" == 3 ]] || rc=1
     done
-    if [[ "$include_self" == 1 ]]; then
+    if [[ "$include_self" == 1 ]] && check_protection h-do1; then
       log "h-do1" "control host: launch the DETACHED self-upgrade (survives gateway restart)"
       log "h-do1" "run: python3 ~/.hermes/upgrade-backup/launch-self-upgrade.py  (see fleet-upgrade-execution reference)"
       log "h-do1" "then verify: fleet-upgrade-verify h-do1"
     fi
   else
     upgrade_one "$target" || rc=$?
+    [[ "$rc" != 3 ]] || err "$target" "direct protected-host update refused; use the approved owner-maintenance cycle"
   fi
   exit $rc
 }

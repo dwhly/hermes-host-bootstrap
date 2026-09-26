@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""Read Intent policy or manage an explicitly selected G3 marker. No credentials."""
+import argparse
+import sys
+import json
+from pathlib import Path
+from desktop_fleet.common import host_record, rooted, update_policy
+from desktop_fleet import marker
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=['policy', 'verify', 'render', 'install', 'backup', 'suspend', 'restore'])
+    parser.add_argument('--registry', required=True)
+    parser.add_argument('--host', required=True)
+    parser.add_argument('--root', default='/')
+    parser.add_argument('--backup', default='/var/backups/hermes-desktop/image-provenance.json')
+    args = parser.parse_args()
+    policy = update_policy(host_record(args.registry, args.host))
+    if args.action == 'policy':
+        print(policy)
+    elif args.action == 'verify':
+        if policy != 'protected':
+            print('not-applicable (eligible Intent)')
+        else:
+            path = rooted(args.root, marker.MARKER)
+            data = json.loads(path.read_text())
+            if (type(data.get('schema')) is not int or data['schema'] != 1
+                    or data.get('deployment_kind') != 'image' or not data.get('manager')
+                    or (Path(args.root) == Path('/') and path.stat().st_uid != 0)):
+                raise ValueError('invalid/unowned G3 marker')
+            print('protected (marker valid; actual-build REST/CLI refusal qualification still required)')
+    elif policy != 'protected':
+        raise ValueError('marker operations require registry-protected Intent')
+    elif args.action == 'render':
+        sys.stdout.buffer.write(marker.render(args.host))
+    elif args.action == 'install':
+        print('changed' if marker.install(args.root, args.registry, args.host) else 'preserved')
+    else:
+        print('changed' if marker.maintenance(args.root, args.registry, args.host, args.backup, args.action) else 'unchanged')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, KeyError, TypeError, ImportError):
+        sys.exit('desktop-fleet-policy: invalid/unavailable Intent or marker; operation refused')
