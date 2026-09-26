@@ -81,6 +81,29 @@ class Fixtures(unittest.TestCase):
         self.assertEqual(before, self.snapshot())
         self.assertEqual(run.call_count, 2)
 
+    def test_credential_rotation_refreshes_only_dashboard_inputs(self):
+        supervisor = Mock()
+        supervisor.check.return_value = {'pid': 41, 'loaded': True}
+        args = (self.root, self.runtime, 'linux', '/usr/local/bin/hermes-dashboard-server',
+                '/etc/systemd/system/hermes-dashboard-server.service', 'hermes-dashboard-server.service',
+                '127.0.0.1', 9000, supervisor)
+        env = self.write('/home/hermes/.hermes/.env', b'OTHER=one\nHERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH=old\nHERMES_DASHBOARD_BASIC_AUTH_SECRET=old\n')
+        dashboard.install(*args)
+        for key in ('PASSWORD_HASH', 'SECRET', 'PASSWORD', 'USERNAME'):
+            supervisor.refresh.reset_mock()
+            env.write_bytes(env.read_bytes() + f'HERMES_DASHBOARD_BASIC_AUTH_{key}=rotated\n'.encode())
+            self.assertTrue(dashboard.install(*args))
+            supervisor.refresh.assert_called_once()
+            supervisor.refresh.reset_mock()
+            self.assertFalse(dashboard.install(*args))
+            supervisor.refresh.assert_not_called()
+        env.write_bytes(env.read_bytes() + b'OTHER=two\n')
+        self.assertFalse(dashboard.install(*args))
+        supervisor.refresh.assert_not_called()
+        stamp = rooted(self.root, '/var/lib/hermes-desktop/dashboard-env.sha256')
+        self.assertEqual(stamp.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn(b'rotated', stamp.read_bytes())
+
     def test_socket_owner_unknown_and_wrong_supervisor(self):
         for show, sockets in [('MainPID=41\nFragmentPath=/other.service\nLoadState=loaded', ''),
                               ('MainPID=41\nFragmentPath=/unit\nLoadState=loaded', 'LISTEN *:9000')]:

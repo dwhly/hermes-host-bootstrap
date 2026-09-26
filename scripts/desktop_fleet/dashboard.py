@@ -5,10 +5,22 @@ import plistlib
 import re
 import subprocess
 
-from .common import atomic_write, existing, rooted
+from .common import atomic_write, digest, existing, rooted
 
 REPO = Path(__file__).resolve().parents[2]
 LABEL = 'com.hermes.dashboard-server'
+
+
+def env_digest(path):
+    """Mirror the launcher's owned assignments without evaluating or logging secrets."""
+    values = {}
+    for line in (existing(path) or b'').splitlines():
+        if line.startswith(b'export '):
+            line = line[7:]
+        key, sep, value = line.partition(b'=')
+        if sep and (key.startswith(b'HERMES_DASHBOARD_BASIC_AUTH_') or key == b'HERMES_DASHBOARD_PUBLIC_URL'):
+            values[key] = value
+    return (digest(b'\0'.join(key + b'=' + values[key] for key in sorted(values))) + '\n').encode()
 
 
 def command(args):
@@ -146,9 +158,15 @@ def install(root, runtime, platform, launcher, unit, service, bind, port, superv
     # All ownership/socket checks occur before any mutation.
     existing(launcher_path)
     existing(unit_path)
+    stamp_path = rooted(root, (runtime['hermes_home'] + '/.desktop-dashboard' if platform == 'macos'
+                              else '/var/lib/hermes-desktop') + '/dashboard-env.sha256')
+    auth_digest = env_digest(rooted(root, runtime['hermes_home'] + '/.env'))
+    auth_changed = existing(stamp_path) != auth_digest
     launcher_changed = atomic_write(launcher_path, launcher_bytes, 0o755)
     unit_changed = atomic_write(unit_path, unit_bytes)
-    if launcher_changed or unit_changed:
+    if launcher_changed or unit_changed or auth_changed:
         rooted(root, runtime['hermes_home'] + '/logs').mkdir(parents=True, exist_ok=True)
         supervisor.refresh(state, unit_changed)
-    return launcher_changed or unit_changed
+        # Only acknowledge credentials after refresh succeeds. Failed refreshes retry.
+        atomic_write(stamp_path, auth_digest, 0o600)
+    return launcher_changed or unit_changed or auth_changed
