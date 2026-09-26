@@ -33,27 +33,34 @@ export default {
     let pending = [];
     let lastPass = -Infinity;
     let passEnds = -Infinity;
+    let cursor = 0;
     const attempts = new Map();
 
-    function pass(recover = false) {
+    function pass(recover = false, start = cursor) {
       const now = Date.now();
-      if (disposed || now - lastPass < MIN_SPACING || (!recover && now < passEnds)) return;
+      if (disposed || now - lastPass < MIN_SPACING || (!recover && now < passEnds)) return false;
       lastPass = now;
       passEnds = now + allowlist.length * STAGGER;
       generation += 1;
       const current = generation;
       pending.forEach(cancel => cancel());
       pending = [];
-      allowlist.forEach((desired, index) => {
+      allowlist.forEach((_, index) => {
+        const rowIndex = (start + index) % allowlist.length;
+        const desired = allowlist[rowIndex];
         const due = now + index * STAGGER;
         pending.push(ctx.setTimeout(async () => {
           if (disposed || current !== generation) return;
           // A suspended renderer must discard missed ticks, then restart the stagger.
-          if (Date.now() - due > 10000) { pass(true); return; }
+          // Hidden-window throttling commonly delays timers by up to a minute.
+          // Only a real suspension restarts the stagger, beginning at this row.
+          // If recovery is throttled, finish this row rather than dropping it.
+          if (Date.now() - due > INTERVAL / 2 && pass(true, rowIndex)) return;
           try {
             const rows = await host.connections();
             if (disposed || current !== generation) return;
-            if (Date.now() - due > 10000) { pass(true); return; }
+            if (Date.now() - due > INTERVAL / 2 && pass(true, rowIndex)) return;
+            cursor = (rowIndex + 1) % allowlist.length;
             const url = normalizedURL(desired.endpoint);
             const label = desired.label.trim().toLowerCase();
             const matches = rows.filter(row => row.label.trim().toLowerCase() === label || normalizedURL(row.url) === url);
@@ -67,6 +74,7 @@ export default {
           } catch { /* Offline/older sources retry next pass; no activation or turn. */ }
         }, index * STAGGER));
       });
+      return true;
     }
     ctx.onDispose(() => { disposed = true; generation += 1; pending.forEach(cancel => cancel()); });
     ctx.setInterval(pass, INTERVAL);
