@@ -131,13 +131,9 @@ verify_desktop_fleet() {
     printf '%s\n' not-applicable
     return 0
   fi
-  if [[ ! -f "${HERMES_HOME:-$HOME/.hermes}/fleet/generated/desktop-gateways.json" ]]; then
-    printf '%s\n' 'not-configured (desktop rollout pending)'
-    return 0
-  fi
   local fleet_repo
   fleet_repo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  local args=(verify --hermes-home "${HERMES_HOME:-$HOME/.hermes}"
+  local args=(verify --optional --hermes-home "${HERMES_HOME:-$HOME/.hermes}"
     --compatibility "$fleet_repo/desktop-plugins/fleet-gateways/compatibility.json")
   [[ -z "${HERMES_DESKTOP_USER_DATA:-}" ]] || args+=(--user-data "$HERMES_DESKTOP_USER_DATA")
   [[ -z "${HERMES_DESKTOP_APP_LOG:-}" ]] || args+=(--app-log "$HERMES_DESKTOP_APP_LOG")
@@ -150,8 +146,8 @@ verify_desktop_fleet_version() {
     return 0
   fi
   if [[ ! -f "${HERMES_HOME:-$HOME/.hermes}/fleet/generated/desktop-gateways.json" ]]; then
-    printf '%s\n' 'not-configured (desktop rollout pending)'
-    return 0
+    verify_desktop_fleet
+    return $?
   fi
   hermes-desktop-fleet-warm "$1"
 }

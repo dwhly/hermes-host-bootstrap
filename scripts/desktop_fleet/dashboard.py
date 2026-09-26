@@ -161,8 +161,9 @@ def install(root, runtime, platform, launcher, unit, service, bind, port, superv
     state = supervisor.check(port)
     launcher_path, unit_path = rooted(root, launcher), rooted(root, unit)
     # All ownership/socket checks occur before any mutation.
-    files_changed = any(existing(path) != data or path.stat().st_mode & 0o777 != mode
-                        for path, data, mode in ((launcher_path, launcher_bytes, 0o755), (unit_path, unit_bytes, 0o644)))
+    file_changes = [existing(path) != data or path.stat().st_mode & 0o777 != mode
+                    for path, data, mode in ((launcher_path, launcher_bytes, 0o755), (unit_path, unit_bytes, 0o644))]
+    files_changed = any(file_changes)
     pending_path = rooted(root, unit + '.refresh-pending')
     pending = existing(pending_path) is not None
     stamp_path = rooted(root, (runtime['hermes_home'] + '/.desktop-dashboard' if platform == 'macos'
@@ -175,7 +176,7 @@ def install(root, runtime, platform, launcher, unit, service, bind, port, superv
     if refresh:
         # Persist before replacing files: every partial write/reload/bootstrap retries.
         atomic_write(pending_path, b'refresh required\n', 0o600)
-    launcher_changed = atomic_write(launcher_path, launcher_bytes, 0o755)
+    atomic_write(launcher_path, launcher_bytes, 0o755)
     unit_changed = atomic_write(unit_path, unit_bytes)
     if refresh:
         rooted(root, runtime['hermes_home'] + '/logs').mkdir(parents=True, exist_ok=True)

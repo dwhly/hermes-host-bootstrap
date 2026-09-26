@@ -129,7 +129,19 @@ def main():
         changed |= install_tools(a.hermes_home, a.bin_dir)
         print('changed' if changed else 'unchanged')
     else:
-        data = load(generated / 'desktop-gateways.json')
+        try:
+            data = load(generated / 'desktop-gateways.json')
+        except IntentUnavailable:
+            if not a.optional:
+                raise
+            try:
+                declared = manifest(a.registry, a.client, a.revision)
+            except IntentUnavailable:
+                declared = {'complete': False}
+            if declared['complete']:
+                raise ValueError('desktop rollout declared but installed manifest is missing')
+            print('not-configured (desktop rollout pending; no protection/qualification asserted)')
+            return 0
         env = {}
         if platform.system() == 'Darwin':
             for key in ('HERMES_DESKTOP_POOL_MAX', 'HERMES_DESKTOP_POOL_IDLE_MS'):

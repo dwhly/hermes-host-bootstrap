@@ -73,6 +73,17 @@ class Fixtures(unittest.TestCase):
         self.assertIn(b'--no-open', a[0])
         self.assertIn(b'/opt/homebrew/bin', a[0])
 
+    def test_all_dashboard_file_preflights_precede_pending_stamp(self):
+        supervisor = Mock()
+        supervisor.check.return_value = {'pid': 41, 'loaded': True}
+        rooted(self.root, '/unit').mkdir()
+        before = self.snapshot()
+        with self.assertRaises(ValueError):
+            dashboard.install(self.root, self.runtime, 'linux', '/bin/new-launcher', '/unit',
+                              'test.service', '127.0.0.1', 9000, supervisor)
+        self.assertEqual(self.snapshot(), before)
+        supervisor.refresh.assert_not_called()
+
     def test_unmanaged_socket_refused_before_files(self):
         run = Mock(side_effect=['MainPID=41\nFragmentPath=/etc/systemd/system/hermes-dashboard-server.service\nLoadState=loaded',
                                 'LISTEN 0 128 *:9000 *:* users:(("python",pid=99,fd=3))'])

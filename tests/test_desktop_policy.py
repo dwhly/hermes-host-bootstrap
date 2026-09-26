@@ -91,6 +91,35 @@ class PolicyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.run_entry(row, 'h-btp')
 
+    def test_optional_verification_skips_legacy_but_refuses_missing_declared_install(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            intent = Path(tmp) / 'intent.json'
+            args = [sys.executable, str(REPO / 'scripts/desktop-fleet.py'), 'verify', '--optional',
+                    '--registry', str(intent), '--client', 'mac', '--hermes-home', tmp]
+            self.assertEqual(subprocess.run(args, capture_output=True).returncode, 0)
+            row = dict(hostname='mac', desktop_gateway=dict(label='mac', admission='admitted',
+                       runtime={'uid': 501}, endpoint='https://mac.test', native_sign_in='password'))
+            intent.write_text(json.dumps({'complete': True, 'hosts': [row]}))
+            self.assertEqual(subprocess.run(args, capture_output=True).returncode, 0)
+            row['update_policy'] = 'eligible'
+            intent.write_text(json.dumps({'complete': True, 'hosts': [row]}))
+            self.assertNotEqual(subprocess.run(args, capture_output=True).returncode, 0)
+            self.assertEqual(list(Path(tmp).iterdir()), [intent])
+
+    def test_marker_failure_never_reaches_service_install(self):
+        record = {'update_policy': 'protected', 'desktop_gateway': {'dashboard_vehicle': 'module97'}}
+        argv = ['entry', 'install', '--platform', 'linux', '--home', '/fixture', '--hermes-home', '/fixture/.hermes',
+                '--executable', '/fixture/hermes', '--user', 'fixture', '--registry', '/fixture/intent', '--host', 'h-do1']
+        with patch.object(sys, 'argv', argv), patch.object(entry, 'optional_host_record', return_value=record), \
+             patch.object(entry.pwd, 'getpwnam', return_value=SimpleNamespace(pw_gid=123, pw_uid=123, pw_dir='/fixture')), \
+             patch.object(entry.grp, 'getgrgid', return_value=SimpleNamespace(gr_name='fixture')), \
+             patch.object(entry.os, 'access', return_value=True), patch.object(entry.dashboard, 'Supervisor'), \
+             patch.object(entry.marker, 'install', side_effect=ValueError('marker refused')), \
+             patch.object(entry.dashboard, 'install') as install:
+            with self.assertRaisesRegex(ValueError, 'marker refused'):
+                entry.main()
+            install.assert_not_called()
+
     def test_no_pyyaml_explicit_diagnostic_and_venv_fallback(self):
         with patch.dict(sys.modules, {'yaml': None}), patch.dict(os.environ, {'HERMES_FLEET_YAML_RETRY': '1'}):
             with self.assertRaisesRegex(IntentUnavailable, 'PyYAML unavailable'):
