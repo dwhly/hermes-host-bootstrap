@@ -45,9 +45,10 @@ are tracked in hermes-config at `fleet/rollouts/assets/chief-2026-09-19/`.
 reboot while its pinned `/var/run/chief/runtime` directory is absent. The node
 silently cannot self-stamp, so healthy heartbeat does NOT prove loaded revision.
 
-The existing narrow sudo grants (`hermes-converger`, `chief-node-supervisor`,
-`chief-update`) do not create the required root:chief directory. Do not bypass
-those grants or relocate only one side of the runtime-proof contract.
+Step 0 retires all three former sudo grants (`hermes-converger`,
+`chief-node-supervisor`, `chief-update`); see [currency containment](currency-step0.md).
+This runtime-directory repair requires an existing administrator session. Do not
+restore those grants or relocate only one side of the runtime-proof contract.
 
 Operator-local repair, using the EXISTING chief group, no new authority:
 
