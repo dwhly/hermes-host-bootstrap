@@ -9,10 +9,10 @@ import time
 import urllib.request
 from typing import Any
 
-from .core import _resolve_tool, iso_now
+from .core import DOCKER_TOKENS, LINUX_UNIT_MAP, _launchd_target, _resolve_tool, iso_now, unit_for, ConvergerError
 
 
-DEFAULT_ALLOWLIST = ["chief-node.service", "chief-loop-watchdog.service", "chief-stack-core-1"]
+DEFAULT_ALLOWLIST = ["chief-node", "chief-loop-watchdog", "chief-core"]
 WINDOW_S = 600
 MAX_RESTARTS = 5
 EXPECTED_INTERVAL_S = 15
@@ -41,7 +41,7 @@ class SupervisorTransport:
 def load_allowlist(path: pathlib.Path) -> list[str]:
     try:
         data = json.loads(path.read_text())
-        units = data.get("units", data if isinstance(data, list) else [])
+        units = data if isinstance(data, list) else data.get("units", [])
         return [str(u) for u in units if u]
     except FileNotFoundError:
         return DEFAULT_ALLOWLIST
@@ -72,7 +72,7 @@ def systemd_status(unit: str) -> dict[str, Any]:
 
 
 def launchd_status(label: str) -> dict[str, Any]:
-    out = subprocess.run([_resolve_tool("launchctl"), "print", f"system/{label}"], text=True, capture_output=True, check=False)
+    out = subprocess.run([_resolve_tool("launchctl"), "print", label], text=True, capture_output=True, check=False)
     return {"unit": label, "manager": "launchd", "exists": out.returncode == 0, "active": "state = running" in out.stdout, "restart_count": 0}
 
 
@@ -129,8 +129,8 @@ def enter_crash_looping(unit: str, manager: str) -> None:
     if manager == "systemd":
         subprocess.run([_resolve_tool("systemctl"), "mask", "--runtime", unit], check=False)
     elif manager == "launchd":
-        subprocess.run([_resolve_tool("launchctl"), "disable", f"system/{unit}"], check=False)
-        subprocess.run([_resolve_tool("launchctl"), "bootout", f"system/{unit}"], check=False)
+        subprocess.run([_resolve_tool("launchctl"), "disable", unit], check=False)
+        subprocess.run([_resolve_tool("launchctl"), "bootout", unit], check=False)
     elif manager == "docker":
         subprocess.run([_resolve_tool("docker"), "stop", unit], check=False)
 
@@ -139,17 +139,28 @@ def restart(unit: str, manager: str) -> None:
     if manager == "systemd":
         subprocess.run([_resolve_tool("systemctl"), "restart", unit], check=False)
     elif manager == "launchd":
-        subprocess.run([_resolve_tool("launchctl"), "kickstart", "-k", f"system/{unit}"], check=False)
+        subprocess.run([_resolve_tool("launchctl"), "kickstart", "-k", unit], check=False)
     elif manager == "docker":
         subprocess.run([_resolve_tool("docker"), "restart", unit], check=False)
 
 
 def process_status(unit: str) -> dict[str, Any]:
-    if sys_platform() == "darwin":
-        return launchd_status(unit)
-    if unit.endswith(".service"):
-        return systemd_status(unit)
-    return docker_status(unit)
+    token = next((t for t, legacy in LINUX_UNIT_MAP.items() if unit == legacy), unit)
+    target = unit_for(token)
+    if token in DOCKER_TOKENS:
+        status = docker_status(target)
+    elif sys_platform() == "darwin":
+        target = _launchd_target(token, target)
+        # No GUI session means defer, never kickstart/disable an absent domain.
+        domain = target.rsplit("/", 1)[0]
+        gui = subprocess.run([_resolve_tool("launchctl"), "print", domain],
+                             text=True, capture_output=True, check=False) if domain.startswith("gui/") else None
+        if gui is not None and gui.returncode:
+            return {"target": target, "manager": "launchd", "deferred": "gui_unavailable"}
+        status = launchd_status(target)
+    else:
+        status = systemd_status(target)
+    return {**status, "target": target}
 
 
 def supervise_once(args: argparse.Namespace) -> int:
@@ -157,26 +168,37 @@ def supervise_once(args: argparse.Namespace) -> int:
     limiter = RestartLimiter(pathlib.Path(args.state_dir) / "supervisor-restarts.json")
     tx = SupervisorTransport(args.core, args.node_id, pathlib.Path(args.auth_token_path))
     for unit in allowlist:
-        status = process_status(unit)
+        try:
+            status = process_status(unit)
+        except ConvergerError as exc:
+            if not str(exc).startswith("launchd_user_uid_not_found:"):
+                raise
+            print(f"chief supervisor deferred: {exc}", flush=True)
+            continue
+        target = status["target"]
+        if status.get("deferred"):
+            print(f"chief supervisor deferred: {target}: {status['deferred']}", flush=True)
+            continue
+        limiter_id = f"{status['manager']}:{target}" if sys_platform() == "darwin" else LINUX_UNIT_MAP.get(unit, unit)
         status_value = "healthy" if status.get("active") else "dead"
-        restart_count = limiter.count(unit)
+        restart_count = limiter.count(limiter_id)
         if restart_count >= MAX_RESTARTS:
             status_value = "crash_looping"
-            enter_crash_looping(unit, status["manager"])
+            enter_crash_looping(target, status["manager"])
         elif not status.get("active"):
-            if limiter.allowed(unit):
-                restart(unit, status["manager"])
-                limiter.record(unit)
+            if limiter.allowed(limiter_id):
+                restart(target, status["manager"])
+                limiter.record(limiter_id)
                 status_value = "restarting"
             else:
                 status_value = "crash_looping"
-                enter_crash_looping(unit, status["manager"])
+                enter_crash_looping(target, status["manager"])
         payload = {
             "node_id": args.node_id,
             "process_id": unit,
             "manager": status["manager"],
             "status": status_value,
-            "restart_count_10m": limiter.count(unit),
+            "restart_count_10m": limiter.count(limiter_id),
             "manager_restart_count": status.get("restart_count", 0),
             "expected_interval_s": EXPECTED_INTERVAL_S,
             "observed_at": iso_now(),
@@ -198,14 +220,16 @@ def sys_platform() -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="chief-node-supervisor")
-    parser.add_argument("--node-id", default=os.environ.get("CHIEF_NODE_ID") or os.uname().nodename.split(".")[0])
-    parser.add_argument("--core", default=os.environ.get("CHIEF_CORE_URL", "http://127.0.0.1:8088"))
+    parser.add_argument("--node-id", default=os.environ.get("CHIEF_NODE_ID"))
+    parser.add_argument("--core", default=os.environ.get("CHIEF_CORE_URL"))
     parser.add_argument("--auth-token-path", default=os.environ.get("CHIEF_NODE_AUTH_TOKEN", "/etc/chief/node-auth.token"))
     parser.add_argument("--allowlist", default="/etc/chief/supervisor-allowlist.json")
     parser.add_argument("--state-dir", default="/var/lib/chief/converger")
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--interval", type=int, default=15)
     args = parser.parse_args(argv)
+    if not args.node_id or not args.core:
+        parser.error("missing_node_config: CHIEF_NODE_ID and CHIEF_CORE_URL required")
     if not args.loop:
         return supervise_once(args)
     while True:

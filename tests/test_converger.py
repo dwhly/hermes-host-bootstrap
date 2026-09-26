@@ -80,22 +80,26 @@ def lookup(key_id):
 
 
 def test_resolve_tool_uses_shutil_which(monkeypatch):
-    monkeypatch.setattr(core.shutil, "which", lambda name: f"/custom/bin/{name}")
+    monkeypatch.setattr(core.shutil, "which", lambda name, **kw: f"/custom/bin/{name}")
 
+    checked = []
+    monkeypatch.setattr(core, "trusted_path", lambda p: checked.append(str(p)))
     assert core._resolve_tool("uv") == "/custom/bin/uv"
+    assert checked == ["/custom/bin/uv"]
 
 
 def test_resolve_tool_uses_fixed_fallback_when_which_missing(monkeypatch):
     expected = "/usr/local/bin/uv"
-    monkeypatch.setattr(core.shutil, "which", lambda name: None)
+    monkeypatch.setattr(core.shutil, "which", lambda name, **kw: None)
     monkeypatch.setattr(core.os.path, "isfile", lambda path: path == expected)
     monkeypatch.setattr(core.os, "access", lambda path, mode: path == expected and mode == core.os.X_OK)
 
+    monkeypatch.setattr(core, "trusted_path", lambda p: None)
     assert core._resolve_tool("uv") == expected
 
 
 def test_resolve_tool_raises_clear_error_when_missing(monkeypatch):
-    monkeypatch.setattr(core.shutil, "which", lambda name: None)
+    monkeypatch.setattr(core.shutil, "which", lambda name, **kw: None)
     monkeypatch.setattr(core.os.path, "isfile", lambda path: False)
     monkeypatch.setattr(core.os, "access", lambda path, mode: False)
 
@@ -538,7 +542,7 @@ def test_malformed_target_ref_rejected_before_git_checkout(tmp_path, monkeypatch
     with pytest.raises(core.ConvergerError, match="target_ref_not_git_sha:main;rm-rf"):
         ops.fetch(verified)
 
-    assert ["git", "fetch", "--all", "--prune"] in calls
+    assert calls == []
     assert not any(cmd[:2] == ["git", "checkout"] for cmd in calls)
 
 
