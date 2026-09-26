@@ -44,7 +44,11 @@ build and review perform only fixture checks; they do not authorize host changes
    existing `.env` retains ownership/mode. Apply rechecks bytes and metadata before
    each replacement and refuses detected concurrent writes. Per-file replacement
    is atomic, not a transaction across files; inspect backups after any partial
-   failure. Stop concurrent env editors during the approved apply window.
+   failure. Quiesce the `.env` writers during the approved apply window: the running
+   Hermes gateway and web UI (`config_env` writes), `hermes config set`, and bootstrap
+   modules 35/92 (`op inject`). After replacement and refresh, apply rereads `.env`
+   and requires each projected assignment to be present exactly once with its
+   projected value; a stale writer causes apply to fail and leaves refresh pending.
 
 The EDD's app artifact/rollback pin, h-do1 capacity gate, owner consents, ingress,
 authentication/revocation checks and Mac retention canary remain required. The

@@ -52,6 +52,17 @@ def project_env(old, fields):
     return result + b''.join(k.encode() + b'=' + v.encode() + b'\n' for k, v in sorted(remaining.items()))
 
 
+def verify_projected_env(path, fields):
+    """Catch stale writers after replacement/refresh without exposing assignments."""
+    observed = {key: [] for key in fields}
+    for line in path.read_bytes().splitlines():
+        match = re.fullmatch(rb'(?:export[ \t]+)?([A-Z_]+)=(.*)', line)
+        if match and match[1].decode() in observed:
+            observed[match[1].decode()].append(match[2])
+    if any(observed[key] != [value.encode()] for key, value in fields.items()):
+        raise ValueError('post-apply dashboard assignments missing, duplicated, or changed')
+
+
 def runtime_check(root, plan):
     runtime = plan['runtime']
     dashboard.validate_runtime(runtime)
@@ -214,6 +225,8 @@ def main():
     # Per-file atomicity, not a filesystem transaction. Backups survive a refresh failure.
     if service_changed and not fixture:
         supervisor.refresh(state, unit_changed)
+    if fields:
+        verify_projected_env(rooted(root, plan['runtime']['hermes_home'] + '/.env'), fields)
     if service_changed:
         pending_path.unlink()
 

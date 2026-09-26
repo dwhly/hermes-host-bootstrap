@@ -437,6 +437,41 @@ class Fixtures(unittest.TestCase):
         self.assertTrue(env.read_bytes().endswith(b'CONCURRENT=preserve\n'))
         self.assertIn(b'http://old', env.read_bytes())
 
+    def test_apply_detects_stale_env_writer_after_refresh(self):
+        base = self.root
+        for damage in ('missing', 'duplicated', 'changed'):
+            with self.subTest(damage=damage):
+                self.root = base / damage
+                self.root.mkdir()
+                self.intent = self.root / 'intent.json'
+                plan, path, env = self.apply_fixture()
+                key = b'HERMES_DASHBOARD_PUBLIC_URL='
+                def stale_writer(*_):
+                    data = env.read_bytes()
+                    if damage == 'missing':
+                        data = b''.join(line for line in data.splitlines(keepends=True) if not line.startswith(key))
+                    elif damage == 'duplicated':
+                        data += b'export ' + key + plan['dashboard_fields'][key[:-1].decode()].encode() + b'\n'
+                    else:
+                        data = apply.project_env(data, {key[:-1].decode(): 'http://stale-writer'})
+                    env.write_bytes(data)
+                refresh = Mock(side_effect=stale_writer)
+                real_prepare = apply.prepare
+                def prepare(*args):
+                    changes, supervisor, state, _, gid = real_prepare(*args)
+                    supervisor.refresh = refresh
+                    return changes, supervisor, state, False, gid
+                argv = ['apply', '--root', str(self.root), '--registry', str(self.intent), '--plan-file', str(path)]
+                with patch.object(sys, 'argv', argv), patch.object(apply, 'prepare', side_effect=prepare), \
+                     patch.object(sys, 'stdout', new_callable=io.StringIO) as output:
+                    with self.assertRaisesRegex(ValueError, 'post-apply dashboard assignments'):
+                        apply.main()
+                refresh.assert_called_once()
+                self.assertNotIn('fixture-only', output.getvalue())
+                self.assertNotIn('http://stale-writer', output.getvalue())
+                pending = rooted(self.root, '/var/lib/hermes-desktop/' + plan['supervisor']['service'] + '.refresh-pending')
+                self.assertTrue(pending.exists())
+
     def test_apply_resolved_executable_and_package_identity(self):
         plan, path, _ = self.apply_fixture()
         alias = rooted(self.root, '/home/hermes/.local/bin/hermes')
