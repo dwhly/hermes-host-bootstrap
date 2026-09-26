@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "host": "h-btp",
+  "runtime": {
+    "user": "hermes",
+    "group": "hermes",
+    "uid": 1000,
+    "home": "/home/hermes",
+    "hermes_home": "/home/hermes/.hermes",
+    "executable": "/home/hermes/.local/bin/hermes",
+    "executable_sha256": "TEST_REPLACED_WITH_FIXTURE_DIGEST"
+  },
+  "supervisor": {"kind": "systemd", "service": "hermes-desktop-gateway.service"},
+  "bind": "127.0.0.1",
+  "port": 8789,
+  "dashboard_fields": {"HERMES_DASHBOARD_PUBLIC_URL": "https://h-btp.example.ts.net"},
+  "prior_sha256": {
+    "/usr/local/bin/hermes-dashboard-server": null,
+    "/etc/systemd/system/hermes-desktop-gateway.service": null,
+    "/home/hermes/.hermes/.env": "TEST_REPLACED_WITH_FIXTURE_DIGEST",
+    "/etc/hermes/image-provenance.json": null
+  }
+}
