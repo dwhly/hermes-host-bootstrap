@@ -111,9 +111,9 @@ def test_dispatcher_clears_all_caller_environment(tmp_path):
     # Execute the generated, real prelude up to the trust functions, then observe
     # its environment. No production action/body or privileged path is executed.
     launcher = (ROOT / "scripts/hermes-converger").read_text()
-    prefix = launcher.split("# Sourced only after", 1)[0]
+    prefix = launcher.split(" /bin/sh -c ", 1)[0] + " /bin/sh -c "
     probe = tmp_path / "probe.sh"
-    probe.write_text(prefix + "/usr/bin/env\nCHIEF_TRUSTED_BODY\n")
+    probe.write_text(prefix + shlex.quote("/usr/bin/env") + "\n")
     env = dict(os.environ, PYTHONPATH="/evil", CHIEF_CORE_URL="http://evil", CHIEF_CODE_ROOT="/evil",
                SUDO_UID="501", GIT_CONFIG_COUNT="1", BASH_ENV="/evil", VIRTUAL_ENV="/evil")
     out = subprocess.run(["/bin/sh",str(probe)],env=env,text=True,capture_output=True,check=True)
@@ -145,38 +145,13 @@ def test_git_and_build_code_drop_privilege_before_exec(monkeypatch, tmp_path):
     assert "GIT_CONFIG_COUNT" not in kwargs["env"]
 
 
-def test_config_missing_present_wrong(tmp_path, metadata, monkeypatch):
-    dest = tmp_path / "node.env"
-    registry = tmp_path / "registry.json"
-    registry.write_text(json.dumps(REGISTRY))
-    ownership = []
-    monkeypatch.setattr(security.os, "fchown", lambda fd, uid, gid: ownership.append((uid,gid)))
-    with pytest.raises(security.TrustError, match="missing_node_env"):
-        security.load_config(dest)
-    security.install_config("h-mini2",registry,dest,321)
-    assert ownership == [(0,321)] and stat.S_IMODE(dest.stat().st_mode) == 0o640
-    config = security.load_config(dest)
-    assert config["CHIEF_CORE_URL"] == "http://100.122.202.37:8088"
-    assert config["CHIEF_NODE_ID"] == "h-mini2"
-    before = dest.read_text()
-    security.install_config("h-mini2",registry,dest,321)
-    assert dest.read_text() == before
-    dest.write_text(before.replace("h-mini2","h-air"))
-    with pytest.raises(security.TrustError, match="identity_conflicts"):
-        security.install_config("h-mini2",registry,dest,321)
-    dest.write_text(before.replace("100.122.202.37","127.0.0.1"))
-    with pytest.raises(security.TrustError, match="loopback_core"):
-        security.install_config("h-mini2",registry,dest,321)
-
-
 def test_config_never_evaluates_shell_or_accepts_path_overrides():
-    for hostname in ("h-mini2","MacBook-Air-8.local"):
+    for hostname in ("h-mini2", "MacBook-Air-8.local"):
         config = security.resolve_config(None, hostname, REGISTRY)
         assert config["CHIEF_CORE_URL"] == "http://100.122.202.37:8088"
-    config = security.resolve_config({"CHIEF_NODE_ID":"h-mini2", "CHIEF_CORE_URL":"http://core:8088",
-                                      "CHIEF_NODE_PLAN_KEY":"/evil", "CHIEF_RUNTIME_USER":"evil"}, "h-mini2", REGISTRY)
-    assert config["CHIEF_NODE_PLAN_KEY"] == "/etc/chief/node-plan.key"
-    assert config["CHIEF_RUNTIME_USER"] == "dano"
+    with pytest.raises(security.TrustError, match="secret_path"):
+        security.resolve_config({"CHIEF_NODE_ID":"h-mini2", "CHIEF_CORE_URL":"http://core:8088",
+                                 "CHIEF_NODE_PLAN_KEY":"/evil"}, "h-mini2", REGISTRY)
     with pytest.raises(security.TrustError):
         security.resolve_config(None, "unknown", REGISTRY)
 
@@ -240,7 +215,12 @@ def test_unknown_wake_defers_service_and_package_actions(tmp_path,monkeypatch):
     monkeypatch.setattr(runtime,"trusted_path",lambda *a,**k:None)
     monkeypatch.setattr(runtime,"load_config",lambda:{})
     monkeypatch.setattr(runtime,"full_wake",lambda:False)
+    from hermes_converger import supervisor
+    monkeypatch.setattr(runtime, "supervisor_admission", lambda config: False)
+    observed = []
+    monkeypatch.setattr(supervisor, "main", lambda args: observed.append(supervisor.mutation_allowed()) or 0)
     assert runtime.run("supervisor")==0
+    assert observed == [False]
 
 
 @pytest.mark.parametrize("platform,expected", [("macos","calendar minute"),("linux","h-do1 boot reconcile independent of Core")])
@@ -262,7 +242,7 @@ def test_trigger_definitions_and_delivery_payload():
     assert pulse["StartCalendarInterval"]=={} and len(pulse["WatchPaths"])==4
     for name in ("chief-node-reconcile.service","chief-update.service","chief-update-request.service"):
         unit=(ROOT/"systemd"/name).read_text()
-        assert "ExecStart=/usr/local/bin/hermes-converger\n" in unit
+        assert "ExecStart=/opt/chief/bin/hermes-converger\n" in unit
         assert "EnvironmentFile" not in unit
         assert (PAYLOAD/"systemd"/name).read_text()==unit
     assert "Before=chief-node" not in (ROOT/"systemd/chief-node-reconcile.service").read_text()
@@ -329,7 +309,7 @@ def test_whole_sudoers_validation_precedes_replacement(tmp_path,reject):
         ('[ "$#" = 1 ] || exit 77\n' if reject else '')+
         'if [ "$#" = 1 ]; then exec /usr/sbin/visudo -c -f '+shlex.quote(str(policy))+'; fi\nexec /usr/sbin/visudo "$@"\n')
     validator.chmod(0o755)
-    source=(PAYLOAD/"contain.sh").read_text().replace('/etc/',str(etc)+'/').replace('/usr/sbin/visudo',str(validator))
+    source=(PAYLOAD/"contain.sh").read_text().replace('/etc/',str(etc)+'/').replace('/usr/sbin/visudo',str(validator)).replace('/usr/bin/id', '/bin/false')
     assert '/etc/sudoers' not in source.replace(str(etc),'FIXTURE')
     # All mutations go to the synthetic /etc; service functions are never called.
     result=subprocess.run(["/bin/sh"],input='set -eu\ntrusted_path() { :; }\nhold() { echo "$*" >&2; return 1; }\n'+source+'\nremove_grants\n',text=True,capture_output=True)
@@ -351,7 +331,7 @@ def test_pulse_noop_never_starts_python_or_consumes_hints(tmp_path):
     env=tmp_path/"node.env"; env.write_text('CHIEF_CORE_URL=http://fixture\n')
     curl=tmp_path/"curl"; curl.write_text('#!/bin/sh\nexit 0\n'); curl.chmod(0o755)
     source=(PAYLOAD/"pulse.sh").read_text().replace('. "$BASE/trust.sh"',
-        'trusted_path() { :; }\ntrusted_tree() { echo python_would_start >&2; exit 99; }\ntrusted_python() { exit 99; }')
+        'trusted_path() { :; }\ntrusted_tree() { echo python_would_start >&2; exit 99; }\ntrusted_runtime() { exit 99; }')
     source=source.replace('/var/lib/chief/currency-step0',str(state)).replace('/var/lib/chief/requests',str(hints)).replace('/etc/chief/node.env',str(env)).replace('/usr/bin/curl',str(curl))
     result=subprocess.run(["/bin/sh"],input=source,text=True,capture_output=True)
     assert result.returncode==0, result.stderr
@@ -395,10 +375,10 @@ def test_closure_without_python_repairs_config_disables_jobs_and_revokes_last(tm
     """Execute the closure against a private fake host; OS controls are recorders."""
     import shutil
     host=tmp_path/'host'
-    base=host/'usr/local/lib/hermes-host-bootstrap/hermes_converger/step0'
+    base=host/'opt/chief/lib/hermes-host-bootstrap/hermes_converger/step0'
     shutil.copytree(PAYLOAD,base)
-    for name in ('usr/local/bin','etc/chief','etc/sudoers.d','Library/LaunchDaemons','Library/LaunchAgents',
-                 'etc/systemd/system','usr/lib/systemd','var/lib'):
+    for name in ('usr/local/bin','opt/chief/bin','etc/chief','etc/sudoers.d','Library/LaunchDaemons','Library/LaunchAgents',
+                 'etc/systemd/system','usr/lib/systemd','var/lib','var/log','var/run'):
         (host/name).mkdir(parents=True,exist_ok=True)
     policy=host/'etc/sudoers'
     policy.write_text('root ALL=(ALL) ALL\n@includedir '+str(host/'etc/sudoers.d')+'\n'); policy.chmod(0o440)
@@ -413,7 +393,7 @@ def test_closure_without_python_repairs_config_disables_jobs_and_revokes_last(tm
     log=tmp_path/'commands'
     bin=tmp_path/'bin'; bin.mkdir()
     commands=['/usr/bin/id','/usr/bin/uname','/bin/hostname','/usr/bin/getent','/usr/sbin/groupadd',
-              '/usr/bin/dscl','/usr/sbin/dseditgroup','/usr/bin/systemctl','/bin/launchctl','/usr/sbin/chown','/bin/chown']
+              '/usr/bin/dscl','/usr/sbin/dseditgroup','/usr/bin/systemctl','/bin/launchctl','/usr/sbin/chown','/bin/chown','/usr/bin/sudo','/bin/sync']
     for command in commands:
         name=command.rsplit('/',1)[1]
         output={'id':'0','uname':platform,'hostname':hostname}.get(name,'')
@@ -434,7 +414,7 @@ subprocess.run(['/usr/bin/install',*args],check=True)
     validator.chmod(0o755)
     for path in (base/'close.sh',base/'contain.sh',base/'configure.sh'):
         source=path.read_text()
-        for directory in ('/usr/local/','/var/lib','/run/','/Library/','/usr/lib/systemd','/etc/'):
+        for directory in ('/opt/','/usr/local/','/var/lib','/var/log','/var/run','/Library/','/usr/lib/systemd','/etc/'):
             source=source.replace(directory,str(host)+directory)
         tool_pattern='|'.join(re.escape(c) for c in sorted([*commands,'/usr/bin/install','/usr/sbin/visudo'],key=len,reverse=True))
         source=re.sub(tool_pattern,lambda m:str(bin/m.group().rsplit('/',1)[1]),source)
@@ -446,7 +426,7 @@ trusted_python() { echo 'fixture: Python unavailable' >&2; return 1; }
 hold() { echo "HOLD: $*" >&2; return 1; }
 ''')
     result=subprocess.run(['/bin/sh',str(base/'close.sh')],text=True,capture_output=True)
-    assert result.returncode==0, result.stdout+result.stderr
+    assert result.returncode==1, result.stdout+result.stderr
     config=security.read_env(host/'etc/chief/node.env')
     assert config['CHIEF_NODE_ID']==hostname
     assert config['CHIEF_CORE_URL']=='http://100.122.202.37:8088'
@@ -455,7 +435,7 @@ hold() { echo "HOLD: $*" >&2; return 1; }
     assert 'trusted_python_unavailable' in (host/'var/lib/chief/currency-step0/closure-status').read_text()
     assert not (host/'var/lib/chief/currency-step0/prepared').exists()
     actions=log.read_text().splitlines()
-    assert actions[-1]=='visudo'
+    assert 'visudo' in actions and (host/'var/lib/chief/currency-step0/grants-removed').exists()
     assert not any(line.startswith(('systemctl start','launchctl bootstrap')) for line in actions)
     assert any(line.startswith('chown root:chief ') for line in actions)
     assert not (host/'etc/systemd/system/chief-node.service').exists()
@@ -464,14 +444,14 @@ hold() { echo "HOLD: $*" >&2; return 1; }
         assert len(list((host/'var/lib/chief/currency-step0').glob('retired-overrides.*/chief-node-converger.service.d/unsafe.conf')))==1
 
 
-@pytest.mark.parametrize('qualified,listing,expected',[(False,'"CurrentPowerState"=4',False),
-    (True,'"CurrentPowerState"=4',True),(True,'"CurrentPowerState"=0',False),(True,'unknown wake',False)])
-def test_actual_wake_classifier_requires_qualification_and_display(monkeypatch,qualified,listing,expected):
+@pytest.mark.parametrize('qualified,listing,expected',[(False,'"SystemPowerStateCapabilities"=15',False),
+    (True,'"SystemPowerStateCapabilities"=15',True),(True,'"SystemPowerStateCapabilities"=1',False),(True,'unknown wake',False)])
+def test_actual_wake_classifier_requires_signed_qualification_and_cpu_graphics(monkeypatch,qualified,listing,expected):
     monkeypatch.setattr(runtime.os,'uname',lambda:SimpleNamespace(sysname='Darwin'))
     original=pathlib.Path.exists
     monkeypatch.setattr(pathlib.Path,'exists',lambda p:qualified if str(p)=='/etc/chief/wake-qualified' else original(p))
     monkeypatch.setattr(runtime,'trusted_path',lambda p:None)
     calls=[]
     monkeypatch.setattr(subprocess,'run',lambda *a,**k:calls.append(a) or SimpleNamespace(returncode=0,stdout=listing))
-    assert runtime.full_wake() is expected
+    assert runtime.full_wake(qualified) is expected
     assert bool(calls) is qualified

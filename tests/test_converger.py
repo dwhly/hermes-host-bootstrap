@@ -12,14 +12,18 @@ CHIEF_SPEC_SDK = pathlib.Path("/root/code/chief/chief-spec/sdk/python")
 if CHIEF_SPEC_SDK.exists():
     sys.path.insert(0, str(CHIEF_SPEC_SDK))
 
-from chief_spec.validation import validate_event
+try:
+    from chief_spec.validation import validate_event
+except ImportError:
+    def validate_event(envelope):
+        pytest.skip("optional Chief Spec SDK unavailable (requires Python >=3.11)")
 
 from hermes_converger import core
 
 
 KEY = b"test-plan-key"
 NODE = "h-do1"
-NOW = dt.datetime(2026, 6, 19, 0, 0, 0, tzinfo=dt.UTC)
+NOW = dt.datetime(2026, 6, 19, 0, 0, 0, tzinfo=dt.timezone.utc)
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
 
