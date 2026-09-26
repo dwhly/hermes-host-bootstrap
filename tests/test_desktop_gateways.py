@@ -156,12 +156,16 @@ class Fixtures(unittest.TestCase):
                 supervisor = dashboard.Supervisor(platform, service, unit, 1000, run)
                 supervisor.check = Mock(side_effect=lambda _: dict(state))
                 args = (self.root, self.runtime, platform, '/bin/' + failing, unit, service, '127.0.0.1', 9000, supervisor)
+                pending = rooted(self.root, (self.runtime['hermes_home'] + '/.desktop-dashboard' if platform == 'macos'
+                                            else '/var/lib/hermes-desktop') + '/dashboard.refresh-pending')
                 with self.assertRaises(subprocess.CalledProcessError):
                     dashboard.install(*args)
-                self.assertTrue(rooted(self.root, unit + '.refresh-pending').exists())
+                self.assertTrue(pending.exists())
+                self.assertEqual(pending.stat().st_mode & 0o777, 0o600)
+                self.assertFalse(rooted(self.root, unit + '.refresh-pending').exists())
                 calls.clear()
                 self.assertTrue(dashboard.install(*args))
-                self.assertFalse(rooted(self.root, unit + '.refresh-pending').exists())
+                self.assertFalse(pending.exists())
                 if platform == 'macos':
                     self.assertEqual([cmd[1] for cmd in calls], ['bootstrap'])
                 else:
