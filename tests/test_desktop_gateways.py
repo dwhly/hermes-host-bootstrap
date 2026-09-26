@@ -639,6 +639,31 @@ class Fixtures(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'template digest'):
             fleet.version(self.root)
 
+    def test_warm_verify_uses_repo_pin_despite_consistent_installed_tampering(self):
+        data = registry.manifest(self.intent, 'mac', 'revision')
+        fleet.install_bundle(self.root, data)
+        fleet.install_tools(self.root, self.root / 'bin')
+        self.write('/fleet/generated/desktop-gateways.json', json_bytes(data))
+        env = {**os.environ, 'HOME': str(self.root), 'HERMES_HOME': str(self.root),
+               'PATH': str(self.root / 'bin') + os.pathsep + os.environ['PATH']}
+        command = ['bash', '-c', 'source "$1/verify.sh"; uname() { echo Darwin; }; verify_desktop_fleet_version --version',
+                   '_', str(REPO)]
+        result = subprocess.run(command, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plugin = self.root / 'desktop-plugins/fleet-gateways/plugin.js'
+        receipt_path = plugin.with_name('installed.json')
+        plugin.write_text(plugin.read_text() + '// consistent installed tampering\n')
+        receipt = json.loads(receipt_path.read_text())
+        receipt['sha256'] = digest(plugin.read_bytes())
+        receipt['template_sha256'] = digest(fleet.template_bytes(plugin.read_bytes()))
+        receipt['compatibility']['template_sha256'] = receipt['template_sha256']
+        receipt_path.write_bytes(json_bytes(receipt))
+        (self.root / 'fleet/tools/desktop_fleet/compatibility.json').write_bytes(json_bytes(receipt['compatibility']))
+        result = subprocess.run(['hermes-desktop-fleet-warm', '--version'], env=env, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = subprocess.run(command, env=env, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+
     def test_plugin_static_surface_digest_noop_and_pin(self):
         source = (REPO / 'desktop-plugins/fleet-gateways/plugin.js').read_text()
         self.assertEqual(re.findall(r'from [\'"]([^\'"]+)', source), ['@hermes/plugin-sdk'])

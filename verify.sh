@@ -149,7 +149,9 @@ verify_desktop_fleet_version() {
     verify_desktop_fleet
     return $?
   fi
-  hermes-desktop-fleet-warm "$1"
+  local fleet_repo
+  fleet_repo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  hermes-desktop-fleet-warm "$1" --compatibility "$fleet_repo/desktop-plugins/fleet-gateways/compatibility.json"
 }
 
 verify_mac_desktop_pmset() {
