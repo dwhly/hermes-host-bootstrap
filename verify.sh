@@ -135,10 +135,13 @@ verify_desktop_fleet() {
     printf '%s\n' 'not-configured (desktop rollout pending)'
     return 0
   fi
-  local args=(verify --hermes-home "${HERMES_HOME:-$HOME/.hermes}")
+  local fleet_repo
+  fleet_repo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local args=(verify --hermes-home "${HERMES_HOME:-$HOME/.hermes}"
+    --compatibility "$fleet_repo/desktop-plugins/fleet-gateways/compatibility.json")
   [[ -z "${HERMES_DESKTOP_USER_DATA:-}" ]] || args+=(--user-data "$HERMES_DESKTOP_USER_DATA")
   [[ -z "${HERMES_DESKTOP_APP_LOG:-}" ]] || args+=(--app-log "$HERMES_DESKTOP_APP_LOG")
-  python3 "${HERMES_HOME:-$HOME/.hermes}/fleet/tools/desktop-fleet.py" "${args[@]}"
+  python3 "$fleet_repo/scripts/desktop-fleet.py" "${args[@]}"
 }
 
 verify_desktop_fleet_version() {

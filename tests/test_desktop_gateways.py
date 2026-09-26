@@ -499,6 +499,20 @@ class Fixtures(unittest.TestCase):
         self.assertFalse((self.root / '.local/state/fleet-enroll').exists())
         self.assertFalse((self.root / 'Library').exists())
 
+    def test_plugin_and_receipt_consistent_tampering_rejected_by_repo_pin(self):
+        data = registry.manifest(self.intent, 'mac', 'revision')
+        fleet.install_bundle(self.root, data)
+        plugin = self.root / 'desktop-plugins/fleet-gateways/plugin.js'
+        receipt_path = plugin.with_name('installed.json')
+        plugin.write_text(plugin.read_text() + '// consistent tampering\n')
+        receipt = json.loads(receipt_path.read_text())
+        receipt['sha256'] = digest(plugin.read_bytes())
+        receipt['template_sha256'] = digest(fleet.template_bytes(plugin.read_bytes()))
+        receipt['compatibility']['template_sha256'] = receipt['template_sha256']
+        receipt_path.write_bytes(json_bytes(receipt))
+        with self.assertRaisesRegex(ValueError, 'template digest'):
+            fleet.version(self.root)
+
     def test_plugin_static_surface_digest_noop_and_pin(self):
         source = (REPO / 'desktop-plugins/fleet-gateways/plugin.js').read_text()
         self.assertEqual(re.findall(r'from [\'"]([^\'"]+)', source), ['@hermes/plugin-sdk'])
