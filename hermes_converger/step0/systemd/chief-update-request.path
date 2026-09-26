@@ -1,0 +1,12 @@
+[Unit]
+Description=Chief bounded request slots
+
+[Path]
+PathChanged=/var/lib/chief/requests/login
+PathChanged=/var/lib/chief/requests/wake
+PathChanged=/var/lib/chief/requests/network
+PathChanged=/var/lib/chief/requests/request
+Unit=chief-update-request.service
+
+[Install]
+WantedBy=multi-user.target

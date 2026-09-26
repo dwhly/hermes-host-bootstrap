@@ -1,0 +1,4 @@
+#!/bin/sh
+# Unprivileged fixed enum hint. Directory/slots are root-owned; no sudo shim.
+[ "$#" = 0 ] || exit 2
+printf 'login\n' > /var/lib/chief/requests/login

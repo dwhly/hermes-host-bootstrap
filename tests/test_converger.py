@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import pathlib
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,14 +12,18 @@ CHIEF_SPEC_SDK = pathlib.Path("/root/code/chief/chief-spec/sdk/python")
 if CHIEF_SPEC_SDK.exists():
     sys.path.insert(0, str(CHIEF_SPEC_SDK))
 
-from chief_spec.validation import validate_event
+try:
+    from chief_spec.validation import validate_event
+except ImportError:
+    def validate_event(envelope):
+        pytest.skip("optional Chief Spec SDK unavailable (requires Python >=3.11)")
 
 from hermes_converger import core
 
 
 KEY = b"test-plan-key"
 NODE = "h-do1"
-NOW = dt.datetime(2026, 6, 19, 0, 0, 0, tzinfo=dt.UTC)
+NOW = dt.datetime(2026, 6, 19, 0, 0, 0, tzinfo=dt.timezone.utc)
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
 
@@ -80,22 +85,26 @@ def lookup(key_id):
 
 
 def test_resolve_tool_uses_shutil_which(monkeypatch):
-    monkeypatch.setattr(core.shutil, "which", lambda name: f"/custom/bin/{name}")
+    monkeypatch.setattr(core.shutil, "which", lambda name, **kw: f"/custom/bin/{name}")
 
+    checked = []
+    monkeypatch.setattr(core, "trusted_path", lambda p: checked.append(str(p)))
     assert core._resolve_tool("uv") == "/custom/bin/uv"
+    assert checked == ["/custom/bin/uv"]
 
 
 def test_resolve_tool_uses_fixed_fallback_when_which_missing(monkeypatch):
     expected = "/usr/local/bin/uv"
-    monkeypatch.setattr(core.shutil, "which", lambda name: None)
+    monkeypatch.setattr(core.shutil, "which", lambda name, **kw: None)
     monkeypatch.setattr(core.os.path, "isfile", lambda path: path == expected)
     monkeypatch.setattr(core.os, "access", lambda path, mode: path == expected and mode == core.os.X_OK)
 
+    monkeypatch.setattr(core, "trusted_path", lambda p: None)
     assert core._resolve_tool("uv") == expected
 
 
 def test_resolve_tool_raises_clear_error_when_missing(monkeypatch):
-    monkeypatch.setattr(core.shutil, "which", lambda name: None)
+    monkeypatch.setattr(core.shutil, "which", lambda name, **kw: None)
     monkeypatch.setattr(core.os.path, "isfile", lambda path: False)
     monkeypatch.setattr(core.os, "access", lambda path, mode: False)
 
@@ -434,12 +443,12 @@ def test_macos_hermes_node_restart_uses_launchd_gui_domain(tmp_path, monkeypatch
     ops = core.HostOps(core.LocalState(tmp_path), DummyTransport())
     calls = []
     monkeypatch.setattr(core, "_resolve_tool", lambda name: name)
-    monkeypatch.setattr(core.subprocess, "run", lambda cmd, *a, **kw: calls.append(cmd))
+    monkeypatch.setattr(core.subprocess, "run", lambda cmd, *a, **kw: calls.append(cmd) or SimpleNamespace(returncode=0))
 
     assert core.unit_for("chief-node") == "com.chief.node"
     ops.restart_units(verified)
 
-    assert calls == [["launchctl", "kickstart", "-k", "gui/501/com.chief.node"]]
+    assert calls == [["launchctl", "print", "gui/501"], ["launchctl", "kickstart", "-k", "gui/501/com.chief.node"]]
 
 
 @pytest.mark.parametrize("is_macos", [False, True])
@@ -466,6 +475,7 @@ def test_macos_reload_records_signal_time_before_launchd_kickstart(tmp_path, mon
         assert "chief-node" in data
         assert data["chief-node"]["config"]
         calls.append(cmd)
+        return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(core, "_resolve_tool", lambda name: name)
     monkeypatch.setattr(core.subprocess, "run", capture_run)
@@ -473,7 +483,7 @@ def test_macos_reload_records_signal_time_before_launchd_kickstart(tmp_path, mon
     reload_at = ops.record_reload_and_signal(verified)
 
     assert json.loads(stamp.read_text())["chief-node"]["config"] == reload_at
-    assert calls == [["launchctl", "kickstart", "-k", "gui/501/com.chief.node"]]
+    assert calls == [["launchctl", "print", "gui/501"], ["launchctl", "kickstart", "-k", "gui/501/com.chief.node"]]
 
 
 def test_macos_runtime_stamp_roots_honor_fixed_env_override(monkeypatch):
@@ -538,7 +548,7 @@ def test_malformed_target_ref_rejected_before_git_checkout(tmp_path, monkeypatch
     with pytest.raises(core.ConvergerError, match="target_ref_not_git_sha:main;rm-rf"):
         ops.fetch(verified)
 
-    assert ["git", "fetch", "--all", "--prune"] in calls
+    assert calls == []
     assert not any(cmd[:2] == ["git", "checkout"] for cmd in calls)
 
 
@@ -617,3 +627,38 @@ def test_transport_emit_posts_observations_endpoint(tmp_path, monkeypatch):
 
     assert captured["url"] == "http://core.example/v1/observations"
     assert captured["body"]["type"] == "hermes.fleet.convergence.started"
+
+
+def test_exception_restore_happens_before_lease_release(monkeypatch):
+    import contextlib
+    ops = FailingOps()
+    held = []
+    @contextlib.contextmanager
+    def lease(*a, **kw):
+        held.append(True)
+        try:
+            yield
+        finally:
+            held.pop()
+    ops.state.convergence_lease = lease
+    ops.fetch = lambda _: (_ for _ in ()).throw(RuntimeError("fixture apply failure"))
+    restored = []
+    def restore(plan, observed_ops):
+        assert held and observed_ops is ops
+        restored.append(True)
+        return True
+    monkeypatch.setattr(core, "attempt_rollback_once", restore)
+    assert core.execute_plan(verify(make_plan()), ops, fresh_idle_snapshot()) == "rolled_back"
+    assert restored == [True] and not held
+
+
+def test_macos_converger_defers_restart_without_gui(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "IS_MACOS", True)
+    monkeypatch.setattr(core, "_launchd_target", lambda *a: "gui/502/com.chief.node")
+    monkeypatch.setattr(core, "_resolve_tool", lambda n: n)
+    calls = []
+    monkeypatch.setattr(core.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or SimpleNamespace(returncode=113))
+    ops = core.HostOps(core.LocalState(tmp_path), DummyTransport())
+    with pytest.raises(core.Deferred, match="gui_unavailable"):
+        ops.restart_units(verify(make_plan()))
+    assert calls == [["launchctl", "print", "gui/502"]]

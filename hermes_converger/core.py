@@ -12,9 +12,12 @@ import json
 import os
 import pathlib
 import pwd
+
+from .security import trusted_path
 import re
 import secrets
 import signal
+import stat as stat_module
 import shutil
 import subprocess
 import sys
@@ -80,14 +83,6 @@ IDLE_LIMITS_S = {
     "subprocess": 10,
     "loop_lock": 10,
 }
-TOOL_FALLBACK_DIRS = (
-    "/root/.local/bin",
-    "/usr/local/bin",
-    "/usr/bin",
-    "/opt/homebrew/bin",
-    os.path.expanduser("~/.local/bin"),
-)
-TOOL_SUBPROCESS_PATH_PREFIX = ":".join((*TOOL_FALLBACK_DIRS, "/bin"))
 
 
 class ConvergerError(Exception):
@@ -105,19 +100,36 @@ class Deferred(ConvergerError):
         self.snapshot = snapshot or {}
 
 
+def mutation_allowed() -> bool:
+    # Fixed runtime entry point replaces this with the trusted wake classifier.
+    return True
+
+
+def guard_mutation() -> None:
+    if not mutation_allowed():
+        raise Deferred("dark_or_unknown_wake")
+
+
 def _resolve_tool(name: str) -> str:
-    found = shutil.which(name)
+    if IS_MACOS and name == "git":
+        tool = pathlib.Path("/Library/Developer/CommandLineTools/usr/bin/git")
+        trusted_path(tool)
+        trusted_path(pathlib.Path("/Library/Developer/CommandLineTools/usr/libexec/git-core"), tree=True)
+        return str(tool)
+    found = shutil.which(name, path=":".join(_tool_fallback_dirs()))
     if found:
+        trusted_path(pathlib.Path(found))
         return found
     for directory in _tool_fallback_dirs():
         candidate = os.path.join(directory, name)
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            trusted_path(pathlib.Path(candidate))
             return candidate
     raise ConvergerError(f"tool_not_found:{name}")
 
 
 def _login_user_home() -> str | None:
-    sudo_user = os.environ.get("SUDO_USER")
+    sudo_user = os.environ.get("CHIEF_RUNTIME_USER") or os.environ.get("SUDO_USER")
     if sudo_user and sudo_user != "root":
         try:
             return pwd.getpwnam(sudo_user).pw_dir
@@ -127,16 +139,12 @@ def _login_user_home() -> str | None:
 
 
 def _tool_fallback_dirs() -> tuple[str, ...]:
-    dirs = list(TOOL_FALLBACK_DIRS)
-    login_home = _login_user_home()
-    if login_home:
-        dirs.append(os.path.join(login_home, ".local/bin"))
-    return tuple(dict.fromkeys(dirs))
+    return ("/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/local/bin", "/root/.local/bin")
 
 
 def _tool_subprocess_env() -> dict[str, str]:
-    prefix = ":".join((*_tool_fallback_dirs(), "/bin"))
-    return {**os.environ, "PATH": f"{prefix}:{os.environ.get('PATH', '')}"}
+    return {"PATH": ":".join(_tool_fallback_dirs()), "HOME": "/var/root" if IS_MACOS else "/root",
+            "LANG": "C", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
 
 
 # Root-owned github credential file (written by lib/94 install_root_git_cred) so the
@@ -148,12 +156,11 @@ ROOT_GIT_CRED = "/etc/chief/.git-fleet-credentials"
 def _git_fetch_env() -> dict[str, str]:
     env = _tool_subprocess_env()
     env["GIT_TERMINAL_PROMPT"] = "0"
-    # Inject git config via env (no on-disk config needed). The converger runs as
-    # ROOT on macOS but the repo is owned by the login user → git's dubious-ownership
-    # guard would abort rev-parse/fetch/checkout; safe.directory=* permits it. The
-    # credential helper (when the root cred file exists) lets root fetch from origin.
-    keys: list[tuple[str, str]] = [("safe.directory", "*")]
+    # Root repositories use fixed credentials and no hooks. User-owned Mac
+    # repositories run after dropping uid and use that user's own credentials.
+    keys: list[tuple[str, str]] = [("core.hooksPath", "/dev/null")]
     if os.path.isfile(ROOT_GIT_CRED):
+        trusted_path(pathlib.Path(ROOT_GIT_CRED))
         keys.append(("credential.https://github.com.helper", f"store --file={ROOT_GIT_CRED}"))
     env["GIT_CONFIG_COUNT"] = str(len(keys))
     for i, (k, v) in enumerate(keys):
@@ -435,7 +442,8 @@ def _launchd_target(token: str, label: str) -> str:
         # The converger normally runs as root via sudo, while the node is a login
         # user's LaunchAgent. Prefer SUDO_UID from sudo's preserved context, then
         # the plist owner, then the active console uid.
-        uid = _sudo_uid() or _launch_agent_plist_owner_uid(label) or _console_uid()
+        runtime_user = os.environ.get("CHIEF_RUNTIME_USER")
+        uid = pwd.getpwnam(runtime_user).pw_uid if runtime_user else (_sudo_uid() or _launch_agent_plist_owner_uid(label) or _console_uid())
         if uid is None:
             raise ConvergerError(f"launchd_user_uid_not_found:{label}")
         return f"gui/{uid}/{label}"
@@ -833,6 +841,9 @@ class HostOps:
         self.transport.emit(build_convergence_envelope(event_name, plan, **extra))
 
     def fetch(self, plan: VerifiedPlan) -> None:
+        guard_mutation()
+        if plan.artifact in RESTART_REQUIRED:
+            validate_git_ref(str(plan.raw["target_ref"]))
         self.journal_before("fetch", {"artifact": plan.artifact, "target_ref": plan.raw["target_ref"]})
         # Local destinations are fixed by artifact; actual source sync is intentionally typed.
         path = self.artifact_path(plan.artifact)
@@ -841,7 +852,7 @@ class HostOps:
         # Fetch from origin (best-effort): if the target ref is already present locally
         # the checkout still succeeds, so a fetch failure (e.g. transient network) is
         # only fatal when we then can't resolve the target. Don't hard-abort here.
-        fetch = subprocess.run([git, "fetch", "--all", "--prune"], cwd=path, env=env,
+        fetch = self.run_artifact([git, "fetch", "--all", "--prune"], path, env=env,
                                capture_output=True, text=True)
         if fetch is not None and getattr(fetch, "returncode", 0) != 0:
             self.journal_before("fetch_warning", {"artifact": plan.artifact, "stderr": (getattr(fetch, "stderr", "") or "")[-500:]})
@@ -850,11 +861,11 @@ class HostOps:
             validate_git_ref(target_ref)
             # Verify the target is resolvable locally before checkout (fail loud if not,
             # e.g. fetch failed AND ref absent). Skipped when subprocess is mocked (None).
-            resolve = subprocess.run([git, "rev-parse", "--verify", "--quiet", f"{target_ref}^{{commit}}"],
-                                     cwd=path, env=env, capture_output=True, text=True)
+            resolve = self.run_artifact([git, "rev-parse", "--verify", "--quiet", f"{target_ref}^{{commit}}"],
+                                     path, env=env, capture_output=True, text=True)
             if resolve is not None and getattr(resolve, "returncode", 0) != 0:
                 raise ConvergerError(f"target_ref_not_resolvable:{target_ref}")
-            subprocess.run([git, "checkout", "--detach", target_ref], cwd=path, env=env, check=True)
+            self.run_artifact([git, "checkout", "--detach", target_ref], path, env=env, check=True)
 
     def _chief_code_root(self) -> str:
         # Where the chief git working copies live. Linux/h-do1: /root/code/chief.
@@ -883,37 +894,60 @@ class HostOps:
         }
         return mapping[artifact]
 
-    def _login_user(self) -> str | None:
-        # The user that owns the macOS venv / LaunchAgent (converger runs as root).
-        return os.environ.get("SUDO_USER") or (os.environ.get("USER") if os.getuid() != 0 else None)
+    def run_artifact(self, cmd: list[str], cwd: str, **kwargs):
+        guard_mutation()
+        user = os.environ.get("CHIEF_RUNTIME_USER", "root")
+        account = pwd.getpwnam(user)
+        if account.pw_uid:
+            # Python drops supplementary groups, gid and uid before exec. User
+            # git config/hooks/build backends can only run as that same user.
+            kwargs["env"] = {"HOME": account.pw_dir, "USER": user, "LANG": "C",
+                             "PATH": f"{account.pw_dir}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"}
+            kwargs.update(user=account.pw_uid, group=account.pw_gid, extra_groups=[])
+        else:
+            trusted_path(pathlib.Path(cwd), tree=True)
+            trusted_path(pathlib.Path(cmd[0]))
+        return subprocess.run(cmd, cwd=cwd, **kwargs)
 
     def install_restart_required(self, plan: VerifiedPlan) -> None:
+        guard_mutation()
         self.journal_before("install", {"artifact": plan.artifact})
         if plan.artifact == "hermes-node":
             cwd = f"{self._chief_code_root()}/hermes-node"
-            cmd = [_resolve_tool("uv"), "pip", "install", "--python", ".venv/bin/python", "-q", "-e", "../chief-spec/sdk/python", "-e", "."]
-            # On macOS the venv is owned by the LOGIN user, not root. The converger runs
-            # as root (via the scoped sudoers), so a plain `uv pip install` would create
-            # root-owned files inside the user's venv and break the user's own deploys.
-            # Drop to the login user for the install (root->user needs no password).
-            user = self._login_user()
-            if IS_MACOS and user and user != "root":
-                cmd = ["/usr/bin/sudo", "-n", "-u", user, *cmd]
-            subprocess.run(cmd, cwd=cwd, env=_tool_subprocess_env(), check=True)
+            user = pwd.getpwnam(os.environ.get("CHIEF_RUNTIME_USER", "root"))
+            if user.pw_uid:
+                uv = shutil.which("uv", path=f"{user.pw_dir}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin")
+                if not uv:
+                    raise ConvergerError("tool_not_found:uv_for_runtime_user")
+            else:
+                uv = _resolve_tool("uv")
+            cmd = [uv, "pip", "install", "--python", ".venv/bin/python", "-q", "-e", "../chief-spec/sdk/python", "-e", "."]
+            self.run_artifact(cmd, cwd, env=_tool_subprocess_env(), check=True)
+
+    def _restart_launchd(self, token: str, unit: str) -> None:
+        target = _launchd_target(token, unit)
+        if target.startswith("gui/"):
+            probe = subprocess.run([_resolve_tool("launchctl"), "print", target.rsplit("/", 1)[0]],
+                                   check=False, capture_output=True, text=True)
+            if probe.returncode:
+                raise Deferred("gui_unavailable")
+        subprocess.run([_resolve_tool("launchctl"), "kickstart", "-k", target], check=True)
 
     def restart_units(self, plan: VerifiedPlan) -> None:
+        guard_mutation()
         for token in plan.restart_units:
             validate_supervised_process(token, action="restart_unit")
             unit = unit_for(token)
             self.journal_before("restart", {"unit": unit, "token": token})
             if IS_MACOS and token not in DOCKER_TOKENS:
-                subprocess.run([_resolve_tool("launchctl"), "kickstart", "-k", _launchd_target(token, unit)], check=True)
+                self._restart_launchd(token, unit)
             elif unit.endswith(".service"):
                 subprocess.run([_resolve_tool("systemctl"), "restart", unit], check=True)
             else:
                 subprocess.run([_resolve_tool("docker"), "restart", unit], check=True)
 
     def record_reload_and_signal(self, plan: VerifiedPlan) -> str:
+        guard_mutation()
         for token in plan.affected_processes:
             validate_supervised_process(token, action="reload_target")
         reload_at = iso_now()
@@ -927,7 +961,7 @@ class HostOps:
             unit = unit_for(token)
             self.journal_before("signal_reload", {"process": unit, "token": token})
             if IS_MACOS and token not in DOCKER_TOKENS:
-                subprocess.run([_resolve_tool("launchctl"), "kickstart", "-k", _launchd_target(token, unit)], check=True)
+                self._restart_launchd(token, unit)
             elif unit.endswith(".service"):
                 subprocess.run([_resolve_tool("systemctl"), "kill", "-s", "HUP", unit], check=True)
         return reload_at
@@ -950,9 +984,17 @@ def read_runtime_proof(artifact: str, target_ref: str, signal_at: str | None = N
             continue
         for stamp in root.glob(f"*/{artifact}.json"):
             try:
-                data = json.loads(stamp.read_text())
-                stat = stamp.stat()
-            except (OSError, json.JSONDecodeError):
+                fd = os.open(stamp, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                try:
+                    stat = os.fstat(fd)
+                    if not stat_module.S_ISREG(stat.st_mode) or stat.st_size > 65536:
+                        continue
+                    data = json.loads(os.read(fd, 65537))
+                    if not isinstance(data, dict):
+                        continue
+                finally:
+                    os.close(fd)
+            except (OSError, ValueError):
                 continue
             observed = data.get("observed_at") or data.get("written_at")
             if data.get("loaded_ref") != target_ref or data.get("health") not in {None, "healthy"}:
@@ -1053,16 +1095,23 @@ def execute_plan(
             if not inside.idle:
                 ops.emit("deferred", plan, reason="accepted_work_after_idle_check", idle_snapshot=inside.probes)
                 return "deferred"
-            ops.fetch(plan)
-            ops.emit("fetched", plan)
-            ops.install_restart_required(plan)
-            ops.restart_units(plan)
-            proof = ops.poll_runtime_ack(plan, iso_now())
-            if proof:
-                ops.emit("applied", plan, verification=proof)
-                mark_success()
-                return "applied"
-            ops.emit("failed", plan, reason="steady_health_timeout", verification=None)
+            try:
+                ops.fetch(plan)
+                ops.emit("fetched", plan)
+                ops.install_restart_required(plan)
+                ops.restart_units(plan)
+                proof = ops.poll_runtime_ack(plan, iso_now())
+                if proof:
+                    ops.emit("applied", plan, verification=proof)
+                    mark_success()
+                    return "applied"
+                ops.emit("failed", plan, reason="steady_health_timeout", verification=None)
+            except Deferred:
+                raise
+            except Exception as exc:
+                ops.emit("failed", plan, reason=type(exc).__name__, verification=None)
+            # Keep the lease across the immediate single restore, including
+            # exception failures. Never restore after releasing admission.
             rolled = attempt_rollback_once(plan, ops)
             if rolled:
                 mark_success()
@@ -1072,10 +1121,7 @@ def execute_plan(
         return "deferred"
     except Exception as exc:
         ops.emit("failed", plan, reason=type(exc).__name__, verification=None)
-        rolled = attempt_rollback_once(plan, ops)
-        if rolled:
-            mark_success()
-        return "rolled_back" if rolled else "failed"
+        return "failed"
 
 
 def attempt_rollback_once(plan: VerifiedPlan, ops: HostOps) -> bool:
@@ -1087,7 +1133,7 @@ def attempt_rollback_once(plan: VerifiedPlan, ops: HostOps) -> bool:
     try:
         disk_ref = str(lkg["disk_ref"])
         validate_git_ref(disk_ref)
-        subprocess.run([_resolve_tool("git"), "checkout", disk_ref], cwd=ops.artifact_path(plan.artifact), check=True)
+        ops.run_artifact([_resolve_tool("git"), "checkout", disk_ref], ops.artifact_path(plan.artifact), env=_git_fetch_env(), check=True)
         ops.install_restart_required(plan)
         ops.restart_units(plan)
         proof = ops.poll_runtime_ack(dataclasses.replace(plan, raw={**plan.raw, "target_ref": lkg["running_ref"]}), iso_now())
@@ -1119,6 +1165,8 @@ def load_cached_plan(state: LocalState) -> dict[str, Any]:
 
 def reconcile(args: argparse.Namespace) -> int:
     state = LocalState(pathlib.Path(args.state_root))
+    if args.plan_only:
+        return converge(args, reconcile_mode=True)
     lock_path = state._path("/var/run/chief/reconcile.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+") as fh:
@@ -1133,6 +1181,7 @@ def reconcile(args: argparse.Namespace) -> int:
             HostOps(state, transport).emit("deferred", vp, reason="reconcile_already_running")
             return 0
         runs = state.read_json(state.state_dir / "reconcile-runs.json", {})
+        runs = dict(list(runs.items())[-63:])
         runs[secrets.token_hex(8)] = {"trigger": args.trigger, "started_at": iso_now()}
         if not args.plan_only:
             state.write_json_0640(state.state_dir / "reconcile-runs.json", runs)
@@ -1149,9 +1198,13 @@ def converge(args: argparse.Namespace, reconcile_mode: bool = False) -> int:
             plan = transport.get_plan()
             if not args.plan_only:
                 state.write_json_0640(state.state_dir / "cached-plan.json", plan)
-        except (urllib.error.URLError, TimeoutError):
+        except (urllib.error.URLError, TimeoutError) as exc:
             if not reconcile_mode:
                 raise
+            # Keep the actual fetch failure visible even if cached verification fails.
+            print(json.dumps({"reason": "plan_fetch_failed", "error": str(exc),
+                              "core": args.core, "fallback": "cached-plan.json",
+                              "cache_policy": "same signature, identity, replay and 600s freshness checks"}), file=sys.stderr)
             plan = load_cached_plan(state)
             if not plan:
                 raise
@@ -1166,7 +1219,28 @@ def converge(args: argparse.Namespace, reconcile_mode: bool = False) -> int:
         watermarks=state.load_watermarks(),
         target_artifact=getattr(args, "target_artifact", None),
     )
+    if getattr(args, "step0", False):
+        from .runtime import full_wake, qualified_plan, wake_identity
+        global mutation_allowed
+        # Recheck wake epoch and freshness at each mutation boundary. A sleep
+        # during the run requires the next pulse to fetch new authorization.
+        expected_wake = args.step0_wake_id
+        def admitted():
+            if expected_wake == "unknown" or wake_identity() != expected_wake:
+                return False
+            try:
+                verify_plan(plan, node_id=args.node_id,
+                            key_lookup=default_key_lookup(args.node_id, pathlib.Path(args.plan_key_path)),
+                            watermarks=state.load_watermarks())
+            except VerificationError:
+                return False
+            return full_wake(qualified_plan(plan))
+        mutation_allowed = admitted
+        args.report_only = not mutation_allowed()
     idle = evaluate_idle(idle_snapshot) if verified.apply_mode == "restart_required" else None
+    if getattr(args, "report_only", False):
+        HostOps(state, transport).emit("deferred", verified, reason="dark_or_unknown_wake")
+        return 0
     if args.plan_only:
         print(plan_only_output(verified, idle))
         return 0
@@ -1176,8 +1250,8 @@ def converge(args: argparse.Namespace, reconcile_mode: bool = False) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hermes-converger")
-    parser.add_argument("--node-id", default=os.environ.get("CHIEF_NODE_ID") or os.uname().nodename.split(".")[0])
-    parser.add_argument("--core", default=os.environ.get("CHIEF_CORE_URL", "http://127.0.0.1:8088"))
+    parser.add_argument("--node-id", default=os.environ.get("CHIEF_NODE_ID"))
+    parser.add_argument("--core", default=os.environ.get("CHIEF_CORE_URL"))
     parser.add_argument("--plan-key-path", default=os.environ.get("CHIEF_NODE_PLAN_KEY", "/etc/chief/node-plan.key"))
     parser.add_argument("--auth-token-path", default=os.environ.get("CHIEF_NODE_AUTH_TOKEN", "/etc/chief/node-auth.token"))
     parser.add_argument("--state-root", default="/")
@@ -1189,13 +1263,15 @@ def build_parser() -> argparse.ArgumentParser:
     conv = sub.add_parser("converge")
     conv.add_argument("--artifact", dest="target_artifact", default=argparse.SUPPRESS)
     rec = sub.add_parser("reconcile")
-    rec.add_argument("--trigger", choices=["boot", "daemon-start"], required=True)
+    rec.add_argument("--trigger", choices=["boot", "daemon-start", "login", "wake", "network", "periodic", "request"], required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if not args.node_id or not args.core:
+        parser.error("missing_node_config: CHIEF_NODE_ID and CHIEF_CORE_URL required")
     if args.command == "reconcile":
         return reconcile(args)
     if args.command in {None, "converge"}:

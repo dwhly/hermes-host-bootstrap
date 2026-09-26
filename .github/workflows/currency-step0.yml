@@ -1,0 +1,12 @@
+name: Step 0 Python floor
+on: [push, pull_request]
+jobs:
+  python39:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - run: python -m pip install 'pytest<9'
+      - run: python -m pytest -q tests/test_converger.py tests/test_supervisor.py tests/test_currency_step0.py tests/test_currency_fix1.py tests/test_currency_fix2.py tests/test_currency_fix3.py

@@ -1,0 +1,10 @@
+[Unit]
+Description=Chief login-equivalent hint (user-manager start; linger means boot)
+
+[Service]
+Type=oneshot
+# Root-runtime hosts need no login hint; other login users may lack slot access.
+ExecStart=-/opt/chief/bin/chief-update-request
+
+[Install]
+WantedBy=default.target
