@@ -6,6 +6,31 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin" "$TMP/hosts" "$TMP/bootstrap"
 export FIXTURE_LOG="$TMP/calls"
+export HOME="$TMP/home" HERMES_HOME="$TMP/home/.hermes"
+export FIXTURE_BASELINE="$TMP/opt/hermes-config-baseline/fleet/hosts.yaml"
+export REAL_PYTHON FIXTURE_RUNNER="$TMP/python-fixture.py"
+REAL_PYTHON="$(command -v python3)"
+cat >"$FIXTURE_RUNNER" <<'PYTHON'
+import os
+from pathlib import Path
+import runpy
+import sys
+sys.argv = sys.argv[1:]
+sys.path.insert(0, str(Path(sys.argv[0]).parent))
+from desktop_fleet import common
+common.BASELINE_INTENT = Path(os.environ['FIXTURE_BASELINE'])
+runpy.run_path(sys.argv[0], run_name='__main__')
+PYTHON
+cat >"$TMP/bin/python3" <<'SHIM'
+#!/usr/bin/env bash
+options=()
+[[ -z "${FIXTURE_NO_YAML:-}" ]] || options+=(-S)
+if [[ "${1:-}" == */desktop-fleet-policy.py ]]; then
+  exec "$REAL_PYTHON" "${options[@]}" "$FIXTURE_RUNNER" "$@"
+fi
+exec "$REAL_PYTHON" "${options[@]}" "$@"
+SHIM
+chmod +x "$TMP/bin/python3"
 export HERMES_FLEET_HOSTS_DIR="$TMP/hosts" HERMES_FLEET_INTENT="$TMP/intent.json"
 export CHIEF_BOOTSTRAP_SRC="$TMP/bootstrap"
 export PATH="$TMP/bin:$PATH"
@@ -75,7 +100,7 @@ if FIXTURE_MARKER_RC=255 bash "$ROOT/fleet-upgrade.sh" mac >"$TMP/unknown.out" 2
 fi
 grep -q 'indeterminate' "$TMP/unknown.out" || fail 'unknown marker state not explicit'
 ! grep -q 'hermes update' "$FIXTURE_LOG" || fail 'unknown marker state mutated host'
-printf '%s\n' '{"hosts":[]}' >"$TMP/intent.json"
+printf '%s\n' '{"complete":false,"hosts":[]}' >"$TMP/intent.json"
 : >"$FIXTURE_LOG"
 if bash "$ROOT/fleet-upgrade.sh" mac >"$TMP/no-policy.out" 2>&1; then
   fail 'missing policy allowed update'
@@ -98,14 +123,36 @@ printf '%s\n' '{"hosts":[{"hostname":"mac"}]}' >"$TMP/intent.json"
 bash "$ROOT/fleet-upgrade.sh" mac >"$TMP/legacy.out" 2>&1 || fail 'legacy policy blocked'
 rm "$TMP/intent.json"
 bash "$ROOT/fleet-upgrade.sh" mac >"$TMP/absent.out" 2>&1 || fail 'absent Intent blocked'
-printf 'hosts:\n  - hostname: mac\n' >"$TMP/intent.json"
-export REAL_PYTHON
-REAL_PYTHON="$(command -v python3)"
-cat >"$TMP/bin/python3" <<'SHIM'
-#!/usr/bin/env bash
-exec "$REAL_PYTHON" -S "$@"
-SHIM
-chmod +x "$TMP/bin/python3"
-HERMES_FLEET_YAML_RETRY=1 bash "$ROOT/fleet-upgrade.sh" mac >"$TMP/no-yaml.out" 2>&1 || fail 'missing PyYAML blocked legacy update'
+# A selected but partially declared row must fail before any SSH/service action.
+cp "$ROOT/tests/fixtures/desktop-partial-hosts.yaml" "$TMP/intent.json"
+: >"$FIXTURE_LOG"
+if bash "$ROOT/fleet-upgrade.sh" h-af >"$TMP/partial.out" 2>&1; then
+  fail 'partial Intent allowed h-af update'
+fi
+grep -q 'indeterminate Intent' "$TMP/partial.out" || fail 'partial Intent diagnostic absent'
+[[ ! -s "$FIXTURE_LOG" ]] || fail 'partial Intent reached SSH'
+
+# The baseline-existing /opt path is resolved even if the preferred path is absent.
+mkdir -p "$(dirname "$FIXTURE_BASELINE")"
+printf 'hosts:\n  - hostname: h-af\n    update_policy: protected\n' >"$FIXTURE_BASELINE"
+rm "$TMP/intent.json"
+: >"$FIXTURE_LOG"
+if bash "$ROOT/fleet-upgrade.sh" h-af >"$TMP/opt.out" 2>&1; then
+  fail '/opt Intent allowed protected update'
+fi
+grep -q 'protected (registry Intent)' "$TMP/opt.out" || fail '/opt Intent was not resolved'
+[[ ! -s "$FIXTURE_LOG" ]] || fail '/opt protected Intent reached SSH'
+rm "$FIXTURE_BASELINE"
+
+# Missing PyYAML is legacy only when the raw seven-host Intent has no declarations.
+cp "$ROOT/tests/fixtures/desktop-legacy-hosts.yaml" "$TMP/intent.json"
+FIXTURE_NO_YAML=1 HERMES_FLEET_YAML_RETRY=1 bash "$ROOT/fleet-upgrade.sh" mac >"$TMP/no-yaml.out" 2>&1 || fail 'missing PyYAML blocked undeclared update'
 grep -q 'PyYAML unavailable' "$TMP/no-yaml.out" || fail 'missing YAML diagnostic absent'
-echo 'PASS: protected Intent/markers, local h-do1, sleeping Mac retry, legacy flows, fail-closed probes'
+printf 'hosts:\n  - hostname: mac\n    update_policy: protected\n' >"$TMP/intent.json"
+: >"$FIXTURE_LOG"
+if FIXTURE_NO_YAML=1 HERMES_FLEET_YAML_RETRY=1 bash "$ROOT/fleet-upgrade.sh" mac >"$TMP/declared-no-yaml.out" 2>&1; then
+  fail 'missing PyYAML allowed declared update'
+fi
+grep -q 'PyYAML unavailable' "$TMP/declared-no-yaml.out" || fail 'declared missing YAML diagnostic absent'
+[[ ! -s "$FIXTURE_LOG" ]] || fail 'undecodable declared Intent reached SSH'
+echo 'PASS: protected Intent/markers, local h-do1, sleeping Mac retry, legacy and declared Intent, /opt discovery, fail-closed probes'

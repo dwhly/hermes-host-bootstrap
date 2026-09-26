@@ -4,10 +4,11 @@ import argparse
 import grp
 import os
 import pwd
+from pathlib import Path
 import socket
 import sys
 from desktop_fleet import dashboard, marker
-from desktop_fleet.common import optional_host_record, update_policy, gateway_record
+from desktop_fleet.common import optional_host_record, resolve_intent, update_policy, gateway_record
 
 
 def main():
@@ -20,7 +21,7 @@ def main():
     p.add_argument('--user', required=True)
     p.add_argument('--bind', default='tailnet')
     p.add_argument('--port', type=int, default=9000)
-    p.add_argument('--registry', required=True)
+    p.add_argument('--registry')
     p.add_argument('--host', default=socket.gethostname().split('.')[0])
     a = p.parse_args()
     user = pwd.getpwnam(a.user)
@@ -28,9 +29,14 @@ def main():
                    home=a.home, hermes_home=a.hermes_home, executable=a.executable)
     if user.pw_dir != a.home or not os.access(a.executable, os.X_OK):
         raise ValueError('runtime account/home or executable mismatch')
+    a.registry = resolve_intent(a.registry, home=a.home, hermes_home=a.hermes_home)
     record = optional_host_record(a.registry, a.host)
     policy = update_policy(record, legacy=True)
-    if policy == 'protected' and gateway_record(record).get('dashboard_vehicle') != 'module97':
+    authorized = policy == 'protected' and gateway_record(record).get('dashboard_vehicle') == 'module97'
+    marker_path = Path(marker.MARKER)
+    if a.action == 'install' and (marker_path.exists() or marker_path.is_symlink()) and not authorized:
+        raise ValueError('G3 marker present; module97 requires protected policy and dashboard_vehicle: module97')
+    if policy == 'protected' and not authorized:
         raise ValueError('protected host requires the preserved-node apply vehicle; module97 not authorized in Intent')
     mac = a.platform == 'macos'
     launcher = a.home + '/.local/bin/hermes-dashboard-server' if mac else '/usr/local/bin/hermes-dashboard-server'

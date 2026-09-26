@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 from urllib.parse import urlsplit, urlunsplit
 
-from .common import digest, load, update_policy, gateway_record
+from .common import digest, load, load_intent, rollout_declared, update_policy, gateway_record
 
 AUTHORITY = 'hermes-config/fleet/hosts.yaml'
 
@@ -26,7 +26,8 @@ def normalized_url(value):
 
 
 def manifest(registry, client, revision):
-    intent = load(registry)
+    intent = load_intent(registry)
+    declared = rollout_declared(intent)
     hosts = intent['hosts']
     if not isinstance(hosts, list) or not hosts:
         raise ValueError('empty/malformed Intent')
@@ -37,7 +38,7 @@ def manifest(registry, client, revision):
     complete = intent.get('complete') is True
     for record in hosts:
         gateway = gateway_record(record)
-        policy = update_policy(record, legacy=True)
+        policy = update_policy(record, legacy=not declared)
         if not gateway or policy is None:
             complete = False
             rows.append({'managed_id': record['hostname'], 'label': record['hostname'],
@@ -59,6 +60,8 @@ def manifest(registry, client, revision):
         elif row['endpoint'] is not None:
             row['endpoint'] = normalized_url(row['endpoint'])
         rows.append(row)
+    if intent.get('complete') is True and not complete:
+        raise ValueError('Intent declares complete but desktop manifest is incomplete')
     labels = [row['label'].strip().lower() for row in rows]
     urls = [row['endpoint'] for row in rows if row['endpoint']]
     if len(set(labels)) != len(labels) or len(set(urls)) != len(urls):

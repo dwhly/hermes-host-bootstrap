@@ -3,10 +3,13 @@
 This supplements EDD-chief-desktop-fleet-gateways §6, especially step 2. The
 build and review perform only fixture checks; they do not authorize host changes.
 
-1. The bootstrap code can merge before the extended Intent. Missing Intent,
-   missing update policy, or unavailable PyYAML preserves existing module 97 and
-   fleet-upgrade behavior. A present marker still blocks updates; malformed or
-   conflicting declared policies are refused. New enrollment, marker installation
+1. The bootstrap code can merge before the extended Intent. Legacy behavior applies
+   only when Intent is absent at every candidate path or has no rollout declarations
+   anywhere. Candidates are `$HERMES_FLEET_INTENT`, `$HERMES_HOME/fleet/hosts.yaml`,
+   `~/.hermes/fleet/hosts.yaml`, and `/opt/hermes-config-baseline/fleet/hosts.yaml`.
+   Declared but unreadable/incomplete policy is refused, including missing PyYAML
+   when raw text contains rollout keys. A present marker blocks updates and requires
+   protected policy plus `dashboard_vehicle: module97` for module 97. New enrollment, marker installation
    and preserved-node apply require their explicit declarations and fail closed.
    Verification reports an unconfigured desktop rollout without failing existing
    hosts. It does not claim G3 or desktop qualification.

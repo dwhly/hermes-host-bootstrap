@@ -13,12 +13,23 @@ fi
 platform=linux
 [[ "$OS" != macos ]] || platform=macos
 hermes_executable="$(command -v hermes)"
+# Resolve PyYAML in the invoking runtime's environment before sudo resets it.
+py="$(command -v python3)"
+hermes_python="$("$py" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent / "python3")' "$hermes_executable")"
+for candidate in "${HERMES_FLEET_PYTHON:-}" "$HOME/hermes-agent/venv/bin/python3" \
+  "$HOME/hermes-agent/.venv/bin/python3" "$hermes_python" \
+  /usr/local/lib/hermes-agent/venv/bin/python3 "$py"; do
+  if [[ -n "$candidate" && -x "$candidate" ]] && "$candidate" -c 'import yaml' >/dev/null 2>&1; then
+    py="$candidate"
+    break
+  fi
+done
 args=(install --platform "$platform" --home "$HOME" --hermes-home "${HERMES_HOME:-$HOME/.hermes}"
   --user "$(id -un)" --executable "$hermes_executable" --port "${HERMES_DASHBOARD_PORT:-9000}"
   --bind "${HERMES_DASHBOARD_BIND:-tailnet}"
-  --registry "${HERMES_FLEET_INTENT:-${HERMES_HOME:-$HOME/.hermes}/fleet/hosts.yaml}")
+  --registry "${HERMES_FLEET_INTENT:-}")
 if [[ "$platform" == linux && "$EUID" != 0 ]]; then
-  sudo python3 "$REPO_ROOT/scripts/desktop-dashboard.py" "${args[@]}"
+  sudo "$py" "$REPO_ROOT/scripts/desktop-dashboard.py" "${args[@]}"
 else
-  python3 "$REPO_ROOT/scripts/desktop-dashboard.py" "${args[@]}"
+  "$py" "$REPO_ROOT/scripts/desktop-dashboard.py" "${args[@]}"
 fi

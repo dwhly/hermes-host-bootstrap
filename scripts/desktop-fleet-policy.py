@@ -4,20 +4,22 @@ import argparse
 import sys
 import json
 from pathlib import Path
-from desktop_fleet.common import host_record, optional_host_record, rooted, update_policy
+from desktop_fleet.common import host_record, optional_host_record, resolve_intent, rooted, update_policy
 from desktop_fleet import marker
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['policy', 'verify', 'render', 'install', 'backup', 'suspend', 'restore'])
-    parser.add_argument('--registry', required=True)
+    parser.add_argument('--registry')
     parser.add_argument('--host', required=True)
     parser.add_argument('--legacy', action='store_true', help='allow absent rollout policy for existing flows only')
     parser.add_argument('--root', default='/')
     parser.add_argument('--backup', default='/var/backups/hermes-desktop/image-provenance.json')
     args = parser.parse_args()
     legacy = args.legacy and args.action in ('policy', 'verify')
+    if legacy:
+        args.registry = resolve_intent(args.registry)
     record = optional_host_record(args.registry, args.host) if legacy else host_record(args.registry, args.host)
     policy = update_policy(record, legacy=legacy)
     if args.action == 'policy':

@@ -1,4 +1,4 @@
-# Sanitized current Intent shape: no complete, update_policy or desktop_gateway.
+# Sanitized seven-host Intent before desktop rollout declarations.
 fleet:
   name: Fixture fleet
   boss: h-do1

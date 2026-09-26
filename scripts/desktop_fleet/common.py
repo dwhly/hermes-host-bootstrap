@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -12,6 +13,47 @@ import tempfile
 
 class IntentUnavailable(ValueError):
     """Optional rollout input/dependency is absent, not malformed."""
+
+
+BASELINE_INTENT = Path('/opt/hermes-config-baseline/fleet/hosts.yaml')
+
+
+def resolve_intent(registry=None, *, home=None, hermes_home=None):
+    """Use the native-bots candidate order; unreadable inputs must not be skipped."""
+    home = Path(home) if home is not None else Path.home()
+    hermes_home = Path(hermes_home or os.environ.get('HERMES_HOME', home / '.hermes'))
+    candidates = [registry, os.environ.get('HERMES_FLEET_INTENT'),
+                  hermes_home / 'fleet/hosts.yaml', home / '.hermes/fleet/hosts.yaml', BASELINE_INTENT]
+    for candidate in dict.fromkeys(str(path) for path in candidates if path):
+        path = Path(candidate)
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        return path
+    return None
+
+
+def rollout_declared(intent):
+    if (not isinstance(intent, dict) or not isinstance(intent.get('hosts'), list)
+            or any(not isinstance(row, dict) for row in intent['hosts'])):
+        raise ValueError('malformed Intent host inventory')
+    return 'complete' in intent or any('update_policy' in row or 'desktop_gateway' in row
+                                     for row in intent['hosts'])
+
+
+def load_intent(registry):
+    if registry is None:
+        raise IntentUnavailable('Intent file is absent at all candidate paths')
+    # A selected path that disappears or cannot be read is indeterminate, not legacy.
+    text = Path(registry).read_text()
+    try:
+        return parse(text)
+    except IntentUnavailable as exc:
+        if ('update_policy' in text or 'desktop_gateway' in text
+                or re.search(r'''(?m)^(?:complete|"complete"|'complete')\s*:''', text)):
+            raise ValueError(str(exc)) from exc
+        raise
 
 
 def yaml_load(text):
@@ -102,10 +144,17 @@ def update_policy(record, *, legacy=False):
 
 def optional_host_record(registry, host):
     try:
-        return host_record(registry, host)
+        intent = load_intent(registry)
     except IntentUnavailable as exc:
         print(f'desktop-fleet: {exc}; legacy behavior only, new rollout actions disabled', file=sys.stderr)
         return {}
+    if not rollout_declared(intent):
+        return {}
+    matches = [row for row in intent['hosts'] if row.get('hostname') == host]
+    if len(matches) != 1:
+        raise ValueError('declared Intent must contain exactly one host record')
+    update_policy(matches[0])  # A declared rollout never permits a row without policy.
+    return matches[0]
 
 
 def digest(data):

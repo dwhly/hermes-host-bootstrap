@@ -9,7 +9,8 @@ import re
 import subprocess
 import sys
 
-from desktop_fleet.common import atomic_write, digest, json_bytes, load, IntentUnavailable
+from desktop_fleet.common import (atomic_write, digest, json_bytes, load, load_intent,
+                                  resolve_intent, rollout_declared, IntentUnavailable)
 from desktop_fleet.registry import checklist, manifest, read_only_report
 
 REPO = Path(__file__).resolve().parents[1]
@@ -90,7 +91,7 @@ def version(home, app=False, compatibility_path=None):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('action', choices=['render', 'install', 'verify', 'version', 'app-version'])
-    p.add_argument('--registry', default=os.environ.get('HERMES_FLEET_INTENT', str(Path.home() / '.hermes/fleet/hosts.yaml')))
+    p.add_argument('--registry')
     p.add_argument('--client', default=platform.node().split('.')[0])
     p.add_argument('--revision', help='reviewed Intent revision; also records exact input digest')
     p.add_argument('--hermes-home', type=Path, default=Path(os.environ.get('HERMES_HOME', str(Path.home() / '.hermes'))))
@@ -101,6 +102,8 @@ def main():
     p.add_argument('--optional', action='store_true', help='bootstrap: skip an unconfigured rollout without writes')
     p.add_argument('--compatibility', type=Path, help='independent reviewed repository compatibility pin')
     a = p.parse_args()
+    if a.action not in ('version', 'app-version'):
+        a.registry = resolve_intent(a.registry, hermes_home=a.hermes_home)
     generated = a.hermes_home / 'fleet/generated'
     if a.action in ('version', 'app-version'):
         print(version(a.hermes_home, a.action == 'app-version', a.compatibility))
@@ -135,7 +138,9 @@ def main():
             if not a.optional:
                 raise
             try:
-                declared = manifest(a.registry, a.client, a.revision)
+                intent = load_intent(a.registry)
+                declared = (manifest(a.registry, a.client, a.revision) if rollout_declared(intent)
+                            else {'complete': False})
             except IntentUnavailable:
                 declared = {'complete': False}
             if declared['complete']:
