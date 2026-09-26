@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import stat
 import subprocess
 import sys
 
@@ -23,6 +24,11 @@ from desktop_fleet import dashboard, marker
 AUTH_KEYS = {'HERMES_DASHBOARD_BASIC_AUTH_PASSWORD', 'HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH',
              'HERMES_DASHBOARD_BASIC_AUTH_SECRET', 'HERMES_DASHBOARD_BASIC_AUTH_USERNAME',
              'HERMES_DASHBOARD_PUBLIC_URL'}
+
+
+def metadata(path):
+    info = path.stat()
+    return {'mode': stat.S_IMODE(info.st_mode), 'uid': info.st_uid, 'gid': info.st_gid}
 
 
 def project_env(old, fields):
@@ -102,7 +108,9 @@ def prepare(root, plan, registry, fields):
     prior = plan['prior_sha256']
     targets = {launcher: (launcher_data, 0o755), unit: (unit_data, 0o644)}
     if fields:
-        targets[env] = (project_env(existing(rooted(root, env)), fields), 0o600)
+        env_path = rooted(root, env)
+        old_env = existing(env_path)
+        targets[env] = (project_env(old_env, fields), metadata(env_path)['mode'] if old_env is not None else 0o600)
     # Preserve any existing marker, byte for byte. Only install a missing marker.
     if not rooted(root, marker.MARKER).exists():
         targets[marker.MARKER] = (marker.render(plan['host']), 0o644)
@@ -110,12 +118,16 @@ def prepare(root, plan, registry, fields):
     for name, (data, mode) in targets.items():
         path = rooted(root, name)
         old = existing(path)
+        info = metadata(path) if old is not None else None
+        owner = None if fixture or (name == env and old is not None) else (
+            (runtime['uid'], gid) if name == env else (0, 0))
+        metadata_change = info is not None and (info['mode'] != mode or
+                          (owner is not None and (info['uid'], info['gid']) != owner))
         # No-op replay takes precedence over the *original* prior hash.
-        if old != data and (name not in prior or (digest(old) if old is not None else None) != prior[name]):
-            raise ValueError('prior file hash mismatch: ' + name)
-        metadata_change = old is not None and path.stat().st_mode & 0o777 != mode
         if old != data or metadata_change:
-            changes.append((name, old, data, mode))
+            if name not in prior or (digest(old) if old is not None else None) != prior[name]:
+                raise ValueError('prior file hash mismatch: ' + name)
+            changes.append((name, old, data, mode, owner, info))
     return changes, supervisor, state, fixture, gid
 
 
@@ -146,7 +158,7 @@ def main():
     backup_dir = '/var/backups/hermes-desktop/' + digest(Path(a.plan_file).read_bytes())[:16]
     service_changed = any(name != marker.MARKER for name, *_ in changes)
     actions = []
-    for name, old, _, _ in changes:
+    for name, old, *_ in changes:
         if old is not None:
             actions.append({'action': 'backup', 'path': name, 'to': backup_dir + name})
         actions.append({'action': 'replace' if old is not None else 'create', 'path': name})
@@ -157,20 +169,33 @@ def main():
             actions.append({'action': 'enable', 'service': supervisor.service})
         actions.append({'action': 'restart' if state['pid'] else 'start', 'service': supervisor.service})
     # Preflight all backup conflicts before any file writes. Never replace a prior backup.
-    for name, old, _, _ in changes:
+    for name, old, _, _, _, info in changes:
         backup = rooted(root, backup_dir + name)
         if old is not None and existing(backup) not in (None, old):
             raise ValueError('backup conflict; select a fresh reviewed plan')
+        if old is not None:
+            saved_metadata = json_bytes(dict(info, sha256=digest(old)))
+            if existing(rooted(root, backup_dir + name + '.metadata.json')) not in (None, saved_metadata):
+                raise ValueError('backup metadata conflict; select a fresh reviewed plan')
     print(json.dumps({'host': plan['host'], 'changes': actions, 'noop': not changes}, sort_keys=True))
     if a.plan or not changes:
         return
-    for name, old, _, _ in changes:
+    # Catch writes since prepare before starting, and again at each replacement.
+    for name, old, _, _, _, info in changes:
+        path = rooted(root, name)
+        if existing(path) != old or (old is not None and metadata(path) != info):
+            raise ValueError('concurrent file change; refusing apply')
+    for name, old, _, _, _, info in changes:
         if old is not None:
             backup = rooted(root, backup_dir + name)
             atomic_write(backup, old, 0o600)
-    for name, _, data, mode in changes:
-        owner = None if fixture else ((plan['runtime']['uid'], gid) if name.endswith('/.env') else (0, 0))
-        atomic_write(rooted(root, name), data, mode, owner=owner)
+            atomic_write(rooted(root, backup_dir + name + '.metadata.json'),
+                         json_bytes(dict(info, sha256=digest(old))), 0o600)
+    for name, old, data, mode, owner, info in changes:
+        path = rooted(root, name)
+        if existing(path) != old or (old is not None and metadata(path) != info):
+            raise ValueError('concurrent file change; refusing replacement')
+        atomic_write(path, data, mode, owner=owner)
     # Per-file atomicity, not a filesystem transaction. Backups survive a refresh failure.
     if service_changed and not fixture:
         supervisor.refresh(state, any(name == supervisor.unit for name, *_ in changes))

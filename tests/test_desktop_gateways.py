@@ -19,6 +19,10 @@ spec = importlib.util.spec_from_file_location('fleet', REPO / 'scripts/desktop-f
 fleet = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fleet)
 
+spec = importlib.util.spec_from_file_location('apply', REPO / 'scripts/desktop-gateway-apply.py')
+apply = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(apply)
+
 
 def load_compatibility():
     return json.loads((REPO / 'desktop-plugins/fleet-gateways/compatibility.json').read_text())
@@ -294,6 +298,50 @@ class Fixtures(unittest.TestCase):
         env.unlink()
         env.symlink_to(self.root / 'plan.json')
         self.run_apply(path, ok=False)
+
+    def test_apply_preserves_env_metadata_and_backs_it_up(self):
+        plan, path, env = self.apply_fixture()
+        env.chmod(0o640)
+        before = apply.metadata(env)
+        result = self.run_apply(path)
+        self.assertEqual(apply.metadata(env), before)
+        backup = next(action['to'] for action in result['changes'] if action['action'] == 'backup')
+        saved = json.loads(rooted(self.root, backup + '.metadata.json').read_text())
+        self.assertEqual({k: saved[k] for k in before}, before)
+        self.assertEqual(saved['sha256'], plan['prior_sha256']['/home/hermes/.hermes/.env'])
+        self.assertTrue(self.run_apply(path)['noop'])
+
+    def test_apply_metadata_only_change_requires_prior_hash(self):
+        plan, path, env = self.apply_fixture()
+        self.run_apply(path)
+        launcher = rooted(self.root, '/usr/local/bin/hermes-dashboard-server')
+        launcher.chmod(0o700)
+        before = self.snapshot()
+        self.run_apply(path, ok=False)
+        self.assertEqual(self.snapshot(), before)
+        plan['prior_sha256']['/usr/local/bin/hermes-dashboard-server'] = digest(launcher.read_bytes())
+        path.write_bytes(json_bytes(plan))
+        self.run_apply(path)
+        self.assertEqual(launcher.stat().st_mode & 0o777, 0o755)
+
+    def test_apply_detects_concurrent_env_write_before_replacement(self):
+        plan, path, env = self.apply_fixture()
+        real_write = apply.atomic_write
+        injected = False
+        def write(target, *args, **kwargs):
+            nonlocal injected
+            result = real_write(target, *args, **kwargs)
+            if target.name == 'hermes-dashboard-server' and '/backups/' not in str(target) and not injected:
+                injected = True
+                env.write_bytes(env.read_bytes() + b'CONCURRENT=preserve\n')
+            return result
+        argv = ['apply', '--root', str(self.root), '--registry', str(self.intent), '--plan-file', str(path)]
+        with patch.object(sys, 'argv', argv), patch.object(apply, 'atomic_write', side_effect=write):
+            with self.assertRaisesRegex(ValueError, 'concurrent file change'):
+                apply.main()
+        self.assertTrue(injected)
+        self.assertTrue(env.read_bytes().endswith(b'CONCURRENT=preserve\n'))
+        self.assertIn(b'http://old', env.read_bytes())
 
     def test_launcher_rejects_desktop_exemption_and_preserves_path(self):
         fake = self.write('/fake-hermes', b'#!/bin/sh\nprintf "%s\\n" "$@"\n', 0o755)
