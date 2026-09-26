@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 from urllib.parse import urlsplit, urlunsplit
 
-from .common import digest, load, load_intent, rollout_declared, update_policy, gateway_record
+from .common import digest, load, load_rollout_intent, rollout_declared, update_policy, gateway_record
 
 AUTHORITY = 'hermes-config/fleet/hosts.yaml'
 
@@ -25,8 +25,8 @@ def normalized_url(value):
     return urlunsplit((url.scheme, authority, url.path.rstrip('/'), '', ''))
 
 
-def manifest(registry, client, revision):
-    intent = load_intent(registry)
+def manifest(registry, client, revision, *, hermes_home=None):
+    intent = load_rollout_intent(registry, hermes_home=hermes_home)
     declared = rollout_declared(intent)
     hosts = intent['hosts']
     if not isinstance(hosts, list) or not hosts:

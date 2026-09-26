@@ -30,7 +30,7 @@ def main():
     if user.pw_dir != a.home or not os.access(a.executable, os.X_OK):
         raise ValueError('runtime account/home or executable mismatch')
     a.registry = resolve_intent(a.registry, home=a.home, hermes_home=a.hermes_home)
-    record = optional_host_record(a.registry, a.host)
+    record = optional_host_record(a.registry, a.host, home=a.home, hermes_home=a.hermes_home)
     policy = update_policy(record, legacy=True)
     authorized = policy == 'protected' and gateway_record(record).get('dashboard_vehicle') == 'module97'
     marker_path = Path(marker.MARKER)

@@ -24,6 +24,10 @@ for candidate in "${HERMES_FLEET_PYTHON:-}" "$HOME/hermes-agent/venv/bin/python3
     break
   fi
 done
+if [[ -n "${HERMES_FLEET_INTENT:-}" && ! -e "$HERMES_FLEET_INTENT" ]]; then
+  echo 'desktop-dashboard: HERMES_FLEET_INTENT file does not exist' >&2
+  exit 1
+fi
 args=(install --platform "$platform" --home "$HOME" --hermes-home "${HERMES_HOME:-$HOME/.hermes}"
   --user "$(id -un)" --executable "$hermes_executable" --port "${HERMES_DASHBOARD_PORT:-9000}"
   --bind "${HERMES_DASHBOARD_BIND:-tailnet}"

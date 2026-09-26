@@ -9,7 +9,7 @@ import re
 import subprocess
 import sys
 
-from desktop_fleet.common import (atomic_write, digest, json_bytes, load, load_intent,
+from desktop_fleet.common import (atomic_write, digest, json_bytes, load, load_rollout_intent,
                                   resolve_intent, rollout_declared, IntentUnavailable)
 from desktop_fleet.registry import checklist, manifest, read_only_report
 
@@ -109,7 +109,7 @@ def main():
         print(version(a.hermes_home, a.action == 'app-version', a.compatibility))
     elif a.action in ('render', 'install'):
         try:
-            data = manifest(a.registry, a.client, a.revision)
+            data = manifest(a.registry, a.client, a.revision, hermes_home=a.hermes_home)
         except IntentUnavailable as exc:
             if not a.optional:
                 raise
@@ -133,13 +133,19 @@ def main():
         print('changed' if changed else 'unchanged')
     else:
         try:
+            intent = load_rollout_intent(a.registry, hermes_home=a.hermes_home)
+        except IntentUnavailable:
+            if not a.optional:
+                raise
+            intent = None
+        try:
             data = load(generated / 'desktop-gateways.json')
         except IntentUnavailable:
             if not a.optional:
                 raise
             try:
-                intent = load_intent(a.registry)
-                declared = (manifest(a.registry, a.client, a.revision) if rollout_declared(intent)
+                declared = (manifest(a.registry, a.client, a.revision, hermes_home=a.hermes_home)
+                            if intent is not None and rollout_declared(intent)
                             else {'complete': False})
             except IntentUnavailable:
                 declared = {'complete': False}

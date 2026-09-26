@@ -10,8 +10,11 @@ if ! tier_allows R || ! role_includes client || [[ "$OS" != macos ]] || is_skipp
   return 0 2>/dev/null || exit 0
 fi
 fleet_home="${HERMES_HOME:-$HOME/.hermes}"
-intent="${HERMES_FLEET_INTENT:-$fleet_home/fleet/hosts.yaml}"
-revision="${HERMES_FLEET_REVISION:-$(git -C "$(dirname "$intent")" rev-parse HEAD 2>/dev/null || true)}"
+intent="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from desktop_fleet.common import resolve_intent; print(resolve_intent(hermes_home=sys.argv[2]) or "")' "$REPO_ROOT/scripts" "$fleet_home")"
+revision="${HERMES_FLEET_REVISION:-}"
+if [[ -z "$revision" && -n "$intent" ]]; then
+  revision="$(git -C "$(dirname "$intent")" rev-parse HEAD 2>/dev/null || true)"
+fi
 args=(install --optional --registry "$intent" --revision "$revision" --hermes-home "$fleet_home")
 if [[ -n "${HERMES_DESKTOP_APP_PIN:-}" ]]; then
   args+=(--app-pin "$HERMES_DESKTOP_APP_PIN")

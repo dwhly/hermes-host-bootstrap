@@ -18,14 +18,23 @@ class IntentUnavailable(ValueError):
 BASELINE_INTENT = Path('/opt/hermes-config-baseline/fleet/hosts.yaml')
 
 
-def resolve_intent(registry=None, *, home=None, hermes_home=None):
-    """Use the native-bots candidate order; unreadable inputs must not be skipped."""
+def intent_candidates(registry=None, *, home=None, hermes_home=None):
     home = Path(home) if home is not None else Path.home()
     hermes_home = Path(hermes_home or os.environ.get('HERMES_HOME', home / '.hermes'))
-    candidates = [registry, os.environ.get('HERMES_FLEET_INTENT'),
+    override = os.environ.get('HERMES_FLEET_INTENT')
+    if override:
+        try:
+            Path(override).lstat()
+        except FileNotFoundError as exc:
+            raise ValueError('HERMES_FLEET_INTENT file does not exist') from exc
+    candidates = [registry, override,
                   hermes_home / 'fleet/hosts.yaml', home / '.hermes/fleet/hosts.yaml', BASELINE_INTENT]
-    for candidate in dict.fromkeys(str(path) for path in candidates if path):
-        path = Path(candidate)
+    return list(dict.fromkeys(Path(path) for path in candidates if path))
+
+
+def resolve_intent(registry=None, *, home=None, hermes_home=None):
+    """Use the native-bots candidate order; unreadable inputs must not be skipped."""
+    for path in intent_candidates(registry, home=home, hermes_home=hermes_home):
         try:
             path.lstat()
         except FileNotFoundError:
@@ -54,6 +63,36 @@ def load_intent(registry):
                 or re.search(r'''(?m)^(?:complete|"complete"|'complete')\s*:''', text)):
             raise ValueError(str(exc)) from exc
         raise
+
+
+def load_rollout_intent(registry, *, home=None, hermes_home=None):
+    """A declared selection wins; legacy requires every candidate to be undeclared."""
+    unavailable = None
+    try:
+        intent = load_intent(registry)
+        if rollout_declared(intent):
+            return intent
+    except IntentUnavailable as exc:
+        unavailable = exc
+    try:
+        for path in intent_candidates(registry, home=home, hermes_home=hermes_home):
+            if registry is not None and path == Path(registry):
+                continue
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                continue
+            try:
+                other = load_intent(path)
+            except IntentUnavailable:
+                continue  # load_intent already refuses raw declaration tokens.
+            if rollout_declared(other):
+                raise ValueError('declared alternative Intent')
+    except (OSError, ValueError) as exc:
+        raise ValueError('Intent copies disagree on desktop rollout declaration') from exc
+    if unavailable is not None:
+        raise unavailable
+    return intent
 
 
 def yaml_load(text):
@@ -142,9 +181,9 @@ def update_policy(record, *, legacy=False):
     return policies[0]
 
 
-def optional_host_record(registry, host):
+def optional_host_record(registry, host, *, home=None, hermes_home=None):
     try:
-        intent = load_intent(registry)
+        intent = load_rollout_intent(registry, home=home, hermes_home=hermes_home)
     except IntentUnavailable as exc:
         print(f'desktop-fleet: {exc}; legacy behavior only, new rollout actions disabled', file=sys.stderr)
         return {}

@@ -7,8 +7,13 @@ build and review perform only fixture checks; they do not authorize host changes
    only when Intent is absent at every candidate path or has no rollout declarations
    anywhere. Candidates are `$HERMES_FLEET_INTENT`, `$HERMES_HOME/fleet/hosts.yaml`,
    `~/.hermes/fleet/hosts.yaml`, and `/opt/hermes-config-baseline/fleet/hosts.yaml`.
-   Declared but unreadable/incomplete policy is refused, including missing PyYAML
-   when raw text contains rollout keys. A present marker blocks updates and requires
+   An explicit `--registry` is considered first. A nonempty `$HERMES_FLEET_INTENT`
+   must exist. A declared selected copy keeps precedence; if it is undeclared
+   (including missing PyYAML without raw declaration tokens), every other existing
+   candidate must also be undeclared. A declared, unreadable or malformed alternate
+   refuses legacy behavior. Declared but unreadable/incomplete policy is refused,
+   including missing PyYAML when raw text contains rollout keys.
+   A present marker blocks updates and requires
    protected policy plus `dashboard_vehicle: module97` for module 97. New enrollment, marker installation
    and preserved-node apply require their explicit declarations and fail closed.
    Verification reports an unconfigured desktop rollout without failing existing
@@ -20,6 +25,8 @@ build and review perform only fixture checks; they do not authorize host changes
    hosts. h-btp and h-af must use the reviewed preserved-node vehicle. Confirm a
    Hermes venv with PyYAML (or `HERMES_FLEET_PYTHON`) on each host. This is an
    activation gate; legacy compatibility is not evidence that protection is armed.
+   On h-btp and h-af, record which candidates exist; any higher-precedence copy
+   must be byte-identical to `/opt/hermes-config-baseline/fleet/hosts.yaml` or removed.
 3. Schedule a one-time dashboard refresh on the first new module 97 apply to h-do1
    and the Phase-A Macs. The rendered unit/plist and credential digest are new.
    Subsequent healthy, identical applies do nothing; owned credential/public-URL
@@ -49,6 +56,8 @@ build and review perform only fixture checks; they do not authorize host changes
    modules 35/92 (`op inject`). After replacement and refresh, apply rereads `.env`
    and requires each projected assignment to be present exactly once with its
    projected value; a stale writer causes apply to fail and leaves refresh pending.
+   Rebuild the plan from current `.env` bytes (fresh `prior_sha256`), then re-apply;
+   the retained stamp forces the refresh.
 
 The EDD's app artifact/rollback pin, h-do1 capacity gate, owner consents, ingress,
 authentication/revocation checks and Mac retention canary remain required. The

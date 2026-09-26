@@ -126,9 +126,17 @@ grep -q 'protected (image-provenance marker)' "$TMP/local.out" || fail 'local ma
 printf '%s\n' '{"hosts":[{"hostname":"mac"}]}' >"$TMP/intent.json"
 bash "$ROOT/fleet-upgrade.sh" mac >"$TMP/legacy.out" 2>&1 || fail 'legacy policy blocked'
 rm "$TMP/intent.json"
+: >"$FIXTURE_LOG"
+if bash "$ROOT/fleet-upgrade.sh" mac >"$TMP/missing-override.out" 2>&1; then
+  fail 'missing explicit Intent override allowed update'
+fi
+grep -q 'HERMES_FLEET_INTENT file does not exist' "$TMP/missing-override.out" || fail 'missing override diagnostic absent'
+[[ ! -s "$FIXTURE_LOG" ]] || fail 'missing override reached SSH'
+unset HERMES_FLEET_INTENT
 bash "$ROOT/fleet-upgrade.sh" mac >"$TMP/absent.out" 2>&1 || fail 'absent Intent blocked'
 # A selected but partially declared row must fail before any SSH/service action.
 cp "$ROOT/tests/fixtures/desktop-partial-hosts.yaml" "$TMP/intent.json"
+export HERMES_FLEET_INTENT="$TMP/intent.json"
 : >"$FIXTURE_LOG"
 if bash "$ROOT/fleet-upgrade.sh" h-af >"$TMP/partial.out" 2>&1; then
   fail 'partial Intent allowed h-af update'
@@ -140,16 +148,37 @@ grep -q 'indeterminate Intent' "$TMP/partial.out" || fail 'partial Intent diagno
 mkdir -p "$(dirname "$FIXTURE_BASELINE")"
 printf 'hosts:\n  - hostname: h-af\n    update_policy: protected\n' >"$FIXTURE_BASELINE"
 rm "$TMP/intent.json"
+unset HERMES_FLEET_INTENT
 : >"$FIXTURE_LOG"
 if bash "$ROOT/fleet-upgrade.sh" h-af >"$TMP/opt.out" 2>&1; then
   fail '/opt Intent allowed protected update'
 fi
 grep -q 'protected (registry Intent)' "$TMP/opt.out" || fail '/opt Intent was not resolved'
 [[ ! -s "$FIXTURE_LOG" ]] || fail '/opt protected Intent reached SSH'
+
+# A stale local snapshot cannot hide declared protection in the /opt baseline.
+mkdir -p "$HERMES_HOME/fleet"
+printf 'hosts:\n  - hostname: h-af\n' >"$HERMES_HOME/fleet/hosts.yaml"
+for missing_yaml in '' 1; do
+  : >"$FIXTURE_LOG"
+  if FIXTURE_NO_YAML="$missing_yaml" HERMES_FLEET_YAML_RETRY=1 bash "$ROOT/fleet-upgrade.sh" h-af >"$TMP/shadow.out" 2>&1; then
+    fail 'undeclared local copy hid protected /opt Intent'
+  fi
+  grep -q 'Intent copies disagree on desktop rollout declaration' "$TMP/shadow.out" || fail 'copy disagreement diagnostic absent'
+  [[ ! -s "$FIXTURE_LOG" ]] || fail 'disagreeing copies reached SSH'
+done
+cp "$ROOT/tests/fixtures/desktop-legacy-hosts.yaml" "$FIXTURE_BASELINE"
+for missing_yaml in '' 1; do
+  : >"$FIXTURE_LOG"
+  FIXTURE_NO_YAML="$missing_yaml" HERMES_FLEET_YAML_RETRY=1 bash "$ROOT/fleet-upgrade.sh" mac >"$TMP/all-legacy.out" 2>&1 || fail 'multiple undeclared copies blocked legacy'
+  grep -q 'hermes update' "$FIXTURE_LOG" || fail 'all-undeclared copies did not take legacy flow'
+done
+rm "$HERMES_HOME/fleet/hosts.yaml"
 rm "$FIXTURE_BASELINE"
 
 # Missing PyYAML is legacy only when the raw seven-host Intent has no declarations.
 cp "$ROOT/tests/fixtures/desktop-legacy-hosts.yaml" "$TMP/intent.json"
+export HERMES_FLEET_INTENT="$TMP/intent.json"
 FIXTURE_NO_YAML=1 HERMES_FLEET_YAML_RETRY=1 bash "$ROOT/fleet-upgrade.sh" mac >"$TMP/no-yaml.out" 2>&1 || fail 'missing PyYAML blocked undeclared update'
 grep -q 'PyYAML unavailable' "$TMP/no-yaml.out" || fail 'missing YAML diagnostic absent'
 printf 'hosts:\n  - hostname: mac\n    update_policy: protected\n' >"$TMP/intent.json"
@@ -159,4 +188,4 @@ if FIXTURE_NO_YAML=1 HERMES_FLEET_YAML_RETRY=1 bash "$ROOT/fleet-upgrade.sh" mac
 fi
 grep -q 'PyYAML unavailable' "$TMP/declared-no-yaml.out" || fail 'declared missing YAML diagnostic absent'
 [[ ! -s "$FIXTURE_LOG" ]] || fail 'undecodable declared Intent reached SSH'
-echo 'PASS: protected Intent/markers, local h-do1, sleeping Mac retry, legacy and declared Intent, /opt discovery, fail-closed probes'
+echo 'PASS: protected Intent/markers, local h-do1, sleeping Mac retry, legacy and declared Intent, /opt discovery, candidate disagreement, strict override, fail-closed probes'
