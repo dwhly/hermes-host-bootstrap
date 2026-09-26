@@ -163,14 +163,20 @@ def main():
         raise ValueError('dashboard values must be single-line strings')
     changes, supervisor, state, fixture, gid = prepare(root, plan, a.registry, fields)
     backup_dir = '/var/backups/hermes-desktop/' + digest(Path(a.plan_file).read_bytes())[:16]
-    service_changed = any(name != marker.MARKER for name, *_ in changes)
+    pending_path = rooted(root, '/var/lib/hermes-desktop/' + supervisor.service + '.refresh-pending')
+    pending = existing(pending_path) is not None
+    unit_changed = (any(name == supervisor.unit for name, *_ in changes)
+                    or pending or state.get('need_reload', False))
+    unhealthy = (not state['loaded'] or not state.get('active', bool(state['pid']))
+                 or state.get('need_reload', False))
+    service_changed = any(name != marker.MARKER for name, *_ in changes) or pending or unhealthy
     actions = []
     for name, old, *_ in changes:
         if old is not None:
             actions.append({'action': 'backup', 'path': name, 'to': backup_dir + name})
         actions.append({'action': 'replace' if old is not None else 'create', 'path': name})
     if service_changed:
-        if any(name == supervisor.unit for name, *_ in changes):
+        if unit_changed:
             actions.append({'action': 'daemon-reload', 'service': supervisor.service})
         if not state['loaded']:
             actions.append({'action': 'enable', 'service': supervisor.service})
@@ -184,14 +190,16 @@ def main():
             saved_metadata = json_bytes(dict(info, sha256=digest(old)))
             if existing(rooted(root, backup_dir + name + '.metadata.json')) not in (None, saved_metadata):
                 raise ValueError('backup metadata conflict; select a fresh reviewed plan')
-    print(json.dumps({'host': plan['host'], 'changes': actions, 'noop': not changes}, sort_keys=True))
-    if a.plan or not changes:
+    print(json.dumps({'host': plan['host'], 'changes': actions, 'noop': not actions}, sort_keys=True))
+    if a.plan or not actions:
         return
     # Catch writes since prepare before starting, and again at each replacement.
     for name, old, _, _, _, info in changes:
         path = rooted(root, name)
         if existing(path) != old or (old is not None and metadata(path) != info):
             raise ValueError('concurrent file change; refusing apply')
+    if service_changed:
+        atomic_write(pending_path, b'refresh required\n', 0o600)
     for name, old, _, _, _, info in changes:
         if old is not None:
             backup = rooted(root, backup_dir + name)
@@ -205,7 +213,9 @@ def main():
         atomic_write(path, data, mode, owner=owner)
     # Per-file atomicity, not a filesystem transaction. Backups survive a refresh failure.
     if service_changed and not fixture:
-        supervisor.refresh(state, any(name == supervisor.unit for name, *_ in changes))
+        supervisor.refresh(state, unit_changed)
+    if service_changed:
+        pending_path.unlink()
 
 
 if __name__ == '__main__':

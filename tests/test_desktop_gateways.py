@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline, non-root fixtures. Does not execute bootstrap modules or host services."""
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -270,6 +271,12 @@ class Fixtures(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         return proc
 
+    def healthy_apply_fixture(self, plan):
+        path = rooted(self.root, '/run/desktop-gateway-supervisor.json')
+        state = json.loads(path.read_text())
+        state.update(loaded=True, active=True, pid=41, need_reload=False, runtime=plan['runtime'])
+        path.write_bytes(json_bytes(state))
+
     def test_apply_plan_exact_output_no_mutation_and_noop(self):
         plan, path, env = self.apply_fixture()
         before = self.snapshot()
@@ -284,6 +291,7 @@ class Fixtures(unittest.TestCase):
         backup = next(action['to'] for action in dry['changes'] if action['action'] == 'backup')
         self.assertEqual(rooted(self.root, backup).read_bytes(), before['home/hermes/.hermes/.env'][0])
         self.assertEqual(rooted(self.root, backup).stat().st_mode & 0o777, 0o600)
+        self.healthy_apply_fixture(plan)
         before = self.snapshot()
         self.assertEqual(self.run_apply(path), {'host': 'h-btp', 'changes': [], 'noop': True})
         self.assertEqual(before, self.snapshot())
@@ -323,7 +331,75 @@ class Fixtures(unittest.TestCase):
         saved = json.loads(rooted(self.root, backup + '.metadata.json').read_text())
         self.assertEqual({k: saved[k] for k in before}, before)
         self.assertEqual(saved['sha256'], plan['prior_sha256']['/home/hermes/.hermes/.env'])
+        self.healthy_apply_fixture(plan)
         self.assertTrue(self.run_apply(path)['noop'])
+
+    def test_apply_refresh_failure_retries_identical_files_and_healthy_is_noop(self):
+        base = self.root
+        for failing in ('daemon-reload', 'restart'):
+            with self.subTest(failing=failing):
+                self.root = base / failing
+                self.root.mkdir()
+                self.intent = self.root / 'intent.json'
+                plan, path, _ = self.apply_fixture()
+                self.healthy_apply_fixture(plan)
+                calls = []
+                failed = False
+                def run(args):
+                    nonlocal failed
+                    calls.append(args)
+                    if args[1] == failing and not failed:
+                        failed = True
+                        raise subprocess.CalledProcessError(1, args)
+                real_prepare = apply.prepare
+                def prepare(*args):
+                    changes, supervisor, state, _, gid = real_prepare(*args)
+                    supervisor.run = run
+                    return changes, supervisor, state, False, gid
+                argv = ['apply', '--root', str(self.root), '--registry', str(self.intent), '--plan-file', str(path)]
+                pending = rooted(self.root, '/var/lib/hermes-desktop/' + plan['supervisor']['service'] + '.refresh-pending')
+                with patch.object(sys, 'argv', argv), patch.object(apply, 'prepare', side_effect=prepare), \
+                     patch.object(sys, 'stdout', new_callable=io.StringIO) as output:
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        apply.main()
+                    self.assertTrue(pending.exists())
+                    self.assertEqual(pending.stat().st_mode & 0o777, 0o600)
+                    before = self.snapshot()
+                    calls.clear()
+                    with patch.object(sys, 'argv', argv + ['--plan']):
+                        apply.main()
+                    dry = json.loads(output.getvalue().splitlines()[-1])
+                    self.assertFalse(dry['noop'])
+                    self.assertEqual([item['action'] for item in dry['changes']], ['daemon-reload', 'restart'])
+                    self.assertEqual(self.snapshot(), before)
+                    self.assertEqual(calls, [])
+                    apply.main()
+                    self.assertEqual([cmd[1] for cmd in calls], ['daemon-reload', 'restart'])
+                    self.assertFalse(pending.exists())
+                    before.pop(str(pending.relative_to(self.root)))
+                    self.assertEqual(self.snapshot(), before)  # No identical files were rewritten.
+                    calls.clear()
+                    apply.main()
+                    self.assertTrue(json.loads(output.getvalue().splitlines()[-1])['noop'])
+                    self.assertEqual(calls, [])
+                    self.assertEqual(self.snapshot(), before)
+
+    def test_apply_unhealthy_identical_files_plan_service_recovery(self):
+        plan, path, _ = self.apply_fixture()
+        self.run_apply(path)
+        state_path = rooted(self.root, '/run/desktop-gateway-supervisor.json')
+        for field, value, actions in [('loaded', False, ['enable', 'restart']),
+                                      ('active', False, ['restart']),
+                                      ('need_reload', True, ['daemon-reload', 'restart'])]:
+            self.healthy_apply_fixture(plan)
+            state = json.loads(state_path.read_text())
+            state[field] = value
+            state_path.write_bytes(json_bytes(state))
+            before = self.snapshot()
+            result = self.run_apply(path, '--plan')
+            self.assertFalse(result['noop'])
+            self.assertEqual([item['action'] for item in result['changes']], actions)
+            self.assertEqual(before, self.snapshot())
 
     def test_apply_metadata_only_change_requires_prior_hash(self):
         plan, path, env = self.apply_fixture()
