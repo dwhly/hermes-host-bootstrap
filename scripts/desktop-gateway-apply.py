@@ -69,6 +69,13 @@ def runtime_check(root, plan):
     executable = rooted(root, runtime['executable'])
     if digest(executable.read_bytes()) != runtime['executable_sha256'] or not os.access(executable, os.X_OK):
         raise ValueError('runtime executable differs from qualified build')
+    # Declare the resolved executable in BOTH plan and Intent. An entry-point
+    # script alone does not identify its installed package, so pin RECORD too.
+    build = runtime['build_identity']
+    if build['kind'] != 'dist-info-record' or not re.search(r'\.dist-info/RECORD$', build['path']):
+        raise ValueError('qualified installed-package RECORD is required')
+    if digest(rooted(root, build['path']).read_bytes()) != build['sha256']:
+        raise ValueError('runtime installed build identity mismatch')
     if not rooted(root, runtime['hermes_home']).is_dir():
         raise ValueError('existing HERMES_HOME is required')
     return fixture, int(groups[0][2])

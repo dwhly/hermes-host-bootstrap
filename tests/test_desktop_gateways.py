@@ -232,6 +232,9 @@ class Fixtures(unittest.TestCase):
         plan = json.loads((REPO / 'tests/fixtures/desktop-gateway-plan.json').read_text())
         exe = self.write(plan['runtime']['executable'], b'#!/bin/sh\nexit 0\n', 0o755)
         plan['runtime']['executable_sha256'] = digest(exe.read_bytes())
+        build = plan['runtime']['build_identity']
+        record = self.write(build['path'], b'hermes_cli/main.py,sha256=fixture-build,123\n')
+        build['sha256'] = digest(record.read_bytes())
         env = self.write('/home/hermes/.hermes/.env', b'# unrelated\r\nSLACK_BOT_TOKEN=fixture-only\r\nKEEP="a=b"\nHERMES_DASHBOARD_PUBLIC_URL=http://old\n', 0o600)
         plan['prior_sha256']['/home/hermes/.hermes/.env'] = digest(env.read_bytes())
         self.write('/home/hermes/.hermes/config.yaml', b'unknown: preserve\n')
@@ -342,6 +345,56 @@ class Fixtures(unittest.TestCase):
         self.assertTrue(injected)
         self.assertTrue(env.read_bytes().endswith(b'CONCURRENT=preserve\n'))
         self.assertIn(b'http://old', env.read_bytes())
+
+    def test_apply_resolved_executable_and_package_identity(self):
+        plan, path, _ = self.apply_fixture()
+        alias = rooted(self.root, '/home/hermes/.local/bin/hermes')
+        alias.parent.mkdir(parents=True)
+        alias.symlink_to(rooted(self.root, plan['runtime']['executable']))
+        self.assertFalse(self.run_apply(path, '--plan')['noop'])
+        record = rooted(self.root, plan['runtime']['build_identity']['path'])
+        record.write_bytes(record.read_bytes() + b'changed-build\n')
+        before = self.snapshot()
+        self.run_apply(path, '--plan', ok=False)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_live_apply_path_uses_socket_runtime_and_refresh_checks_with_stubs(self):
+        plan, path, env = self.apply_fixture()
+        env.chmod(0o640)
+        self.write('/proc/41/status', b'Uid: 1000 1000 1000 1000\n')
+        environ = self.write('/proc/41/environ', b'HOME=/home/hermes\0HERMES_HOME=/home/hermes/.hermes\0')
+        service = plan['supervisor']['service']
+        unit = '/etc/systemd/system/' + service
+        calls = []
+        def run(args):
+            calls.append(args)
+            if args[:2] == ['systemctl', 'show']:
+                return f'MainPID=41\nFragmentPath={unit}\nLoadState=loaded\nActiveState=active\nNeedDaemonReload=no'
+            if args[0] == 'ss':
+                return 'LISTEN 0 128 127.0.0.1:8789 *:* users:(("python",pid=41,fd=3))'
+            return ''
+        adapter = dashboard.Supervisor('linux', service, unit, 1000, run, self.root / 'proc')
+        original_write = apply.atomic_write
+        owners = []
+        def write(target, data, mode=0o644, owner=None):
+            owners.append((str(target), owner))
+            # Simulate privileged ownership for unit files, without requiring root.
+            return original_write(target, data, mode)
+        argv = ['apply', '--root', str(self.root), '--registry', str(self.intent), '--plan-file', str(path)]
+        with patch.object(apply, 'runtime_check', return_value=(False, 1000)), \
+             patch.object(apply.dashboard, 'Supervisor', return_value=adapter), \
+             patch.object(apply, 'atomic_write', side_effect=write), patch.object(sys, 'argv', argv):
+            before = self.snapshot()
+            environ.write_bytes(environ.read_bytes() + b'HERMES_SSH_PRIVATE_KEY=forbidden\0')
+            with self.assertRaisesRegex(ValueError, 'forbidden'):
+                apply.main()
+            self.assertEqual(owners, [])
+            environ.write_bytes(before['proc/41/environ'][0])
+            calls.clear()
+            apply.main()
+        self.assertEqual(calls[-2:], [['systemctl', 'daemon-reload'], ['systemctl', 'restart', service]])
+        self.assertEqual(next(owner for target, owner in owners if target == str(env)), None)
+        self.assertEqual(env.stat().st_mode & 0o777, 0o640)
 
     def test_launcher_rejects_desktop_exemption_and_preserves_path(self):
         fake = self.write('/fake-hermes', b'#!/bin/sh\nprintf "%s\\n" "$@"\n', 0o755)

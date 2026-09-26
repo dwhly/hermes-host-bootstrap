@@ -47,7 +47,7 @@ def manifest(registry, client, revision):
         row = {key: gateway.get(key) for key in ('label', 'admission', 'runtime', 'endpoint', 'native_sign_in')}
         if isinstance(row['runtime'], dict):
             row['runtime'] = {key: value for key, value in row['runtime'].items() if key in
-                ('user', 'uid', 'group', 'home', 'hermes_home', 'executable', 'executable_sha256', 'build', 'auth_provider')}
+                ('user', 'uid', 'group', 'home', 'hermes_home', 'executable', 'executable_sha256', 'build', 'build_identity', 'auth_provider')}
         row['managed_id'] = record['hostname']
         row['update_policy'] = policy
         if not row['label'] or row['admission'] not in ('admitted', 'pending-qualification', 'deferred'):

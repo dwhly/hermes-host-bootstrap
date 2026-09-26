@@ -7,8 +7,13 @@
     "uid": 1000,
     "home": "/home/hermes",
     "hermes_home": "/home/hermes/.hermes",
-    "executable": "/home/hermes/.local/bin/hermes",
-    "executable_sha256": "TEST_REPLACED_WITH_FIXTURE_DIGEST"
+    "executable": "/home/hermes/hermes-agent/venv/bin/hermes",
+    "executable_sha256": "TEST_REPLACED_WITH_FIXTURE_DIGEST",
+    "build_identity": {
+      "kind": "dist-info-record",
+      "path": "/home/hermes/hermes-agent/venv/lib/python3.11/site-packages/hermes_agent-0.0.0.dist-info/RECORD",
+      "sha256": "TEST_REPLACED_WITH_FIXTURE_DIGEST"
+    }
   },
   "supervisor": {"kind": "systemd", "service": "hermes-desktop-gateway.service"},
   "bind": "127.0.0.1",
