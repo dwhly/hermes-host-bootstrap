@@ -68,6 +68,24 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(subprocess.run(args + ['--optional'], capture_output=True).returncode, 0)
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
+    def test_legacy_seven_host_behavior_matches_slice1_bytes(self):
+        path = REPO / 'tests/fixtures/desktop-legacy-hosts.yaml'
+        golden = json.loads((REPO / 'tests/fixtures/desktop-legacy-slice1.json').read_text())
+        self.assertEqual(golden['source_commit'], '6ece92658654c2ebc0b11b37ce5922037ed44a4b')
+        for host in golden['manifest_sha256']:
+            data = registry.manifest(path, host, 'fixture')
+            self.assertEqual(common.digest(common.json_bytes(data)), golden['manifest_sha256'][host])
+            self.assertEqual(common.digest(registry.checklist(data).encode()), golden['checklist_sha256'][host])
+            with patch.object(sys, 'stdout', new_callable=io.StringIO) as output:
+                self.assertEqual(self.run_entry(host=host, intent=path)[0], ['check', 'install'])
+            self.assertEqual(output.getvalue(), 'dashboard unchanged; no restart\n')
+        runtime = dict(user='fixture', group='fixture', uid=123, home='/fixture',
+                       hermes_home='/fixture/.hermes', executable='/fixture/hermes')
+        for platform in ('linux', 'macos'):
+            service = entry.dashboard.LABEL if platform == 'macos' else 'fixture.service'
+            rendered = entry.dashboard.render(runtime, platform, '/fixture/launcher', service, 'tailnet', 9000)
+            self.assertEqual([common.digest(part) for part in rendered], golden['render_sha256'][platform])
+
     def test_conflicting_and_null_policy_fail_closed(self):
         for row in ({'update_policy': 'protected', 'desktop_gateway': {'update_policy': 'eligible'}},
                     {'update_policy': 'protected', 'desktop_gateway': None}):
@@ -78,6 +96,162 @@ class PolicyTests(unittest.TestCase):
                 path.write_text(json.dumps({'hosts': [dict(row, hostname='mac')]}))
                 with self.assertRaises(ValueError):
                     registry.manifest(path, 'mac', 'fixture')
+
+    def test_marker_declaration_is_required_and_validated_in_every_policy_consumer(self):
+        path = self.root / 'invalid.json'
+        for policy_name, states in (('protected', ('absent', None, '', False, [], {}, 'later')),
+                                   ('eligible', ('armed', None, '', False, [], {}))):
+            for state in states:
+                row = dict(hostname='actual', update_policy=policy_name,
+                           desktop_gateway=dict(admission='admitted', dashboard_vehicle='module97'))
+                if state != 'absent':
+                    row['desktop_gateway']['g3_marker'] = state
+                path.write_bytes(common.json_bytes(dict(complete=True, hosts=[row])))
+                with self.subTest(policy=policy_name, state=state):
+                    for legacy in (False, True):
+                        with self.assertRaisesRegex(ValueError, 'g3_marker'):
+                            update_policy(row, legacy=legacy)
+                    with self.assertRaisesRegex(ValueError, 'g3_marker'):
+                        optional_host_record(path, 'actual')
+                    with self.assertRaisesRegex(ValueError, 'g3_marker'):
+                        registry.manifest(path, 'actual', 'fixture')
+                    with self.assertRaisesRegex(ValueError, 'g3_marker'):
+                        self.run_entry(row)
+        for state in ('deferred', 'armed'):
+            self.assertEqual(update_policy(dict(update_policy='protected', desktop_gateway=dict(g3_marker=state))),
+                             'protected')
+        for gateway in ({}, {'g3_marker': 'deferred'}):
+            self.assertEqual(update_policy(dict(update_policy='eligible', desktop_gateway=gateway)), 'eligible')
+
+    def test_policy_cli_deferred_refuses_create_restore_and_suspend_without_writes(self):
+        intent = REPO / 'tests/fixtures/desktop-deferred-hosts.yaml'
+        def snapshot():
+            return {str(p): (p.read_bytes(), p.stat()) for p in self.root.rglob('*') if p.is_file()}
+        for host in ('h-do1', 'h-btp', 'h-af'):
+            root = self.root / host
+            marker_path = common.rooted(root, entry.marker.MARKER)
+            backup = common.rooted(root, '/backup/marker')
+            backup.parent.mkdir(parents=True)
+            backup.write_bytes(entry.marker.render(host))
+            backup.with_name('marker.metadata.json').write_bytes(common.json_bytes(dict(
+                sha256=common.digest(backup.read_bytes()), mode=0o600, uid=os.getuid(), gid=os.getgid())))
+            for present in (False, True):
+                if present:
+                    marker_path.parent.mkdir(parents=True)
+                    marker_path.write_bytes(b'pre-existing marker; preserve even if malformed\n')
+                    marker_path.chmod(0o600)
+                for action in ('install', 'restore', 'suspend'):
+                    before = snapshot()
+                    proc = subprocess.run([sys.executable, str(REPO / 'scripts/desktop-fleet-policy.py'),
+                        action, '--root', str(root), '--registry', str(intent), '--host', host,
+                        '--backup', '/backup/marker'], capture_output=True, text=True)
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertIn('G3 marker deferred; refusing', proc.stderr)
+                    # Reads may change atime; all marker bytes and mutation metadata must match.
+                    after = snapshot()
+                    self.assertEqual(before.keys(), after.keys())
+                    for name, (data, info) in before.items():
+                        self.assertEqual(data, after[name][0])
+                        for field in ('st_ino', 'st_mtime_ns', 'st_ctime_ns', 'st_mode', 'st_uid', 'st_gid'):
+                            self.assertEqual(getattr(info, field), getattr(after[name][1], field))
+
+    def test_declared_admission_holds_module97_before_any_runtime_or_service_work(self):
+        for policy_name in ('protected', 'eligible'):
+            for state in ('deferred', 'pending-qualification'):
+                row = dict(hostname='actual', update_policy=policy_name,
+                           desktop_gateway=dict(admission=state, g3_marker='deferred',
+                                                dashboard_vehicle='module97', endpoint=None))
+                for marker_present in (False, True):
+                    with patch.object(sys, 'stdout', new_callable=io.StringIO) as output, \
+                         patch.object(subprocess, 'Popen', side_effect=AssertionError('unexpected process')):
+                        events, _ = self.run_entry(row, marker_present=marker_present)
+                    self.assertEqual(events, [])
+                    self.assertIn('dashboard held: admission ' + state, output.getvalue())
+        for state in (None, '', 'unknown'):
+            with self.assertRaisesRegex(ValueError, 'admission'):
+                self.run_entry(dict(hostname='actual', update_policy='eligible', desktop_gateway=dict(admission=state)))
+
+    def test_admitted_module97_skips_deferred_marker_but_keeps_dashboard_behavior(self):
+        for policy_name in ('protected', 'eligible'):
+            row = dict(hostname='actual', update_policy=policy_name,
+                       desktop_gateway=dict(admission='admitted', g3_marker='deferred', dashboard_vehicle='module97'))
+            with patch.object(sys, 'stdout', new_callable=io.StringIO) as output:
+                events, _ = self.run_entry(row)
+            self.assertEqual(events, ['check', 'install'])
+            if policy_name == 'protected':
+                self.assertIn('G3 marker deferred; marker step skipped', output.getvalue())
+                self.assertEqual(self.run_entry(row, marker_present=True)[0], ['check', 'install'])
+
+    def test_module97_shell_returns_success_for_held_do1_and_pending_air2(self):
+        # Execute the actual wrapper with a fixture common.sh and interpreter.
+        # No service/process call is allowed once the Python entry point starts.
+        fixture_repo = self.root / 'bootstrap'
+        (fixture_repo / 'lib').mkdir(parents=True)
+        (fixture_repo / 'scripts').symlink_to(REPO / 'scripts', target_is_directory=True)
+        (fixture_repo / 'lib/common.sh').write_text('''set -euo pipefail
+OS=linux
+step() { :; }
+tier_allows() { return 0; }
+is_skipped() { return 1; }
+''')
+        wrapper = fixture_repo / 'lib/97-dashboard-server.sh'
+        wrapper.write_bytes((REPO / 'lib/97-dashboard-server.sh').read_bytes())
+        interpreter = self.root / 'fixture-python'
+        interpreter.write_text('#!' + sys.executable + '\n' + '''import os, runpy, socket, subprocess, sys
+if sys.argv[1] == '-c':
+    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+socket.gethostname = lambda: os.environ['FIXTURE_HOST']
+def forbidden(*args, **kwargs):
+    raise AssertionError('unexpected process/service call')
+subprocess.Popen = forbidden
+sys.argv = sys.argv[1:]
+sys.path.insert(0, os.path.dirname(sys.argv[0]))
+runpy.run_path(sys.argv[0], run_name='__main__')
+''')
+        interpreter.chmod(0o755)
+        for host in ('h-do1', 'h-air2'):
+            proc = subprocess.run(['bash', str(wrapper)], capture_output=True, text=True,
+                env={**os.environ, 'REPO_ROOT': str(fixture_repo), 'FIXTURE_HOST': host,
+                     'HERMES_FLEET_PYTHON': str(interpreter), 'PYTHONDONTWRITEBYTECODE': '1',
+                     'HERMES_FLEET_INTENT': str(REPO / 'tests/fixtures/desktop-deferred-hosts.yaml')})
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn('dashboard held: admission ', proc.stdout)
+            self.assertFalse((self.root / '.hermes').exists())
+
+    def test_safe_seven_host_fixture_keeps_client_admission_unchanged(self):
+        path = REPO / 'tests/fixtures/desktop-deferred-hosts.yaml'
+        data = registry.manifest(path, 'h-mini2', 'fixture')
+        self.assertTrue(data['complete'])
+        self.assertEqual(len(data['rows']), 7)
+        self.assertEqual({row['managed_id'] for row in data['rows'] if row['admission'] == 'admitted'},
+                         {'h-mini', 'h-mini2', 'h-air'})
+        self.assertEqual(registry.checklist(data).count('Add Remote '), 3)
+        for row in data['rows']:
+            if row['admission'] != 'admitted':
+                self.assertIsNone(row['endpoint'])
+
+    def test_verify_deferred_is_warning_in_human_and_json_modes(self):
+        intent = REPO / 'tests/fixtures/desktop-deferred-hosts.yaml'
+        # Source the real runner and keep only G3. Never run the machine-wide checks
+        # or h-btp's unrelated baseline/credential reporting.
+        script = '''source "$1/verify.sh"
+HERMES_VERIFY_CHECKS=()
+hostname() { printf '%s\\n' h-do1; }
+verify_check desktop-g3-marker false hermes verify_desktop_g3
+"$2"
+'''
+        for mode in ('verify_json', 'verify_human'):
+            proc = subprocess.run(['bash', '-c', script, '_', str(REPO), mode], capture_output=True, text=True,
+                                  env={**os.environ, 'HERMES_FLEET_INTENT': str(intent)})
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            if mode == 'verify_json':
+                row, = json.loads(proc.stdout)['checks']
+                self.assertEqual(row['status'], 'deferred')
+                self.assertFalse(row['required'])
+                self.assertIn('not protected; convergence reconciliation pending', row['detail'])
+            else:
+                self.assertIn('warn: desktop-g3-marker — deferred (not protected;', proc.stdout)
+            self.assertNotIn('missing', proc.stdout)
 
     def run_entry(self, record=None, host=None, unavailable=False, intent=None, marker_present=False,
                   home=None, hermes_home=None):
@@ -123,7 +297,7 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(host, 'explicit')
 
     def test_entry_marker_precedes_service_and_preserved_nodes_refused(self):
-        row = {'hostname': 'h-do1', 'update_policy': 'protected', 'desktop_gateway': {'dashboard_vehicle': 'module97'}}
+        row = {'hostname': 'h-do1', 'update_policy': 'protected', 'desktop_gateway': {'dashboard_vehicle': 'module97', 'admission': 'admitted', 'g3_marker': 'armed'}}
         events, _ = self.run_entry(row, 'h-do1')
         self.assertEqual(events, ['check', ('marker', 'h-do1'), 'install'])
         for row in ({'update_policy': 'protected'}, {'desktop_gateway': None},
@@ -150,7 +324,7 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(list(Path(tmp).iterdir()), [intent])
 
     def test_marker_failure_never_reaches_service_install(self):
-        record = {'update_policy': 'protected', 'desktop_gateway': {'dashboard_vehicle': 'module97'}}
+        record = {'update_policy': 'protected', 'desktop_gateway': {'dashboard_vehicle': 'module97', 'admission': 'admitted', 'g3_marker': 'armed'}}
         argv = ['entry', 'install', '--platform', 'linux', '--home', '/fixture', '--hermes-home', '/fixture/.hermes',
                 '--executable', '/fixture/hermes', '--user', 'fixture', '--registry', '/fixture/intent', '--host', 'h-do1']
         with patch.object(sys, 'argv', argv), patch.object(entry, 'optional_host_record', return_value=record), \
@@ -190,20 +364,23 @@ class PolicyTests(unittest.TestCase):
                 self.run_entry(host='new-mac', intent=path)
 
     def test_marker_requires_explicit_module97_protected_authorization(self):
-        for record in ({'hostname': 'actual'}, {'hostname': 'actual', 'update_policy': 'eligible'},
-                       {'hostname': 'actual', 'update_policy': 'protected'}):
+        for record in ({'hostname': 'actual'}, {'hostname': 'actual', 'update_policy': 'eligible',
+                        'desktop_gateway': {'admission': 'admitted'}},
+                       {'hostname': 'actual', 'update_policy': 'protected',
+                        'desktop_gateway': {'admission': 'admitted', 'g3_marker': 'armed'}}):
             with self.assertRaisesRegex(ValueError, 'G3 marker present'):
                 self.run_entry(record, marker_present=True)
         with self.assertRaisesRegex(ValueError, 'G3 marker present'):
             self.run_entry(unavailable=True, marker_present=True)
         events, _ = self.run_entry({'hostname': 'actual', 'update_policy': 'protected',
-                                   'desktop_gateway': {'dashboard_vehicle': 'module97'}}, marker_present=True)
+                                   'desktop_gateway': {'dashboard_vehicle': 'module97', 'admission': 'admitted', 'g3_marker': 'armed'}}, marker_present=True)
         self.assertEqual(events, ['check', ('marker', 'actual'), 'install'])
 
     def test_candidate_paths_include_opt_and_preserve_precedence(self):
         baseline = common.BASELINE_INTENT
         baseline.parent.mkdir(parents=True)
-        baseline.write_text('hosts:\n  - hostname: h-af\n    update_policy: protected\n')
+        baseline.write_text('hosts:\n  - hostname: h-af\n    update_policy: protected\n'
+                            '    desktop_gateway: {g3_marker: armed, admission: admitted}\n')
         self.assertEqual(resolve_intent(self.root / 'missing'), baseline)
         self.assertEqual(update_policy(optional_host_record(resolve_intent(), 'h-af')), 'protected')
         with self.assertRaisesRegex(ValueError, 'preserved-node'):

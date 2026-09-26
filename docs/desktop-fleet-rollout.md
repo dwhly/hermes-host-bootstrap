@@ -22,13 +22,51 @@ build and review perform only fixture checks; they do not authorize host changes
    hermes-config change for all seven hosts: one consistent `update_policy`,
    `desktop_gateway` declarations and top-level `complete: true`. Declare
    `desktop_gateway.dashboard_vehicle: module97` only for h-do1 among the protected
-   hosts. h-btp and h-af must use the reviewed preserved-node vehicle. Confirm a
+   hosts. h-btp and h-af must declare `dashboard_vehicle: preserved-node`.
+   Every protected host must explicitly declare `desktop_gateway.g3_marker` as
+   `deferred` or `armed`; absent, null or other values are refused. **Step 2 sets
+   `g3_marker: deferred` on h-do1, h-btp and h-af** until the software-currency
+   reconciliation is built and qualified. The four Macs stay `eligible`, may omit
+   `g3_marker` or declare `deferred`, and must never declare `armed` or receive a marker.
+
+   | Host | `update_policy` | `desktop_gateway.admission` | `desktop_gateway.g3_marker` | Vehicle |
+   |---|---|---|---|---|
+   | h-do1 | protected | deferred (HELD until capacity GO) | deferred | module97 |
+   | h-btp | protected | pending-qualification | deferred | preserved-node |
+   | h-af | protected | pending-qualification | deferred | preserved-node |
+   | h-air2 | eligible | pending-qualification; endpoint null | omitted | module97 |
+   | h-mini, h-mini2, h-air | eligible | admitted after their rollout gates | omitted | module97 |
+
+   `deferred` blocks marker creation, restoration and suspension at every writer;
+   any pre-existing marker remains untouched. Explicit backup remains available.
+   Module 97 skips the deferred marker step. G3 verification reports
+   `deferred (not protected; convergence reconciliation pending)` as a warning
+   (`status: deferred` in JSON), with human/JSON reporting still exiting 0. This
+   does not claim G3 even if an old marker exists. The ordinary fleet-upgrade
+   protected skip remains in force independently of marker state.
+
+   Arming later means changing the three declarations to `g3_marker: armed` only
+   after H1 qualifies the currency EDD §6 process-local convergence exemption.
+   Building and qualifying that exemption is H1's scope; this slice supplies no
+   bypass or marker-removal convergence cycle. `armed` enables the existing marker
+   lifecycle and still requires actual-build refusal qualification.
+
+   Confirm a
    Hermes venv with PyYAML (or `HERMES_FLEET_PYTHON`) on each host. This is an
    activation gate; legacy compatibility is not evidence that protection is armed.
    On h-btp and h-af, record which candidates exist; any higher-precedence copy
    must be byte-identical to `/opt/hermes-config-baseline/fleet/hosts.yaml` or removed.
-3. Schedule a one-time dashboard refresh on the first new module 97 apply to h-do1
-   and the Phase-A Macs. The rendered unit/plist and credential digest are new.
+   Every candidate must be readable by the accounts running bootstrap or verify.
+3. In declared Intent, **module 97 mutates only `admitted` rows**. `deferred` and
+   `pending-qualification` return a successful held status without dashboard file
+   writes, refresh, stop/restart or marker changes. An existing legacy dashboard
+   stays exactly as it is. h-do1 remains HELD until its capacity GO; h-air2 retains
+   its null endpoint and gets no invented listener. Missing/invalid admission is
+   refused. Undeclared legacy behavior is unchanged.
+
+   Schedule a one-time dashboard refresh on the first new module 97 apply to each
+   admitted host; h-do1 must first clear its hold and admission gates.
+   The rendered unit/plist and credential digest are new.
    Subsequent healthy, identical applies do nothing; owned credential/public-URL
    changes refresh the service, and failed refreshes retry on the next apply.
    Credential digests are stored mode 0600 (root-owned on Linux, user-owned on Mac).
@@ -47,6 +85,22 @@ build and review perform only fixture checks; they do not authorize host changes
    the installed package (not an editable source checkout); otherwise a separately
    reviewed build-identity adapter is required. No real host layout or build has
    been qualified by these fixtures.
+
+   Preserved apply requires the row's `dashboard_vehicle: preserved-node` and
+   enforces admission during both preparation and apply. `deferred` always
+   refuses, including with `--qualify`. `pending-qualification` refuses by default;
+   an explicit `--qualify` permits the scoped service setup needed for the EDD's
+   stage-5 checks. Use it for both preview and apply, for example
+   `desktop-gateway-apply.py --registry INTENT --plan-file PLAN --qualify --plan`,
+   then the same command without `--plan` in the approved host window. It neither
+   admits the row nor creates a client connection/endpoint nor overrides marker
+   deferral. Module 97 has no qualification exception.
+
+   A deferred-marker plan must omit `/etc/hermes/image-provenance.json` from
+   `prior_sha256`. Preparation emits no marker action, and apply refuses a stale
+   armed plan or a hand-edited marker change before writing any files. Plans use
+   the input schema in `tests/fixtures/desktop-gateway-plan.json` (an **armed test
+   example**); printed `changes` are preview output, never accepted plan input.
 6. Backups contain original file bytes plus mode/uid/gid/digest metadata. An
    existing `.env` retains ownership/mode. Apply rechecks bytes and metadata before
    each replacement and refuses detected concurrent writes. Per-file replacement
@@ -59,7 +113,8 @@ build and review perform only fixture checks; they do not authorize host changes
    Rebuild the plan from current `.env` bytes (fresh `prior_sha256`), then re-apply;
    the retained stamp forces the refresh.
 
-The EDD's app artifact/rollback pin, h-do1 capacity gate, owner consents, ingress,
+The EDD's app artifact/rollback pin, h-do1 capacity gate, ingress,
 authentication/revocation checks and Mac retention canary remain required. The
 h-af non-systemd/:8787 adapter is still deferred. No host, credentials or `/opt`
-pin changes are included in this build.
+pin changes are included in this build. The Gate-2 amendment already resolves
+h-af owner consent; its technical qualification and stage-5 gates remain open.

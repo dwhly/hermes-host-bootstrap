@@ -1,0 +1,69 @@
+# Synthetic rollout declarations; no actual listener/build qualification.
+complete: true
+hosts:
+  - hostname: h-do1
+    update_policy: protected
+    desktop_gateway:
+      label: h-do1
+      admission: deferred
+      g3_marker: deferred
+      dashboard_vehicle: module97
+      endpoint: null
+      native_sign_in: password
+      runtime: {user: root, uid: 0, home: /root, hermes_home: /root/.hermes}
+  - hostname: h-btp
+    update_policy: protected
+    desktop_gateway:
+      label: h-btp
+      admission: pending-qualification
+      g3_marker: deferred
+      dashboard_vehicle: preserved-node
+      endpoint: null
+      native_sign_in: password
+      runtime: {user: hermes, uid: 1000, home: /home/hermes, hermes_home: /home/hermes/.hermes}
+  - hostname: h-af
+    update_policy: protected
+    desktop_gateway:
+      label: h-af
+      admission: pending-qualification
+      g3_marker: deferred
+      dashboard_vehicle: preserved-node
+      endpoint: null
+      native_sign_in: password
+      runtime: {user: root, uid: 0, home: /root, hermes_home: /root/.hermes}
+  - hostname: h-mini
+    update_policy: eligible
+    desktop_gateway:
+      label: h-mini
+      admission: admitted
+      dashboard_vehicle: module97
+      endpoint: https://h-mini.example.test
+      native_sign_in: password
+      runtime: {user: danz, home: /Users/dan_1, hermes_home: /Users/dan_1/.hermes}
+  - hostname: h-mini2
+    update_policy: eligible
+    desktop_gateway:
+      label: h-mini2
+      admission: admitted
+      dashboard_vehicle: module97
+      endpoint: https://h-mini2.example.test
+      native_sign_in: password
+      runtime: {user: dano, home: /Users/dano, hermes_home: /Users/dano/.hermes}
+  - hostname: h-air
+    update_policy: eligible
+    desktop_gateway:
+      label: h-air
+      admission: admitted
+      dashboard_vehicle: module97
+      endpoint: https://h-air.example.test
+      native_sign_in: password
+      runtime: {user: danz, home: /Users/danz, hermes_home: /Users/danz/.hermes}
+  - hostname: h-air2
+    update_policy: eligible
+    desktop_gateway:
+      label: h-air2
+      admission: pending-qualification
+      dashboard_vehicle: module97
+      endpoint: null
+      native_sign_in: password
+      runtime: {user: dano, home: /Users/dano, hermes_home: /Users/dano/.hermes}

@@ -12,7 +12,8 @@ if ! tier_allows R || is_skipped dashboard-server; then
 fi
 platform=linux
 [[ "$OS" != macos ]] || platform=macos
-hermes_executable="$(command -v hermes)"
+# A held row returns successfully even before a runtime has been installed.
+hermes_executable="$(command -v hermes || true)"
 # Resolve PyYAML in the invoking runtime's environment before sudo resets it.
 py="$(command -v python3)"
 hermes_python="$("$py" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent / "python3")' "$hermes_executable")"

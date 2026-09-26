@@ -27,6 +27,8 @@ def main():
     elif args.action == 'verify':
         if policy != 'protected':
             print('not-applicable (eligible or legacy Intent)')
+        elif marker.deferred(record):
+            print('deferred (not protected; convergence reconciliation pending)')
         else:
             path = rooted(args.root, marker.MARKER)
             data = json.loads(path.read_text())

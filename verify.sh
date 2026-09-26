@@ -266,7 +266,9 @@ verify_run_check() {
   out="$(eval "$cmd" 2>&1)"
   rc=$?
   first="$(printf '%s\n' "$out" | sed '/^[[:space:]]*$/d; q')"
-  if [[ "$rc" -eq 0 ]]; then
+  if [[ "$rc" -eq 0 && "$first" == 'deferred ('* ]]; then
+    printf 'deferred\t\t%s\n' "$first"
+  elif [[ "$rc" -eq 0 ]]; then
     printf 'ok\t%s\t%s\n' "$first" "ok"
   else
     printf 'missing\t\t%s\n' "${first:-not found or failed}"
@@ -420,7 +422,7 @@ verify_json() {
 }
 
 verify_human() {
-  local entry name cmd result status
+  local entry name cmd result status detail
   for entry in "${HERMES_VERIFY_CHECKS[@]}"; do
     name="${entry%%|*}"
     entry="${entry#*|}"
@@ -436,10 +438,12 @@ verify_human() {
         printf 'ok: %s\n' "$name"
       fi
     else
+      detail='not found or failed'
+      [[ "$status" != deferred ]] || detail="${result##*$'\t'}"
       if declare -F warn >/dev/null 2>&1; then
-        warn "$name — not found or failed"
+        warn "$name — $detail"
       else
-        printf 'warn: %s — not found or failed\n' "$name"
+        printf 'warn: %s — %s\n' "$name" "$detail"
       fi
     fi
   done

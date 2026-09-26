@@ -41,7 +41,8 @@ class Fixtures(unittest.TestCase):
 
     def host(self, name, policy):
         return {'hostname': name, 'desktop_gateway': dict(label=name, admission='admitted',
-            runtime=self.runtime, endpoint=f'https://{name}.example.test', native_sign_in='password', update_policy=policy)}
+            runtime=self.runtime, endpoint=f'https://{name}.example.test', native_sign_in='password', update_policy=policy,
+            g3_marker='armed' if policy == 'protected' else 'deferred', dashboard_vehicle='preserved-node')}
 
     def write(self, name, data, mode=0o644):
         path = rooted(self.root, name)
@@ -244,6 +245,50 @@ class Fixtures(unittest.TestCase):
         with self.assertRaises(ValueError):
             marker.install(self.root, self.intent, 'mac')
 
+    def update_gateway(self, **fields):
+        intent = json.loads(self.intent.read_text())
+        intent['hosts'][0]['desktop_gateway'].update(fields)
+        self.intent.write_bytes(json_bytes(intent))
+
+    def test_deferred_marker_guard_covers_install_restore_and_preserves_existing_marker(self):
+        marker.install(self.root, self.intent, 'h-btp')
+        marker.maintenance(self.root, self.intent, 'h-btp', '/backup/marker', 'backup')
+        marker.maintenance(self.root, self.intent, 'h-btp', '/backup/marker', 'suspend')
+        self.update_gateway(g3_marker='deferred')
+        for present in (False, True):
+            if present:
+                self.write(marker.MARKER, marker.render('h-btp'), 0o600)
+            before = self.snapshot()
+            with self.assertRaisesRegex(marker.MarkerDeferred, 'refusing create'):
+                marker.install(self.root, self.intent, 'h-btp')
+            for action in ('restore', 'suspend'):
+                with self.assertRaisesRegex(marker.MarkerDeferred, 'refusing ' + action):
+                    marker.maintenance(self.root, self.intent, 'h-btp', '/backup/marker', action)
+            self.assertEqual(self.snapshot(), before)
+
+    def test_policy_cli_armed_install_and_restore_keep_existing_behavior(self):
+        for action in ('install', 'backup', 'suspend', 'restore'):
+            proc = subprocess.run([sys.executable, str(REPO / 'scripts/desktop-fleet-policy.py'), action,
+                '--registry', str(self.intent), '--host', 'h-btp', '--root', str(self.root)], capture_output=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            if action == 'suspend':
+                self.assertFalse(rooted(self.root, marker.MARKER).exists())
+        self.assertEqual(rooted(self.root, marker.MARKER).read_bytes(), marker.render('h-btp'))
+
+    def test_backup_cannot_rewrite_marker_via_backup_path(self):
+        self.write(marker.MARKER, marker.render('h-btp'), 0o644)
+        for state in ('deferred', 'armed'):
+            self.update_gateway(g3_marker=state)
+            before = self.snapshot()
+            with self.assertRaisesRegex(ValueError, 'backup must be a separate file'):
+                marker.maintenance(self.root, self.intent, 'h-btp', marker.MARKER, 'backup')
+            proc = subprocess.run([sys.executable, str(REPO / 'scripts/desktop-fleet-policy.py'), 'backup',
+                '--registry', str(self.intent), '--host', 'h-btp', '--root', str(self.root),
+                '--backup', marker.MARKER], capture_output=True, text=True)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn('backup must be a separate file', proc.stderr)
+            self.assertEqual(self.snapshot(), before)
+
     def apply_fixture(self):
         plan = json.loads((REPO / 'tests/fixtures/desktop-gateway-plan.json').read_text())
         exe = self.write(plan['runtime']['executable'], b'#!/bin/sh\nexit 0\n', 0o755)
@@ -280,6 +325,94 @@ class Fixtures(unittest.TestCase):
         state = json.loads(path.read_text())
         state.update(loaded=True, active=True, pid=41, need_reload=False, runtime=plan['runtime'])
         path.write_bytes(json_bytes(state))
+
+    def deferred_apply_fixture(self):
+        plan, path, env = self.apply_fixture()
+        self.update_gateway(g3_marker='deferred')
+        del plan['prior_sha256'][marker.MARKER]
+        path.write_bytes(json_bytes(plan))
+        return plan, path, env
+
+    def test_deferred_apply_preparation_and_apply_omit_marker_and_preserve_existing_bytes(self):
+        plan, path, _ = self.deferred_apply_fixture()
+        for present in (False, True):
+            if present:
+                marker_path = self.write(marker.MARKER, b'pre-existing arbitrary marker\n', 0o600)
+                marker_before = (marker_path.read_bytes(), marker_path.stat().st_mtime_ns, apply.metadata(marker_path))
+            before = self.snapshot()
+            changes, *_ = apply.prepare(self.root, plan, self.intent, plan['dashboard_fields'])
+            self.assertNotIn(marker.MARKER, [item[0] for item in changes])
+            dry = self.run_apply(path, '--plan')
+            self.assertNotIn(marker.MARKER, [item.get('path') for item in dry['changes']])
+            self.assertEqual(self.snapshot(), before)
+            self.run_apply(path)
+            if present:
+                self.assertEqual((marker_path.read_bytes(), marker_path.stat().st_mtime_ns,
+                                  apply.metadata(marker_path)), marker_before)
+            else:
+                self.assertFalse(rooted(self.root, marker.MARKER).exists())
+            self.healthy_apply_fixture(plan)
+
+    def test_deferred_apply_refuses_hand_edited_or_stale_marker_plan_without_any_writes(self):
+        plan, path, _ = self.deferred_apply_fixture()
+        # An old armed plan, or a manually added marker prior hash, cannot authorize it.
+        plan['prior_sha256'][marker.MARKER] = None
+        path.write_bytes(json_bytes(plan))
+        before = self.snapshot()
+        with self.assertRaisesRegex(marker.MarkerDeferred, 'planned marker change'):
+            apply.prepare(self.root, plan, self.intent, {})
+        for args in ((), ('--plan',)):
+            result = self.run_apply(path, *args, ok=False)
+            self.assertIn('G3 marker deferred', result.stderr)
+            self.assertEqual(self.snapshot(), before)
+        del plan['prior_sha256'][marker.MARKER]
+        plan['changes'] = [{'action': 'create', 'path': marker.MARKER}]
+        path.write_bytes(json_bytes(plan))
+        before = self.snapshot()
+        self.run_apply(path, ok=False)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_apply_guard_rechecks_prepared_marker_changes_before_any_writes(self):
+        plan, path, _ = self.deferred_apply_fixture()
+        prepared = apply.prepare(self.root, plan, self.intent, {})
+        prepared[0].append((marker.MARKER, None, marker.render('h-btp'), 0o644, None, None))
+        argv = ['apply', '--root', str(self.root), '--registry', str(self.intent), '--plan-file', str(path)]
+        before = self.snapshot()
+        with patch.object(sys, 'argv', argv), patch.object(apply, 'prepare', return_value=prepared), \
+             patch.object(sys, 'stdout', new_callable=io.StringIO), \
+             patch.object(apply, 'atomic_write', side_effect=AssertionError('unexpected write')):
+            with self.assertRaisesRegex(marker.MarkerDeferred, 'apply marker change'):
+                apply.main()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_preserved_apply_vehicle_and_admission_are_mutation_gates(self):
+        plan, path, _ = self.deferred_apply_fixture()
+        for vehicle, state, flags, expected in (
+                ('module97', 'admitted', (), 'dashboard_vehicle'),
+                (None, 'admitted', ('--qualify',), 'dashboard_vehicle'),
+                ('preserved-node', 'deferred', (), 'dashboard held'),
+                ('preserved-node', 'deferred', ('--qualify',), 'dashboard held'),
+                ('preserved-node', 'pending-qualification', (), '--qualify')):
+            self.update_gateway(dashboard_vehicle=vehicle, admission=state, endpoint=None)
+            before = self.snapshot()
+            with self.assertRaisesRegex(apply.ApplyHeld, expected):
+                apply.prepare(self.root, plan, self.intent, {}, bool(flags))
+            result = self.run_apply(path, *flags, ok=False)
+            self.assertIn(expected, result.stderr)
+            self.assertEqual(self.snapshot(), before)
+        self.update_gateway(dashboard_vehicle='preserved-node', admission='pending-qualification')
+        before = self.snapshot()
+        dry = self.run_apply(path, '--qualify', '--plan')
+        self.assertEqual(self.snapshot(), before)
+        self.assertTrue(any(item['action'] == 'start' for item in dry['changes']))
+        self.assertNotIn(marker.MARKER, [item.get('path') for item in dry['changes']])
+        self.assertEqual(self.run_apply(path, '--qualify'), dry)
+        self.assertFalse(rooted(self.root, marker.MARKER).exists())
+        # Admission lives in current Intent, not in a previously reviewed plan.
+        self.update_gateway(admission='deferred')
+        before = self.snapshot()
+        self.run_apply(path, '--qualify', ok=False)
+        self.assertEqual(self.snapshot(), before)
 
     def test_apply_plan_exact_output_no_mutation_and_noop(self):
         plan, path, env = self.apply_fixture()

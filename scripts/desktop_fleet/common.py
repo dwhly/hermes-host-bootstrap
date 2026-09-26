@@ -178,7 +178,20 @@ def update_policy(record, *, legacy=False):
         raise ValueError('Intent update policy is missing or invalid; refusing update')
     if len(set(policies)) != 1:
         raise ValueError('conflicting Intent update policies; refusing operation')
+    # A policy declaration itself makes this a declared rollout, even without complete.
+    state = gateway.get('g3_marker')
+    if ('g3_marker' in gateway or policies[0] == 'protected') and state not in ('deferred', 'armed'):
+        raise ValueError('desktop_gateway.g3_marker is missing or invalid; expected deferred or armed')
+    if policies[0] == 'eligible' and state == 'armed':
+        raise ValueError('eligible hosts must not declare desktop_gateway.g3_marker: armed')
     return policies[0]
+
+
+def admission(record):
+    state = gateway_record(record).get('admission')
+    if state not in ('admitted', 'pending-qualification', 'deferred'):
+        raise ValueError('desktop_gateway.admission is missing or invalid; refusing mutation')
+    return state
 
 
 def optional_host_record(registry, host, *, home=None, hermes_home=None):

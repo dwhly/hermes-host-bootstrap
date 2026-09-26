@@ -2,10 +2,27 @@
 import json
 from pathlib import Path
 
-from .common import atomic_write, digest, existing, host_record, json_bytes, rooted, update_policy
+from .common import atomic_write, digest, existing, gateway_record, host_record, json_bytes, rooted, update_policy
 
 MARKER = '/etc/hermes/image-provenance.json'
 OWNER = 'hermes-host-bootstrap/desktop-fleet-gateways'
+
+
+class MarkerDeferred(ValueError):
+    """A deliberate marker hold, distinct from missing/invalid protection."""
+
+
+def deferred(record):
+    return update_policy(record) == 'protected' and gateway_record(record)['g3_marker'] == 'deferred'
+
+
+def guard(record, action):
+    """Every marker mutation, including recovery, must pass this guard."""
+    if update_policy(record) != 'protected':
+        raise ValueError('marker operations require registry-protected Intent')
+    if deferred(record):
+        raise MarkerDeferred(f'G3 marker deferred; refusing {action}; convergence reconciliation pending; '
+                             'any existing marker preserved')
 
 
 def render(host):
@@ -14,8 +31,7 @@ def render(host):
 
 
 def install(root, registry, host):
-    if update_policy(host_record(registry, host)) != 'protected':
-        raise ValueError('G3 is only installed for registry-protected hosts')
+    guard(host_record(registry, host), 'create')
     path = rooted(root, MARKER)
     # Preserve arbitrary existing bytes, including a malformed marker (upstream fails closed).
     if path.exists():
@@ -29,10 +45,15 @@ def maintenance(root, registry, host, backup, action):
     Back up any existing marker without altering it. Suspend only our exact marker.
     Restore exact saved bytes; an intervening marker is never overwritten.
     """
-    if update_policy(host_record(registry, host)) != 'protected':
+    record = host_record(registry, host)
+    if update_policy(record) != 'protected':
         raise ValueError('maintenance requires protected Intent')
+    if action in ('restore', 'suspend'):
+        guard(record, action)
     path = rooted(root, MARKER)
     backup = rooted(root, backup)
+    if backup == path:
+        raise ValueError('marker backup must be a separate file; existing marker preserved')
     current = existing(path)
     saved = existing(backup)
     metadata_path = rooted(root, "/" + str(backup.relative_to(root)) + ".metadata.json")

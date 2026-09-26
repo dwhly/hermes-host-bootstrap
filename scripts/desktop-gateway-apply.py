@@ -17,8 +17,8 @@ import stat
 import subprocess
 import sys
 
-from desktop_fleet.common import (atomic_write, digest, existing, host_record, json_bytes,
-                                  load, rooted, update_policy)
+from desktop_fleet.common import (admission, atomic_write, digest, existing, gateway_record, host_record,
+                                  json_bytes, load, rooted, update_policy)
 from desktop_fleet import dashboard, marker
 
 AUTH_KEYS = {'HERMES_DASHBOARD_BASIC_AUTH_PASSWORD', 'HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH',
@@ -92,14 +92,34 @@ def runtime_check(root, plan):
     return fixture, int(groups[0][2])
 
 
-def prepare(root, plan, registry, fields):
-    if plan['schema'] != 1:
-        raise ValueError('unsupported apply schema')
+class ApplyHeld(ValueError):
+    """Safe-to-report admission/vehicle refusal, without projected values."""
+
+
+def authorize(plan, registry, qualify=False):
     record = host_record(registry, plan['host'])
     if update_policy(record) != 'protected':
         raise ValueError('preserved-node vehicle requires protected Intent')
-    if record.get('desktop_gateway', {}).get('runtime') != plan['runtime']:
+    if gateway_record(record).get('dashboard_vehicle') != 'preserved-node':
+        raise ApplyHeld('dashboard_vehicle must be preserved-node; refusing apply')
+    state = admission(record)
+    if state == 'deferred' or (state == 'pending-qualification' and not qualify):
+        raise ApplyHeld('dashboard held: admission ' + state +
+                        ('; explicit --qualify required' if state == 'pending-qualification' else '; no apply allowed'))
+    # prior_sha256 is the reviewed set of possible file replacements. A deferred
+    # plan must omit the marker, including stale plans prepared while armed.
+    if marker.deferred(record) and marker.MARKER in plan['prior_sha256']:
+        marker.guard(record, 'planned marker change')
+    if gateway_record(record).get('runtime') != plan['runtime']:
         raise ValueError('runtime differs from registry Intent')
+    return record
+
+
+def prepare(root, plan, registry, fields, qualify=False):
+    if plan['schema'] != 1 or set(plan) - {'schema', 'host', 'runtime', 'supervisor', 'bind', 'port',
+                                         'dashboard_fields', 'prior_sha256'}:
+        raise ValueError('unsupported apply schema or fields')
+    record = authorize(plan, registry, qualify)
     fixture, gid = runtime_check(root, plan)
     runtime = plan['runtime']
     service = plan['supervisor']['service']
@@ -130,7 +150,8 @@ def prepare(root, plan, registry, fields):
         old_env = existing(env_path)
         targets[env] = (project_env(old_env, fields), metadata(env_path)['mode'] if old_env is not None else 0o600)
     # Preserve any existing marker, byte for byte. Only install a missing marker.
-    if not rooted(root, marker.MARKER).exists():
+    if not marker.deferred(record) and not rooted(root, marker.MARKER).exists():
+        marker.guard(record, 'create')
         targets[marker.MARKER] = (marker.render(plan['host']), 0o644)
     changes = []
     for name, (data, mode) in targets.items():
@@ -155,6 +176,8 @@ def main():
     p.add_argument('--registry', required=True)
     p.add_argument('--dashboard-env', help='host-local projected dashboard assignments; never printed')
     p.add_argument('--plan', action='store_true', help='read-only: print exact file and service actions')
+    p.add_argument('--qualify', action='store_true',
+                   help='explicitly allow pending-qualification service setup for stage-5 checks; never deferred admission')
     p.add_argument('--root', default='/', help='fixture root; service calls disabled when not /')
     a = p.parse_args()
     root = Path(a.root).absolute()
@@ -172,7 +195,7 @@ def main():
             fields[key] = value
     if any(not isinstance(v, str) or any(c in v for c in '\r\n\0') for v in fields.values()):
         raise ValueError('dashboard values must be single-line strings')
-    changes, supervisor, state, fixture, gid = prepare(root, plan, a.registry, fields)
+    changes, supervisor, state, fixture, gid = prepare(root, plan, a.registry, fields, a.qualify)
     backup_dir = '/var/backups/hermes-desktop/' + digest(Path(a.plan_file).read_bytes())[:16]
     pending_path = rooted(root, '/var/lib/hermes-desktop/' + supervisor.service + '.refresh-pending')
     pending = existing(pending_path) is not None
@@ -204,6 +227,11 @@ def main():
     print(json.dumps({'host': plan['host'], 'changes': actions, 'noop': not actions}, sort_keys=True))
     if a.plan or not actions:
         return
+    # Re-read authorization at the mutation boundary. Never trust a saved change
+    # set to carry permission to write a marker (or to mutate a newly held row).
+    record = authorize(plan, a.registry, a.qualify)
+    if any(name == marker.MARKER for name, *_ in changes):
+        marker.guard(record, 'apply marker change')
     # Catch writes since prepare before starting, and again at each replacement.
     for name, old, _, _, _, info in changes:
         path = rooted(root, name)
@@ -218,6 +246,8 @@ def main():
             atomic_write(rooted(root, backup_dir + name + '.metadata.json'),
                          json_bytes(dict(info, sha256=digest(old))), 0o600)
     for name, old, data, mode, owner, info in changes:
+        if name == marker.MARKER:
+            marker.guard(host_record(a.registry, plan['host']), 'create')
         path = rooted(root, name)
         if existing(path) != old or (old is not None and metadata(path) != info):
             raise ValueError('concurrent file change; refusing replacement')
@@ -234,5 +264,7 @@ def main():
 if __name__ == '__main__':
     try:
         main()
+    except (ApplyHeld, marker.MarkerDeferred) as exc:
+        sys.exit('desktop-gateway-apply: ' + str(exc))
     except (OSError, ValueError, KeyError, TypeError, ImportError, subprocess.SubprocessError):
         sys.exit('desktop-gateway-apply: preflight/apply failed; files may need recovery if apply began; no secret values logged')
