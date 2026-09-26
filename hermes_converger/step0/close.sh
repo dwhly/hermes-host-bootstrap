@@ -29,25 +29,50 @@ if [ "${1:-}" = --plan ]; then
       'No later sudo grant is needed; do not restore the grants. Unreachable Mac: same closure from an administrator console.'
     exit 0
 fi
+preflight=no
+if [ "${1:-}" = --preflight ] && [ "$#" = 1 ]; then preflight=yes; shift; fi
 [ "$#" = 0 ] || { echo 'chief closure: arguments refused' >&2; exit 2; }
 # The public launcher has already checked the full payload tree. Direct root
 # installation must use the reviewed root-owned tree, never a login checkout.
 BASE=/opt/chief/lib/hermes-host-bootstrap/hermes_converger/step0
+if [ "$preflight" = yes ]; then
+    case "$0" in /*/close.sh) BASE=${0%/*};; *) echo 'preflight requires an absolute reviewed script path' >&2; exit 2;; esac
+fi
 # shellcheck source=hermes_converger/step0/trust.sh
 . "$BASE/trust.sh"
+OS=$(/usr/bin/uname -s)
+STATE=/var/lib/chief/currency-step0
+if [ "$preflight" = yes ]; then
+    trusted_path "$BASE/preflight.sh" || exit 1
+    # shellcheck source=hermes_converger/step0/preflight.sh
+    . "$BASE/preflight.sh"
+    closure_preflight
+    exit $?
+fi
 [ "$(/usr/bin/id -u)" = 0 ] || { hold 'root required'; exit 1; }
 trusted_tree /opt/chief/lib/hermes-host-bootstrap/hermes_converger || exit 1
 trusted_path /opt/chief/bin || exit 1
-OS=$(/usr/bin/uname -s)
-STATE=/var/lib/chief/currency-step0
 
 # shellcheck source=hermes_converger/step0/contain.sh
 . "$BASE/contain.sh"
 
 # Keep all output in a root log even after the SSH pipe disappears. A final
 # receipt is also sent to the original caller when that fd remains available.
-trusted_path /var/run
-lock=/var/run/chief-currency-closure.lock
+lock=/run/chief-currency-closure.lock
+if [ "$OS" = Darwin ]; then
+    # /var/run is intentionally group-writable on macOS. Never trust it.
+    for dir in /var/lib /var/lib/chief; do
+        trusted_path "${dir%/*}"
+        [ -e "$dir" ] || /usr/bin/install -d -o root -m 0755 "$dir"
+        trusted_path "$dir"
+    done
+    lock=/var/lib/chief/chief-currency-closure.lock
+    boot_id=$(/usr/sbin/sysctl -n kern.boottime) || exit 1
+else
+    boot_id=$(/bin/cat /proc/sys/kernel/random/boot_id) || exit 1
+fi
+[ -n "$boot_id" ] || { hold missing_boot_identity; exit 1; }
+trusted_path "${lock%/*}"
 if ! /bin/mkdir "$lock" 2>/dev/null; then
     trusted_path "$lock"
     # mkdir and pid publication are separate syscalls. Give a new holder time.
@@ -55,13 +80,19 @@ if ! /bin/mkdir "$lock" 2>/dev/null; then
     holder=0
     [ ! -f "$lock/pid" ] || read -r holder < "$lock/pid" || holder=0
     case "$holder" in ''|*[!0-9]*) holder=0;; esac
-    if [ "$holder" != 0 ] && kill -0 "$holder" 2>/dev/null; then
+    # Unknown boot on an older live holder remains busy; an explicit boot
+    # mismatch permits reclaim even when the PID has been reused.
+    holder_boot=''
+    [ ! -f "$lock/boot" ] || IFS= read -r holder_boot < "$lock/boot" || holder_boot=''
+    if { [ "$holder_boot" = "$boot_id" ] || [ -z "$holder_boot" ]; } &&
+       [ "$holder" != 0 ] && kill -0 "$holder" 2>/dev/null; then
         printf 'closure already running; revocation pending\n'
         exit 75
     fi
     /bin/rm -rf "$lock"
     /bin/mkdir "$lock" || exit 1
 fi
+printf '%s\n' "$boot_id" > "$lock/boot"
 printf '%s\n' "$$" > "$lock/pid"
 cleanup() { /bin/rm -rf "$lock"; }
 trusted_path /var/log

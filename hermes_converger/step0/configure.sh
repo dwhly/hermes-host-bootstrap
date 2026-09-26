@@ -50,6 +50,7 @@ configure_node_env() {
     [ ! -e /etc/chief/node.env ] || return 0
     # Preserved owner files are never seeded or repaired by foundation closure.
     case "$id" in h-af|h-btp) hold preserved_node_config_missing; return 1;; esac
+    [ "${1:-}" != --check ] || return 0
     tmp=$(/usr/bin/mktemp /etc/chief/.node-env.XXXXXX)
     {
         printf 'CHIEF_NODE_ID=%s\nCHIEF_CORE_URL=%s\n' "$id" "$core"

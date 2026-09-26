@@ -75,6 +75,7 @@ runtime.os.uname = lambda: types.SimpleNamespace(sysname={platform!r})
 runtime.grp.getgrnam = lambda name: types.SimpleNamespace(gr_gid=os.getgid())
 runtime.os.chown = lambda *args: None
 core.IS_MACOS = {platform == 'Darwin'!r}
+core.RUN_BASE = {str(self.root / ('var/lib' if platform == 'Darwin' else 'run'))!r}
 supervisor.sys_platform = lambda: {'darwin' if platform == 'Darwin' else 'linux'!r}
 supervisor._launchd_target = lambda token,label: 'gui/502/'+label
 core._resolve_tool = supervisor._resolve_tool = lambda name: {str(self.bin)!r}+'/'+name
@@ -92,7 +93,7 @@ core.HostOps.poll_runtime_ack = lambda *a,**k: {{'method':'fixture'}}
 supervisor.SupervisorTransport.emit_health = lambda self,payload: record('health '+payload['status'])
 '''
         wrapper = self.bin / "python"
-        wrapper.write_text('#!'+sys.executable+'\nimport sys\nexec('+repr(prelude)+'+sys.argv[-1])\n')
+        wrapper.write_text('#!'+sys.executable+'\nimport sys\nsys.dont_write_bytecode = True\nindex = sys.argv.index("-c")\ncode = sys.argv[index + 1]\nsys.argv = ["-c", *sys.argv[index + 2:]]\nexec('+repr(prelude)+'+code)\n')
         wrapper.chmod(0o755)
         self.trust = f'''set -eu
 TRUST_OS={platform}
@@ -125,6 +126,7 @@ hold() {{ HOLD_REASON=$*; echo "HOLD: $*" >&2; return 1; }}
                 b = body.index('remove_grants() {', a)
                 body = body[:a] + self.trust + body[b:]
                 source = source[:start] + ' '.join(shlex.quote(v) for v in args[:-1]) + ' ' + shlex.quote(body) + '\n'
+                source = source.replace("'CHIEF_LEGACY_ENTRY=$legacy'", 'CHIEF_LEGACY_ENTRY="$legacy"')
             source = source.replace(str(self.root), '@HOST@')
             source = re.sub('|'.join(re.escape(d) for d in dirs), lambda m: '@HOST@'+m[0], source)
             source = source.replace('@HOST@@HOST@', '@HOST@').replace('@HOST@', str(self.root))

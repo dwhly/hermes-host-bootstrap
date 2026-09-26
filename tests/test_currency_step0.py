@@ -379,7 +379,7 @@ def test_closure_without_python_repairs_config_disables_jobs_and_revokes_last(tm
     base=host/'opt/chief/lib/hermes-host-bootstrap/hermes_converger/step0'
     shutil.copytree(PAYLOAD,base)
     for name in ('usr/local/bin','opt/chief/bin','etc/chief','etc/sudoers.d','Library/LaunchDaemons','Library/LaunchAgents',
-                 'etc/systemd/system','usr/lib/systemd','var/lib','var/log','var/run'):
+                 'etc/systemd/system','usr/lib/systemd','var/lib','var/log','var/run','run'):
         (host/name).mkdir(parents=True,exist_ok=True)
     policy=host/'etc/sudoers'
     policy.write_text('root ALL=(ALL) ALL\n@includedir '+str(host/'etc/sudoers.d')+'\n'); policy.chmod(0o440)
@@ -393,11 +393,11 @@ def test_closure_without_python_repairs_config_disables_jobs_and_revokes_last(tm
         (override/'unsafe.conf').write_text('[Service]\nExecStart=/login/venv/python\n')
     log=tmp_path/'commands'
     bin=tmp_path/'bin'; bin.mkdir()
-    commands=['/usr/bin/id','/usr/bin/uname','/bin/hostname','/usr/bin/getent','/usr/sbin/groupadd',
+    commands=['/usr/bin/id','/usr/bin/uname','/usr/sbin/sysctl','/bin/hostname','/usr/bin/getent','/usr/sbin/groupadd',
               '/usr/bin/dscl','/usr/sbin/dseditgroup','/usr/bin/systemctl','/bin/launchctl','/usr/sbin/chown','/bin/chown','/usr/bin/sudo','/bin/sync']
     for command in commands:
         name=command.rsplit('/',1)[1]
-        output={'id':'0','uname':platform,'hostname':hostname}.get(name,'')
+        output={'id':'0','uname':platform,'hostname':hostname,'sysctl':'fixture-boot'}.get(name,'')
         (bin/name).write_text('#!/bin/sh\nprintf "%s\\n" '+shlex.quote(name)+'" $*" >> '+shlex.quote(str(log))+'\nprintf "%s\\n" '+shlex.quote(output)+'\n')
         (bin/name).chmod(0o755)
     installer=bin/'install'
@@ -415,7 +415,7 @@ subprocess.run(['/usr/bin/install',*args],check=True)
     validator.chmod(0o755)
     for path in (base/'close.sh',base/'contain.sh',base/'configure.sh'):
         source=path.read_text()
-        for directory in ('/opt/','/usr/local/','/var/lib','/var/log','/var/run','/Library/','/usr/lib/systemd','/etc/'):
+        for directory in ('/opt/','/usr/local/','/var/lib','/var/log','/var/run','/run/','/Library/','/usr/lib/systemd','/etc/'):
             source=source.replace(directory,str(host)+directory)
         tool_pattern='|'.join(re.escape(c) for c in sorted([*commands,'/usr/bin/install','/usr/sbin/visudo'],key=len,reverse=True))
         source=re.sub(tool_pattern,lambda m:str(bin/m.group().rsplit('/',1)[1]),source)

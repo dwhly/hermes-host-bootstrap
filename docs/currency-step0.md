@@ -1,4 +1,4 @@
-# Fleet currency Step 0 / A0 — fix round 3
+# Fleet currency Step 0 / A0 — fix round 4
 
 Step 0 closes the legacy privilege grants and retains the existing authenticated,
 six-artifact converger. Success requires active root readers, boss check-ins,
@@ -7,6 +7,35 @@ are a failed rollout**, even if containment succeeded. No rollout has been run b
 these fixtures. Phases A–D, new package adapters and HMAC retirement remain outside
 this change. Gate-2 §8 governs h-af/h-btp: foundation closure applies; their vaults,
 credentials, cron, local code/config and owner workloads are preserved.
+
+## Mandatory first step on every host
+
+Before any bridge, closure, archive installation or administrator update, run
+`close.sh --preflight` from a **reviewed root-owned payload** in a clean root
+shell. This applies to every Mac and Linux host, including h-mini2 retries and
+preserved h-af/h-btp. Use an absolute path to the reviewed script; preflight can
+run from a private extracted review directory before `/opt/chief` exists:
+
+```sh
+# currency_review is the administrator's verified, root-owned extracted payload.
+/bin/sh "$currency_review/hermes_converger/step0/close.sh" --preflight
+```
+
+Require exit 0 and retain the complete output before proceeding. This mode
+collects trust/path, isolated interpreter/import, hostname/host-contracts,
+config/allowlist, original and rendered sudo policy, effective grants, lock and
+job-definition holds. It checks prospective destinations against their existing
+parent chains. It never writes files, takes a lock, populates the trust cache,
+rotates logs, installs/stops jobs or revokes grants. Rendered policy goes through
+`visudo -c -f -` on stdin. Missing required tools or unavailable dependent checks
+hold. Resolve **all** printed reasons, then repeat preflight. A pass describes
+the current files and policy; closure still repeats its checks and can fail if
+state changes or an activation command fails.
+
+For an already installed reviewed build, the command is:
+`/bin/sh /opt/chief/lib/hermes-host-bootstrap/hermes_converger/step0/close.sh --preflight`.
+Do not use the older canary's installed script for this gate. Extract the new
+reviewed build first. The fixed public launchers still accept no arguments.
 
 ## Before delivery
 
@@ -54,7 +83,8 @@ trusted_path /usr/local/lib/hermes-host-bootstrap
 Replace `<review dir>` with the extracted reviewed payload's parent. Record the
 real CLT import result, not just its version. `/bin/hostname` must resolve through
 `host-contracts.json`, especially on h-mini2 before node.env exists. Confirm ioreg
-prints `"SystemPowerStateCapabilities"` on **every** Mac, including headless minis.
+prints a parseable `"System Capabilities"` bitmask (legacy
+`"SystemPowerStateCapabilities"` is an absence-only fallback), including headless minis.
 Inspect expanded sudo policy: stop closure if any remaining passwordless `ALL`,
 wildcard or directory rule reaches a Chief root entry. Qualify `sudo -ll -U` on
 the host's sudo version, including a known no-rules user: a nonzero result holds
@@ -117,8 +147,11 @@ ssh -o BatchMode=yes -o ConnectTimeout=15 "$currency_target" \
 ```
 
 The shim on the last command verifies the legacy payload and copies it to the
-fixed `/opt/chief` home. New plists/units reference only that home. No post-closure
-operation depends on a retained passwordless grant. Legacy schedulers that pass
+fixed `/opt/chief` home. An explicit legacy invocation before `prepared` exists
+refreshes a previously copied payload, including h-mini2 after the `/var/run`
+hold; fixed installed readers never select a legacy copy. After preparation,
+repeat invocations resume the existing closure/readers. New plists/units reference
+only that home. No post-closure operation depends on a retained passwordless grant. Legacy schedulers that pass
 arguments are refused until closure installs the new argv-free definitions.
 Freeze reviewed `main` before step 1 and compare immediately. The login-user
 xcrun digest detects drift only; the trusted-root `/opt` digest in the completion
@@ -260,14 +293,44 @@ passes the unchanged signature/digest/freshness checks. No manually edited or
 re-signed cached plan is an activation method. This companion patch is an explicit
 rollout dependency, not a claim that Core is already deployed.
 
-The classifier candidate reads IOPMrootDomain `SystemPowerStateCapabilities` CPU
-and graphics bits, rather than physical display power. It can admit a headless Mac.
+The classifier reads IOPMrootDomain `"System Capabilities"` as a decimal bitmask:
+CPU=1, Graphics=2, Audio=4, Network=8. CPU **and** Graphics must be present
+(`caps & 3 == 3`); Audio/Network alone never admit a wake. These are system
+capabilities, independent of physical display power, so the classifier can
+recognize a headless mini.
+Only absence of the primary key permits `SystemPowerStateCapabilities` fallback;
+malformed primary values remain report-only. The real 26.5.2, 26.3.1 and 15.6.1
+captures in `tests/fixtures/macos-paths-ioreg.txt` all contain 15 and no legacy key.
+`IOPMUserTriggeredFullWake`, `Wake Type`, `Wake Reason` and `SleepWakeUUID` are
+not admission signals: this snapshot does not prove they describe current
+capabilities rather than wake history. Both shell and Python use the same rule.
 Unknown output, unqualified policy and dark wake defer mutation while health and
 check-ins continue. Mutations recheck the wake epoch, signed-plan freshness and
 power capability; a wake change during a run requires the next pulse to reauthorize.
 Qualify on headless h-mini2, h-air2 and h-mini: the paired Q6 runs, full/dark wakes,
 network returns, sleep races, latency, CPU/RSS and battery gates are still mandatory.
 The fixture is not live Apple Silicon or battery evidence.
+
+macOS `/var/run` (`/private/var/run`) is `root:daemon 0775` on all three measured
+OS versions. Trust still rejects every group-writable directory; there is no
+`daemon` exception. The closure lock now lives at
+`/var/lib/chief/chief-currency-closure.lock`, reconciliation at
+`/var/lib/chief/reconcile.lock`, leases at `/var/lib/chief/convergence`, and the
+runtime-stamp default at `/var/lib/chief/runtime`. These use trusted root-writable
+parent chains. Configure any runtime-stamp producer to the matching new path
+through its owner release process; this closure does not rewrite owner jobs.
+Linux uses `/run` for locks and `/run/chief/runtime` for runtime stamps.
+
+The audit also covers the shared worker/supervisor `run.lock`, trust cache, pulse
+boot/wake/online/check stamps and supervisor targets under
+`/var/lib/chief/currency-step0`; journals/restart limits under
+`/var/lib/chief/converger`; request slots under `/var/lib/chief/requests`; and
+update staging under `/opt/chief/lib`. No macOS root runtime writer uses
+`/var/run`. Persistent closure locks record `kern.boottime` alongside the PID:
+a live PID retains the lock on the same boot (or conservatively when an older
+holder has no boot record). Explicit old-boot PID reuse and dead holders are reclaimed. Python's flock locks are released by the kernel on
+exit/reboot even though their files persist; pulse boot identity and the trust
+cache also invalidate old boot observations.
 
 Supervisor cadence is 60 seconds. Between five-minute health reports, shell checks
 all resolved targets with launchctl/systemctl/Docker. Python records the observed

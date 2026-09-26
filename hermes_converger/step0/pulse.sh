@@ -19,11 +19,28 @@ unknown'
 '}
     full=no
     power=$(/usr/sbin/ioreg -r -n IOPMrootDomain -d 1) || power=''
-    case "$power" in
-        *'"SystemPowerStateCapabilities" = '*)
-            caps=${power#*'"SystemPowerStateCapabilities" = '}
-            caps=${caps%%[!0-9]*}
-            case "$caps" in ''|*[!0-9]*) ;; *) [ $((caps & 3)) -ne 3 ] || full=yes;; esac;;
+    # Match complete numeric values, with the real key taking precedence.
+    # CPU=1 Graphics=2 Audio=4 Network=8; no display-power or wake-history test.
+    caps='' legacy=''
+    primary=no
+    while IFS= read -r row; do
+        row=${row#"${row%%[![:space:]]*}"}
+        case "$row" in
+            '"System Capabilities"'*=*) caps=${row#*=}; primary=yes;;
+            '"SystemPowerStateCapabilities"'*=*) legacy=${row#*=};;
+        esac
+    done <<EOF
+$power
+EOF
+    [ "$primary" = yes ] || caps=$legacy
+    caps=${caps#"${caps%%[![:space:]]*}"}
+    caps=${caps%"${caps##*[![:space:]]}"}
+    case "$caps" in ''|*[!0-9]*) ;; *)
+        if [ "${#caps}" -le 5 ]; then
+            # Strip leading zeroes before POSIX shell arithmetic (octal).
+            while [ "${caps#0}" != "$caps" ]; do caps=${caps#0}; done
+            [ $(( ${caps:-0} & 3 )) -ne 3 ] || full=yes
+        fi;;
     esac
 else
     IFS= read -r boot < /proc/sys/kernel/random/boot_id

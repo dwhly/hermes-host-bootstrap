@@ -18,8 +18,8 @@ STATE = pathlib.Path("/var/lib/chief/currency-step0")
 HINTS = pathlib.Path("/var/lib/chief/requests")
 
 
-def configure():
-    config = load_config()
+def configure(config=None, *, check_only=False):
+    config = load_config() if config is None else config
     user = config["CHIEF_RUNTIME_USER"]
     allow = pathlib.Path("/etc/chief/supervisor-allowlist.json")
     node = config["CHIEF_NODE_ID"]
@@ -34,6 +34,8 @@ def configure():
         trusted_path(allow)
         data = json.loads(allow.read_text())
         repair = os.uname().sysname == "Darwin" and (data == legacy or data == {"units": legacy})
+    if check_only:
+        return
     if not allow.exists() or repair:
         node = config["CHIEF_NODE_ID"]
         units = ["chief-node", "chief-loop-watchdog", "chief-core"] if node == "h-do1" else ["chief-node"]
@@ -84,13 +86,19 @@ def full_wake(qualified: bool = False) -> bool:
         return True
     if not qualified:
         return False
-    # IOPMrootDomain graphics capability is independent of display power and
-    # permits headless classification. Unknown output fails closed. Q6 must qualify
-    # this candidate on each hardware class before signing wake_qualified.
+    # Capability bits describe the system, not physical display power. Require
+    # CPU (1) + Graphics (2); Audio (4) and Network (8) do not admit a wake.
+    # Prefer the real Mac key; only an absent key permits the legacy fallback.
     result = subprocess.run(["/usr/sbin/ioreg", "-r", "-n", "IOPMrootDomain", "-d", "1"],
                             capture_output=True, text=True, timeout=5, check=False)
-    match = re.search(r'"SystemPowerStateCapabilities"\s*=\s*(\d+)', result.stdout)
-    return result.returncode == 0 and match is not None and int(match[1]) & 3 == 3
+    if result.returncode != 0:
+        return False
+    for key in ("System Capabilities", "SystemPowerStateCapabilities"):
+        match = re.search(r'^\s*"' + key + r'"\s*=([^\n]*)$', result.stdout, re.MULTILINE)
+        if match:
+            value = match[1].strip()
+            return bool(re.fullmatch(r"[0-9]{1,5}", value)) and int(value) & 3 == 3
+    return False
 
 
 def qualified_plan(plan) -> bool:

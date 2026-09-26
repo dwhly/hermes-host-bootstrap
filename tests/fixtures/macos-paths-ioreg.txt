@@ -1,0 +1,50 @@
+== dano@100.110.241.2
+26.5.2
+h-mini2
+root:wheel 755 /var
+root:wheel 755 /private/var
+root:daemon 775 /var/run
+root:wheel 755 /var/lib
+root:wheel 755 /var/lib/chief
+root:wheel 755 /opt
+root:wheel 755 /var/log
+      "Last Sleep Options" = {"Sleep Reason"="Dark Wake Thermal Emergency"}
+      "Wake Type" = "UserActivity Assertion"
+      "IOPMUserTriggeredFullWake" = Yes
+      "Supported Features" = {"SleepServiceWakeCalendarKey"=33095687,"MaintenanceWakeCalendarDate"=33030151,"TimeZoneOffsetSeconds"=33423367,"PowerByCalendarDate"=33161223,"PowerRelativeToShutdown"=33292295,"WakeOnMagicPacket"=(33488901,33619975),"Automatic Restart On Power Connect"=32899077,"WakeRelativeToSleep"=33226759,"Automatic Restart On Power Loss"=32833541,"AdaptiveDimming"=33357831,"WakeByCalendarDate"=32964615}
+      "System Capabilities" = 15
+      "Wake Reason" = "smc.sysState.Wake(0x70070000) wifibt SMC.OutboxNotEmpty bluetooth-pcie"
+      "SleepWakeUUID" = "53A14CD8-B322-4AC3-8F04-F4AB164FE1C1"
+== danz@100.108.85.31
+26.3.1
+h-air.local
+root:wheel 755 /var
+root:wheel 755 /private/var
+root:daemon 775 /var/run
+root:wheel 755 /var/lib
+root:wheel 755 /var/lib/chief
+root:wheel 755 /opt
+root:wheel 755 /var/log
+      "Last Sleep Options" = {"Sleep Reason"="Notification Wake Back to Sleep"}
+      "Wake Type" = "UserActivity Assertion"
+      "IOPMUserTriggeredFullWake" = Yes
+      "Supported Features" = {"WakeByCalendarDate"=32899079,"MaintenanceWakeCalendarDate"=32964615,"SleepServiceWakeCalendarKey"=33030151,"PowerByCalendarDate"=33095687,"PowerRelativeToShutdown"=33226759,"WakeOnMagicPacket"=33423367,"WakeRelativeToSleep"=33161223,"AdaptiveDimming"=33292295,"Hibernation"=32833543}
+      "System Capabilities" = 15
+      "Wake Reason" = "MTP.DOCK.CHANNELS.AP0.IRQ RTP.keyboard"
+      "SleepWakeUUID" = "EBD1906F-D734-41E0-ADF2-26CAF2A646D7"
+== danz@100.121.213.125
+15.6.1
+h-mini
+root:wheel 755 /var
+root:wheel 755 /private/var
+root:daemon 775 /var/run
+root:wheel 755 /var/lib
+root:wheel 755 /var/lib/chief
+root:wheel 755 /opt
+root:wheel 755 /var/log
+      "Wake Type" = "UserActivity Assertion"
+      "IOPMUserTriggeredFullWake" = Yes
+      "Supported Features" = {"WakeByCalendarDate"=33030151,"MaintenanceWakeCalendarDate"=33095687,"SleepServiceWakeCalendarKey"=33161223,"PowerByCalendarDate"=33226759,"PowerRelativeToShutdown"=33357831,"WakeOnMagicPacket"=(33423365,33554439),"WakeRelativeToSleep"=33292295,"AdaptiveDimming"=32833543,"TimeZoneOffsetSeconds"=32899079,"Automatic Restart On Power Loss"=32964613}
+      "System Capabilities" = 15
+      "Wake Reason" = "smc.70070000 wifibt SMC.OutboxNotEmpty bluetooth-pcie"
+      "SleepWakeUUID" = "E8C73434-D382-4DC0-B344-EE7799019605"

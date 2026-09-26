@@ -51,10 +51,10 @@ MACOS_UNIT_MAP = {
 }
 DOCKER_TOKENS = {"chief-core"}
 MACOS_USER_AGENT_TOKENS = {"chief-node"}
-MACOS_RUNTIME_STAMP_DIR = pathlib.Path("/var/run/chief/runtime")
-# Volatile run dir base differs by OS: macOS has /var/run (no /run); Linux uses /run.
-# Keep ALL volatile convergence paths (lease lock, runtime stamp fallback) consistent.
-RUN_BASE = "/var/run" if IS_MACOS else "/run"
+MACOS_RUNTIME_STAMP_DIR = pathlib.Path("/var/lib/chief/runtime")
+# macOS /var/run is root:daemon 0775. Persistent root-written locks live
+# below /var/lib/chief; flock releases on exit/reboot, independent of file age.
+RUN_BASE = "/var/lib" if IS_MACOS else "/run"
 ARTIFACT_PROCESS_MAP = {
     "chief": (("chief-core",), ("chief-core",)),
     "hermes-node": (("chief-node",), ("chief-node",)),
@@ -578,10 +578,25 @@ class LocalState:
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps({"at": iso_now(), **record}, sort_keys=True) + "\n")
 
+    def prepare_lock(self, path: pathlib.Path) -> None:
+        # Fixture/unprivileged state roots remain an offline API. Fixed root
+        # execution must verify existing chains before creating any lock parent.
+        privileged = self.root == pathlib.Path("/") and os.geteuid() == 0
+        if privileged:
+            existing = path.parent
+            while not existing.exists() and not existing.is_symlink():
+                existing = existing.parent
+            trusted_path(existing)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if privileged:
+            trusted_path(path.parent)
+            if path.exists() or path.is_symlink():
+                trusted_path(path)
+
     @contextlib.contextmanager
     def convergence_lease(self, node_id: str, convergence_id: str, artifact: str, affected: tuple[str, ...]):
-        self.run_dir.mkdir(parents=True, exist_ok=True)
         path = self.run_dir / f"{node_id}.lock"
+        self.prepare_lock(path)
         with path.open("a+") as fh:
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1167,8 +1182,8 @@ def reconcile(args: argparse.Namespace) -> int:
     state = LocalState(pathlib.Path(args.state_root))
     if args.plan_only:
         return converge(args, reconcile_mode=True)
-    lock_path = state._path("/var/run/chief/reconcile.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state._path(f"{RUN_BASE}/chief/reconcile.lock")
+    state.prepare_lock(lock_path)
     with lock_path.open("a+") as fh:
         try:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)

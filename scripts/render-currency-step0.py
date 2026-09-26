@@ -33,7 +33,7 @@ for name, mode in (("hermes-converger", "converge"), ("chief-node-supervisor", "
     body = "cd /\numask 027\n" + TRUST + '''
 [ "${EUID:-$(/usr/bin/id -u)}" = 0 ] || { hold 'root service entry point'; exit 1; }
 BASE=/opt/chief/lib/hermes-host-bootstrap/hermes_converger/step0
-if [ ! -d "$BASE" ]; then
+if [ ! -d "$BASE" ] || { [ "$CHIEF_LEGACY_ENTRY" = yes ] && [ ! -f /var/lib/chief/currency-step0/prepared ]; }; then
     # One-time bridge from the legacy updater's fixed copy destinations. On an
     # untrusted /usr/local chain use the reviewed root archive route instead.
     trusted_path /usr/local/bin/''' + name + ''' || refuse unsafe_launcher_path
@@ -46,7 +46,16 @@ if [ ! -d "$BASE" ]; then
     trap '/bin/rm -rf "$bridge"' EXIT
     /bin/cp -R /usr/local/lib/hermes-host-bootstrap/hermes_converger "$bridge/"
     trusted_tree "$bridge/hermes_converger" || refuse unsafe_bridge
-    /bin/mv "$bridge/hermes_converger" /opt/chief/lib/hermes-host-bootstrap/hermes_converger
+    # A failed first closure can leave the previous reviewed /opt copy behind.
+    # Only an explicit legacy entry before preparation refreshes that copy.
+    if [ -e "$BASE/.." ]; then
+        trusted_tree "$BASE/.." || refuse unsafe_existing_payload
+        /bin/mv /opt/chief/lib/hermes-host-bootstrap/hermes_converger "$bridge/previous"
+    fi
+    if ! /bin/mv "$bridge/hermes_converger" /opt/chief/lib/hermes-host-bootstrap/hermes_converger; then
+        [ ! -d "$bridge/previous" ] || /bin/mv "$bridge/previous" /opt/chief/lib/hermes-host-bootstrap/hermes_converger
+        exit 1
+    fi
     /bin/rm -rf "$bridge"
     trap - EXIT
 fi
@@ -78,7 +87,8 @@ fi
     else:
         # Keep the already checked embedded helpers and OS identity in this shell.
         body += f'. "$BASE/{script}.sh"\n'
-    rendered = PREFIX + "exec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/empty LANG=C /bin/sh -c " + shlex.quote(body) + "\n"
+    entry = f'legacy=no\n[ "$0" != /usr/local/bin/{name} ] || legacy=yes\n'
+    rendered = PREFIX + entry + 'exec /usr/bin/env -i CHIEF_LEGACY_ENTRY="$legacy" PATH=' + "/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/empty LANG=C /bin/sh -c " + shlex.quote(body) + "\n"
     (ROOT / "scripts" / name).write_text(rendered)
     (BASE / "bin").mkdir(exist_ok=True)
     (BASE / "bin" / name).write_text(rendered)
