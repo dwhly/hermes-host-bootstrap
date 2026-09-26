@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'scripts'))
@@ -118,6 +118,77 @@ class Fixtures(unittest.TestCase):
         supervisor.refresh({'loaded': True, 'pid': 41}, unit_changed=True)
         self.assertEqual([call.args[0] for call in run.call_args_list],
                          [['systemctl', 'daemon-reload'], ['systemctl', 'restart', 'existing-dashboard.service']])
+
+    def test_refresh_failure_retries_identical_files_and_healthy_is_noop(self):
+        for platform, failing in [('linux', 'daemon-reload'), ('linux', 'restart'), ('macos', 'bootstrap')]:
+            with self.subTest(platform=platform, failing=failing):
+                unit = '/units/' + failing
+                service = dashboard.LABEL if platform == 'macos' else 'fixture.service'
+                state = {'loaded': True, 'pid': 41, 'active': True}
+                failed = False
+                calls = []
+                def run(args):
+                    nonlocal failed
+                    calls.append(args)
+                    if args[1] == 'bootout':
+                        state['loaded'] = False
+                    if args[1] == failing and not failed:
+                        failed = True
+                        raise subprocess.CalledProcessError(1, args)
+                    if args[1] == 'bootstrap':
+                        state['loaded'] = True
+                supervisor = dashboard.Supervisor(platform, service, unit, 1000, run)
+                supervisor.check = Mock(side_effect=lambda _: dict(state))
+                args = (self.root, self.runtime, platform, '/bin/' + failing, unit, service, '127.0.0.1', 9000, supervisor)
+                with self.assertRaises(subprocess.CalledProcessError):
+                    dashboard.install(*args)
+                self.assertTrue(rooted(self.root, unit + '.refresh-pending').exists())
+                calls.clear()
+                self.assertTrue(dashboard.install(*args))
+                self.assertFalse(rooted(self.root, unit + '.refresh-pending').exists())
+                if platform == 'macos':
+                    self.assertEqual([cmd[1] for cmd in calls], ['bootstrap'])
+                else:
+                    self.assertEqual([cmd[1] for cmd in calls], ['daemon-reload', 'restart'])
+                calls.clear()
+                self.assertFalse(dashboard.install(*args))
+                self.assertEqual(calls, [])
+                state['loaded'] = False
+                self.assertTrue(dashboard.install(*args))
+
+    def test_linux_stopped_or_stale_loaded_unit_recovers(self):
+        supervisor = Mock()
+        state = {'loaded': True, 'pid': 41, 'active': True, 'need_reload': False}
+        supervisor.check.side_effect = lambda _: dict(state)
+        args = (self.root, self.runtime, 'linux', '/bin/dashboard', '/unit', 'test.service', '127.0.0.1', 9000, supervisor)
+        dashboard.install(*args)
+        for field, value in [('active', False), ('need_reload', True)]:
+            state[field] = value
+            supervisor.refresh.reset_mock()
+            self.assertTrue(dashboard.install(*args))
+            supervisor.refresh.assert_called_once()
+            state[field] = not value
+
+    def test_macos_refresh_sequence(self):
+        run = Mock()
+        supervisor = dashboard.Supervisor('macos', dashboard.LABEL, '/fixture.plist', 501, run)
+        supervisor.refresh({'loaded': True, 'pid': 41}, True)
+        self.assertEqual([call.args[0] for call in run.call_args_list], [
+            ['launchctl', 'bootout', 'gui/501/' + dashboard.LABEL],
+            ['launchctl', 'bootstrap', 'gui/501', '/fixture.plist']])
+
+    def test_runtime_rejects_all_desktop_and_ssh_credentials(self):
+        self.write('/proc/41/status', b'Uid: 1000 1000 1000 1000\n')
+        environ = self.write('/proc/41/environ', b'')
+        supervisor = dashboard.Supervisor('linux', 'test.service', '/unit', 1000, Mock(), self.root / 'proc')
+        base = b'HOME=/home/hermes\0HERMES_HOME=/home/hermes/.hermes\0'
+        environ.write_bytes(base)
+        supervisor.check_runtime({'pid': 41}, self.runtime)
+        for key in ('HERMES_DESKTOP', 'HERMES_DASHBOARD_SESSION_TOKEN', 'HERMES_DESKTOP_OWNER_NONCE',
+                    'HERMES_SSH_PASSWORD', 'HERMES_SSH_PRIVATE_KEY'):
+            environ.write_bytes(base + key.encode() + b'=fixture-secret\0')
+            with self.assertRaisesRegex(ValueError, 'forbidden auth environment'):
+                supervisor.check_runtime({'pid': 41}, self.runtime)
 
     def test_mac_hidden_listener_is_not_adopted(self):
         run = Mock(side_effect=[subprocess.CalledProcessError(113, 'launchctl'),

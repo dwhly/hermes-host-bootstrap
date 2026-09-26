@@ -73,8 +73,9 @@ def render(runtime, platform, launcher, service, bind, port):
 
 
 class Supervisor:
-    def __init__(self, platform, service, unit, uid, run=command):
+    def __init__(self, platform, service, unit, uid, run=command, proc_root='/proc'):
         self.platform, self.service, self.unit, self.uid, self.run = platform, service, str(unit), uid, run
+        self.proc_root = Path(proc_root)
 
     def inspect(self):
         if self.platform == 'macos':
@@ -85,10 +86,12 @@ class Supervisor:
             path = re.search(r'^\s*path = (.+)$', out, re.M)
             pid = re.search(r'^\s*pid = (\d+)$', out, re.M)
             return {'pid': int(pid[1]) if pid else 0, 'path': path[1] if path else '', 'loaded': True}
-        out = self.run(['systemctl', 'show', self.service, '--property=MainPID,FragmentPath,LoadState'])
+        out = self.run(['systemctl', 'show', self.service, '--property=MainPID,FragmentPath,LoadState,ActiveState,NeedDaemonReload'])
         values = dict(line.split('=', 1) for line in out.splitlines() if '=' in line)
         return {'pid': int(values.get('MainPID', 0)), 'path': values.get('FragmentPath', ''),
-                'loaded': values.get('LoadState') == 'loaded'}
+                'loaded': values.get('LoadState') == 'loaded',
+                'active': values.get('ActiveState') == 'active',
+                'need_reload': values.get('NeedDaemonReload') == 'yes'}
 
     def check(self, port, expected_path=None):
         state = self.inspect()
@@ -122,7 +125,7 @@ class Supervisor:
         """Verify a running Linux service without logging argv or environment values."""
         if not state['pid']:
             return
-        process = Path('/proc') / str(state['pid'])
+        process = self.proc_root / str(state['pid'])
         status = (process / 'status').read_text()
         uid = re.search(r'^Uid:\s+(\d+)\s+(\d+)', status, re.M)
         if not uid or int(uid[2]) != runtime['uid']:
@@ -135,7 +138,8 @@ class Supervisor:
                 actual = env.get(b'HOME', b'') + b'/.hermes'
             if actual != value.encode():
                 raise ValueError('running dashboard home mismatch')
-        if any(env.get(key) for key in (b'HERMES_DESKTOP', b'HERMES_DASHBOARD_SESSION_TOKEN')):
+        if any(env.get(key) for key in (b'HERMES_DESKTOP', b'HERMES_DASHBOARD_SESSION_TOKEN',
+                                       b'HERMES_DESKTOP_OWNER_NONCE', b'HERMES_SSH_PASSWORD', b'HERMES_SSH_PRIVATE_KEY')):
             raise ValueError('running dashboard has forbidden auth environment')
 
     def refresh(self, state, unit_changed):
@@ -156,17 +160,26 @@ def install(root, runtime, platform, launcher, unit, service, bind, port, superv
     state = supervisor.check(port)
     launcher_path, unit_path = rooted(root, launcher), rooted(root, unit)
     # All ownership/socket checks occur before any mutation.
-    existing(launcher_path)
-    existing(unit_path)
+    files_changed = any(existing(path) != data or path.stat().st_mode & 0o777 != mode
+                        for path, data, mode in ((launcher_path, launcher_bytes, 0o755), (unit_path, unit_bytes, 0o644)))
+    pending_path = rooted(root, unit + '.refresh-pending')
+    pending = existing(pending_path) is not None
     stamp_path = rooted(root, (runtime['hermes_home'] + '/.desktop-dashboard' if platform == 'macos'
                               else '/var/lib/hermes-desktop') + '/dashboard-env.sha256')
     auth_digest = env_digest(rooted(root, runtime['hermes_home'] + '/.env'))
     auth_changed = existing(stamp_path) != auth_digest
+    unhealthy = not state['loaded'] or (platform == 'linux' and
+                (not state.get('active', bool(state['pid'])) or state.get('need_reload', False)))
+    refresh = files_changed or auth_changed or pending or unhealthy
+    if refresh:
+        # Persist before replacing files: every partial write/reload/bootstrap retries.
+        atomic_write(pending_path, b'refresh required\n', 0o600)
     launcher_changed = atomic_write(launcher_path, launcher_bytes, 0o755)
     unit_changed = atomic_write(unit_path, unit_bytes)
-    if launcher_changed or unit_changed or auth_changed:
+    if refresh:
         rooted(root, runtime['hermes_home'] + '/logs').mkdir(parents=True, exist_ok=True)
-        supervisor.refresh(state, unit_changed)
+        supervisor.refresh(state, unit_changed or pending or state.get('need_reload', False))
         # Only acknowledge credentials after refresh succeeds. Failed refreshes retry.
         atomic_write(stamp_path, auth_digest, 0o600)
-    return launcher_changed or unit_changed or auth_changed
+        pending_path.unlink()
+    return refresh
