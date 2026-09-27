@@ -9,8 +9,12 @@ import re
 import subprocess
 import sys
 
+# A deferred invocation must not create caches in an installed tools directory.
+sys.dont_write_bytecode = True
+
 from desktop_fleet.common import (atomic_write, digest, json_bytes, load, load_rollout_intent,
-                                  resolve_intent, rollout_declared, IntentUnavailable)
+                                  resolve_intent, rollout_declared, host_record, desktop_client,
+                                  IntentUnavailable, PythonOverrideError)
 from desktop_fleet.registry import checklist, manifest, read_only_report
 
 REPO = Path(__file__).resolve().parents[1]
@@ -88,6 +92,18 @@ def version(home, app=False, compatibility_path=None):
     return pin['version'] + ' source:' + pin['source_revision'] + ' sha256:' + pin['binary_sha256']
 
 
+def client_deferred_report(home, bin_dir, client):
+    paths = [home / 'fleet/generated/desktop-gateways.json',
+             home / 'fleet/generated/desktop-gateways-checklist.txt',
+             home / 'desktop-plugins/fleet-gateways/plugin.js',
+             home / 'desktop-plugins/fleet-gateways/installed.json',
+             home / 'fleet/tools', bin_dir / 'hermes-desktop-fleet-warm']
+    leftovers = [str(path) for path in paths if path.exists() or path.is_symlink()]
+    detail = ('leftover client artifacts (untouched): ' + ', '.join(leftovers)
+              if leftovers else 'no client artifacts installed')
+    return f'deferred (client deferred for {client}; desktop_client=deferred; {detail})'
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('action', choices=['render', 'install', 'verify', 'version', 'app-version'])
@@ -99,12 +115,24 @@ def main():
     p.add_argument('--user-data', type=Path, default=Path(os.environ.get('HERMES_DESKTOP_USER_DATA_DIR', str(Path.home() / 'Library/Application Support/Hermes'))))
     p.add_argument('--app-log', type=Path, help='log of the current app launch for effective pool settings')
     p.add_argument('--app-pin', type=Path, help='reviewed app build pin; checked post-build only')
-    p.add_argument('--optional', action='store_true', help='bootstrap: skip an unconfigured rollout without writes')
+    p.add_argument('--optional', action='store_true', help='skip an unconfigured rollout; version checks also report client deferral')
     p.add_argument('--compatibility', type=Path, help='independent reviewed repository compatibility pin')
     a = p.parse_args()
-    if a.action not in ('version', 'app-version'):
+    if a.action not in ('version', 'app-version') or a.optional:
         a.registry = resolve_intent(a.registry, hermes_home=a.hermes_home)
     generated = a.hermes_home / 'fleet/generated'
+    if a.action == 'verify' or (a.action in ('version', 'app-version') and a.optional):
+        try:
+            intent = load_rollout_intent(a.registry, hermes_home=a.hermes_home)
+        except IntentUnavailable:
+            if not a.optional:
+                raise
+            intent = None
+        declared = (manifest(a.registry, a.client, a.revision, hermes_home=a.hermes_home)
+                    if intent is not None and rollout_declared(intent) else {'complete': False})
+        if declared['complete'] and desktop_client(host_record(a.registry, a.client)) == 'deferred':
+            print(client_deferred_report(a.hermes_home, a.bin_dir, a.client))
+            return 0
     if a.action in ('version', 'app-version'):
         print(version(a.hermes_home, a.action == 'app-version', a.compatibility))
     elif a.action in ('render', 'install'):
@@ -120,6 +148,11 @@ def main():
                 print('not-configured (complete desktop Intent required); desktop rollout disabled')
                 return 0
             raise ValueError('complete desktop Intent is required for installation')
+        if a.action == 'install':
+            state = desktop_client(host_record(a.registry, a.client))
+            if state != 'enabled':
+                print(f'desktop-fleet: client install deferred for {a.client} (desktop_client={state})')
+                return 0
         if not a.revision:
             raise ValueError('explicit registry revision is required')
         if a.action == 'render':
@@ -133,22 +166,10 @@ def main():
         print('changed' if changed else 'unchanged')
     else:
         try:
-            intent = load_rollout_intent(a.registry, hermes_home=a.hermes_home)
-        except IntentUnavailable:
-            if not a.optional:
-                raise
-            intent = None
-        try:
             data = load(generated / 'desktop-gateways.json')
         except IntentUnavailable:
             if not a.optional:
                 raise
-            try:
-                declared = (manifest(a.registry, a.client, a.revision, hermes_home=a.hermes_home)
-                            if intent is not None and rollout_declared(intent)
-                            else {'complete': False})
-            except IntentUnavailable:
-                declared = {'complete': False}
             if declared['complete']:
                 raise ValueError('desktop rollout declared but installed manifest is missing')
             print('not-configured (desktop rollout pending; no protection/qualification asserted)')
@@ -170,6 +191,8 @@ def main():
                 raise ValueError('installed allowlist differs from generated manifest')
             report['plugin_version'] = version(a.hermes_home, compatibility_path=a.compatibility)
             report['app_pin'] = version(a.hermes_home, True, a.compatibility)
+        except PythonOverrideError:
+            raise
         except (OSError, ValueError, KeyError):
             report['sdk_compatibility'] = 'indeterminate: app pin unselected, unqualified or mismatched'
             report['status'] = 'indeterminate'
@@ -183,5 +206,7 @@ if __name__ == '__main__':
         sys.exit(main())
     except IntentUnavailable as exc:
         sys.exit('desktop-fleet: ' + str(exc) + '; enrollment disabled')
+    except PythonOverrideError as exc:
+        sys.exit('desktop-fleet: ' + str(exc))
     except (OSError, ValueError, KeyError, TypeError, ImportError, subprocess.SubprocessError):
         sys.exit('desktop-fleet: indeterminate inventory, settings, or artifact pin; stop enrollment; no removal advice')

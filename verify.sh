@@ -151,7 +151,11 @@ verify_desktop_fleet_version() {
   fi
   local fleet_repo
   fleet_repo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  hermes-desktop-fleet-warm "$1" --compatibility "$fleet_repo/desktop-plugins/fleet-gateways/compatibility.json"
+  local action=version
+  [[ "$1" != --app-version ]] || action=app-version
+  python3 "$fleet_repo/scripts/desktop-fleet.py" "$action" --optional \
+    --hermes-home "${HERMES_HOME:-$HOME/.hermes}" \
+    --compatibility "$fleet_repo/desktop-plugins/fleet-gateways/compatibility.json"
 }
 
 verify_mac_desktop_pmset() {
@@ -266,7 +270,9 @@ verify_run_check() {
   out="$(eval "$cmd" 2>&1)"
   rc=$?
   first="$(printf '%s\n' "$out" | sed '/^[[:space:]]*$/d; q')"
-  if [[ "$rc" -eq 0 ]]; then
+  if [[ "$rc" -eq 0 && "$first" == 'deferred ('* ]]; then
+    printf 'deferred\t\t%s\n' "$first"
+  elif [[ "$rc" -eq 0 ]]; then
     printf 'ok\t%s\t%s\n' "$first" "ok"
   else
     printf 'missing\t\t%s\n' "${first:-not found or failed}"
@@ -420,7 +426,7 @@ verify_json() {
 }
 
 verify_human() {
-  local entry name cmd result status
+  local entry name cmd result status detail
   for entry in "${HERMES_VERIFY_CHECKS[@]}"; do
     name="${entry%%|*}"
     entry="${entry#*|}"
@@ -436,10 +442,12 @@ verify_human() {
         printf 'ok: %s\n' "$name"
       fi
     else
+      detail='not found or failed'
+      [[ "$status" != deferred ]] || detail="${result##*$'\t'}"
       if declare -F warn >/dev/null 2>&1; then
-        warn "$name — not found or failed"
+        warn "$name — $detail"
       else
-        printf 'warn: %s — not found or failed\n' "$name"
+        printf 'warn: %s — %s\n' "$name" "$detail"
       fi
     fi
   done

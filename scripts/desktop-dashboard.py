@@ -8,7 +8,7 @@ from pathlib import Path
 import socket
 import sys
 from desktop_fleet import dashboard, marker
-from desktop_fleet.common import optional_host_record, resolve_intent, update_policy, gateway_record
+from desktop_fleet.common import admission, optional_host_record, resolve_intent, update_policy, gateway_record
 
 
 def main():
@@ -24,14 +24,17 @@ def main():
     p.add_argument('--registry')
     p.add_argument('--host', default=socket.gethostname().split('.')[0])
     a = p.parse_args()
+    a.registry = resolve_intent(a.registry, home=a.home, hermes_home=a.hermes_home)
+    record = optional_host_record(a.registry, a.host, home=a.home, hermes_home=a.hermes_home)
+    policy = update_policy(record, legacy=True)
+    if a.action == 'install' and record and admission(record) != 'admitted':
+        print(f'dashboard held: admission {admission(record)}; no dashboard or marker mutation')
+        return
     user = pwd.getpwnam(a.user)
     runtime = dict(user=a.user, group=grp.getgrgid(user.pw_gid).gr_name, uid=user.pw_uid,
                    home=a.home, hermes_home=a.hermes_home, executable=a.executable)
     if user.pw_dir != a.home or not os.access(a.executable, os.X_OK):
         raise ValueError('runtime account/home or executable mismatch')
-    a.registry = resolve_intent(a.registry, home=a.home, hermes_home=a.hermes_home)
-    record = optional_host_record(a.registry, a.host, home=a.home, hermes_home=a.hermes_home)
-    policy = update_policy(record, legacy=True)
     authorized = policy == 'protected' and gateway_record(record).get('dashboard_vehicle') == 'module97'
     marker_path = Path(marker.MARKER)
     if a.action == 'install' and (marker_path.exists() or marker_path.is_symlink()) and not authorized:
@@ -49,7 +52,10 @@ def main():
     # Protect before service changes; existing markers are never rewritten.
     supervisor.check(a.port)
     if policy == 'protected':
-        marker.install('/', a.registry, a.host)
+        if marker.deferred(record):
+            print('G3 marker deferred; marker step skipped; convergence reconciliation pending')
+        else:
+            marker.install('/', a.registry, a.host)
     changed = dashboard.install('/', runtime, a.platform, launcher, unit, service, a.bind, a.port, supervisor)
     print('dashboard changed; owned service refreshed' if changed else 'dashboard unchanged; no restart')
 

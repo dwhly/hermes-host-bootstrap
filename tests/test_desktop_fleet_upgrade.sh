@@ -35,7 +35,7 @@ export HERMES_FLEET_HOSTS_DIR="$TMP/hosts" HERMES_FLEET_INTENT="$TMP/intent.json
 export CHIEF_BOOTSTRAP_SRC="$TMP/bootstrap"
 export PATH="$TMP/bin:$PATH"
 cat >"$TMP/intent.json" <<'JSON'
-{"hosts":[{"hostname":"h-af","update_policy":"protected"},{"hostname":"h-btp","update_policy":"protected"},{"hostname":"h-do1","update_policy":"protected"},{"hostname":"marker","update_policy":"eligible"},{"hostname":"mac","update_policy":"eligible"}]}
+{"hosts":[{"hostname":"h-af","update_policy":"protected","desktop_gateway":{"g3_marker":"deferred"}},{"hostname":"h-btp","update_policy":"protected","desktop_gateway":{"g3_marker":"deferred"}},{"hostname":"h-do1","update_policy":"protected","desktop_gateway":{"g3_marker":"deferred"}},{"hostname":"marker","update_policy":"eligible"},{"hostname":"mac","update_policy":"eligible"}]}
 JSON
 for host in h-af h-btp h-do1 marker mac; do
   cat >"$TMP/hosts/$host.yaml" <<YAML
@@ -94,6 +94,22 @@ for host in h-af h-btp h-do1 marker; do
   grep -q 'direct protected-host update refused' "$TMP/direct.out" || fail 'direct refusal unclear'
   ! grep -qE 'hermes update|gateway start|deploy-node' "$FIXTURE_LOG" || fail 'direct attempt mutated host'
 done
+# Arming changes marker permission, never the protected skip.
+sed 's/"g3_marker":"deferred"/"g3_marker":"armed"/g' "$TMP/intent.json" >"$TMP/armed.json"
+: >"$FIXTURE_LOG"
+HERMES_FLEET_INTENT="$TMP/armed.json" bash "$ROOT/fleet-upgrade.sh" all --include-self >"$TMP/armed.out" 2>&1 || fail 'armed all failed'
+! grep -q 'fixture@h-' "$FIXTURE_LOG" || fail 'armed protected hosts touched'
+rm "$TMP/armed.json"
+for declaration in '"update_policy":"protected"' '"update_policy":"eligible","desktop_gateway":{"g3_marker":"armed"}'; do
+  printf '{"hosts":[{"hostname":"mac",%s}]}\n' "$declaration" >"$TMP/invalid.json"
+  : >"$FIXTURE_LOG"
+  if HERMES_FLEET_INTENT="$TMP/invalid.json" bash "$ROOT/fleet-upgrade.sh" mac >"$TMP/invalid.out" 2>&1; then
+    fail 'invalid marker declaration allowed update'
+  fi
+  grep -q 'g3_marker' "$TMP/invalid.out" || fail 'marker schema diagnostic missing'
+  [[ ! -s "$FIXTURE_LOG" ]] || fail 'invalid marker declaration reached SSH'
+done
+rm "$TMP/invalid.json"
 : >"$FIXTURE_LOG"
 if FIXTURE_MARKER_RC=255 bash "$ROOT/fleet-upgrade.sh" mac >"$TMP/unknown.out" 2>&1; then
   fail 'unknown marker state allowed update'
@@ -146,7 +162,7 @@ grep -q 'indeterminate Intent' "$TMP/partial.out" || fail 'partial Intent diagno
 
 # The baseline-existing /opt path is resolved even if the preferred path is absent.
 mkdir -p "$(dirname "$FIXTURE_BASELINE")"
-printf 'hosts:\n  - hostname: h-af\n    update_policy: protected\n' >"$FIXTURE_BASELINE"
+printf 'hosts:\n  - hostname: h-af\n    update_policy: protected\n    desktop_gateway: {g3_marker: deferred}\n' >"$FIXTURE_BASELINE"
 rm "$TMP/intent.json"
 unset HERMES_FLEET_INTENT
 : >"$FIXTURE_LOG"
