@@ -15,6 +15,34 @@ CORE = ROOT / "scripts/hermes-workspace"
 COMPOSER = "Hermes Agent v0.16\nType your message or /help for commands.\n❯ Ask me anything…\n"
 LIVE = {"shell_pid": 10, "foreground_process_group_id": 20,
         "foreground_processes": [{"pid": 20, "name": "hermes", "argv": ["hermes"]}]}
+STORE_PY = "/root/.hermes/tools/python-3.14.7-linux-x64/bin/python3"
+
+
+def launcher_script(module):
+    # Mirrors hermes_cli/_launchers.py::_launcher_script (the h-af v0.21.5 shape).
+    return ("import os, re, sys\nos.environ.pop('PYTHONHOME', None)\nos.environ.pop('PYTHONPATH', None)\n"
+            "sys.path.insert(0, '/usr/local/lib/hermes-agent')\n"
+            "if sys.argv[1:2] == ['--print-runtime-command']: sys.dont_write_bytecode = True\n"
+            "from hermes_constants import get_default_hermes_root\n"
+            "os.environ['HERMES_HOME'] = os.environ.get('HERMES_HOME') or str(get_default_hermes_root())\n"
+            "if sys.argv[1:2] == ['--print-runtime-command']:\n    from pathlib import Path\n"
+            "    from hermes_cli._launchers import print_runtime_command\n"
+            "    print_runtime_command(Path('/usr/local/lib/hermes-agent'), sys.argv[2:])\n    sys.exit(0)\n"
+            "import hermes_bootstrap\nif sys.argv[1:2] == ['--run-module']:\n    import runpy\n"
+            "    if len(sys.argv) < 3: sys.exit('hermes: --run-module needs a module')\n"
+            "    module = sys.argv.pop(2)\n    del sys.argv[1]\n"
+            "    runpy.run_module(module, run_name='__main__', alter_sys=True)\n    sys.exit(0)\n"
+            f"from {module} import main\n"
+            "sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\nsys.exit(main())\n")
+
+
+# Mirrors hermes_cli/_launchers.py runtime-command form (module entry).
+RUNTIME_COMMAND = ("import os, sys, runpy; os.environ.pop('PYTHONHOME', None); "
+                   "os.environ.pop('PYTHONPATH', None); os.environ.pop('VIRTUAL_ENV', None); "
+                   "sys.path.insert(0, '/usr/local/lib/hermes-agent'); "
+                   "os.environ['HERMES_HOME'] = os.environ.get('HERMES_HOME') or '/root/.hermes'; "
+                   "import hermes_bootstrap; "
+                   "runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)")
 SHELL = {"shell_pid": 10, "foreground_process_group_id": 10,
          "foreground_processes": [{"pid": 10, "name": "bash", "argv": ["bash"]}]}
 
@@ -279,6 +307,31 @@ class Herdr082Tests(unittest.TestCase):
                 self.write(panes=[self.pane("H1")], process=self.with_argv(argv))
                 result = self.run_core()
                 self.assertEqual(result.returncode, 0, result.stderr)
+                self.assert_no_launch()
+
+    def test_managed_store_launcher_is_ready(self):
+        # Hermes 0.21+ `.hermes/bin/hermes` execs the store Python with -I -c.
+        for argv in ([STORE_PY, "-I", "-c", launcher_script("hermes_cli.main"), "--resume", "20260925_215057_fe86d4"],
+                     [STORE_PY, "-I", "-c", launcher_script("hermes_cli.main")],
+                     [STORE_PY, "-Ic", launcher_script("hermes_cli.main"), "chat", "--source", "pane:H1"],
+                     [STORE_PY, "-I", "-c", RUNTIME_COMMAND, "--tui"]):
+            with self.subTest(argv=argv[1:2] + argv[3:]):
+                self.write(panes=[self.pane("H1")], process=self.with_argv(argv))
+                result = self.run_core()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assert_no_launch()
+
+    def test_managed_launcher_lookalikes_fail_closed(self):
+        for argv in ([STORE_PY, "-I", "-c", launcher_script("acp_adapter.entry")],
+                     [STORE_PY, "-I", "-c", launcher_script("hermes_cli.main"), "--run-module", "http.server"],
+                     [STORE_PY, "-I", "-c", launcher_script("hermes_cli.main"), "--print-runtime-command"],
+                     [STORE_PY, "-I", "-c", launcher_script("hermes_cli.main"), "update"],
+                     [STORE_PY, "-I", "-ic", launcher_script("hermes_cli.main")],
+                     [STORE_PY, "-I", "-c", "from hermes_cli.main import main\nsys.exit(main())"],
+                     [STORE_PY, "-I", "-c"]):
+            with self.subTest(argv=argv[1:2] + argv[3:]):
+                self.write(panes=[self.pane("H1", agent="hermes")], process=self.with_argv(argv))
+                self.assert_failed(self.run_core())
                 self.assert_no_launch()
 
     def test_exec_replaced_shell_pid_is_valid_chat(self):

@@ -696,6 +696,22 @@ try:
     jobs = process["foreground_processes"]
     if not pid(shell) or not pid(group) or not isinstance(jobs, list) or not jobs:
         raise ValueError
+    def hermes_launcher_code(code):
+        # Hermes 0.21+ managed launchers exec the store Python as
+        # `python3 -I -c <bootstrap>`. Accept only the published Hermes CLI
+        # entry shapes (hermes_cli/_launchers.py); arbitrary -c code, and
+        # sibling entry points such as hermes-acp, stay rejected.
+        lines = code.strip().splitlines()
+        if not lines:
+            return False
+        if (lines[-1] == "sys.exit(main())" and "import hermes_bootstrap" in lines
+                and "from hermes_cli.main import main" in lines):
+            return True
+        statements = [part.strip() for part in code.strip().split(";")]
+        # (chr(39) is a single quote; this code lives in a single-quoted shell string.)
+        entry = "runpy.run_module({0}hermes_cli.main{0}, run_name={0}__main__{0}, alter_sys=True)"
+        return "import hermes_bootstrap" in statements and statements[-1] == entry.format(chr(39))
+
     def hermes_args(argv):
         executable = os.path.basename(argv[0])
         if executable == "hermes":
@@ -734,6 +750,14 @@ try:
                     if option == "m":
                         return argv[i + 1:] if value == "hermes_cli.main" else None
                     break
+                if option == "c":
+                    value = arg[j + 1:]
+                    if not value:
+                        i += 1
+                        if i >= len(argv):
+                            return None
+                        value = argv[i]
+                    return argv[i + 1:] if hermes_launcher_code(value) else None
                 # -i keeps Python alive at its REPL after Hermes exits. It
                 # cannot prove live Hermes even when PID/identity are retained.
                 if option not in "bBdEIOPqsSuvx":
