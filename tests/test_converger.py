@@ -349,7 +349,10 @@ class FakeState:
         self.rollback_attempts = 0
         self.state_dir = pathlib.Path("/missing")
 
-    def update_watermark(self, plan):
+    def load_watermarks(self):
+        return {}
+
+    def update_watermark(self, plan, *, applied=True):
         self.events.append(("watermark", plan.artifact))
 
     def convergence_lease(self, *args, **kwargs):

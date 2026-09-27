@@ -14,7 +14,7 @@ jobs:
       # The Step 0 trust checks correctly refuse non-root-owned paths, and the converger/closure run as root on real hosts,
       # so run the suite as root, exactly like production. No test-only trust bypass exists or should be added.
       # "$(command -v python)" pins the setup-python 3.9 interpreter under sudo.
-      - run: sudo -E env "PATH=$PATH" "$(command -v python)" -m pytest -q tests/test_converger.py tests/test_converger_idle_source.py tests/test_supervisor.py tests/test_currency_step0.py tests/test_currency_fix1.py tests/test_currency_fix2.py tests/test_currency_fix3.py tests/test_currency_fix4.py tests/test_currency_fix5.py tests/test_currency_fix6.py
+      - run: sudo -E env "PATH=$PATH" "$(command -v python)" -m pytest -q tests/test_converger.py tests/test_converger_idle_source.py tests/test_converger_noop.py tests/test_supervisor.py tests/test_currency_step0.py tests/test_currency_fix1.py tests/test_currency_fix2.py tests/test_currency_fix3.py tests/test_currency_fix4.py tests/test_currency_fix5.py tests/test_currency_fix6.py
   macos-sh:
     # macOS /bin/sh is bash 3.2 (POSIX mode). Linux bash -n and shellcheck do NOT catch its parser bugs: an unparenthesised
     # case pattern inside $( ) broke preflight.sh on every Mac. Parse every shipped shell file with the real Mac /bin/sh,
