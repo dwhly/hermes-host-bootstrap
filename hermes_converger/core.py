@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
@@ -65,6 +66,7 @@ ARTIFACT_PROCESS_MAP = {
 }
 GIT_REF_RE = re.compile(r"^[0-9a-f]{7,40}$")
 DEFAULT_FRESHNESS_S = 600
+NODE_IDLE_FRESHNESS_S = 180
 MAX_FUTURE_S = 60
 LEASE_TTL_S = 300
 CONVERGER_VERSION = "0.1.0"
@@ -299,6 +301,8 @@ class VerifiedPlan:
     apply_mode: str
     affected_processes: tuple[str, ...]
     restart_units: tuple[str, ...]
+    trigger: str = "operator"
+    idle_source: str = "none"
 
 
 def verify_plan(
@@ -462,6 +466,79 @@ class IdleSnapshot:
     probes: dict[str, Any]
 
 
+def fresh_node_idle(snapshot: Any, now: dt.datetime) -> bool:
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("checked_at"), str):
+        return False
+    try:
+        age = (now - parse_time(snapshot["checked_at"])).total_seconds()
+    except (ValueError, OverflowError):
+        return False
+    return 0 <= age <= NODE_IDLE_FRESHNESS_S
+
+
+def node_idle_snapshot(data: Any, source: str, *, now: dt.datetime) -> dict[str, Any] | None:
+    """Adapt a fresh node attestation, preserving busy/unknown as vetoes."""
+    if not fresh_node_idle(data, now) or data.get("status") not in ("idle", "busy", "unknown"):
+        return None
+    evidence = data.get("evidence")
+    fields = ("owned_active_directives", "held_leases", "work_subprocesses")
+    if not isinstance(evidence, dict) or any(not isinstance(evidence.get(k), list) for k in fields):
+        return None
+    return {
+        "query_ok": data["status"] != "unknown",
+        "node_status": data["status"],
+        "checked_at": data["checked_at"],
+        "active_directives": evidence["owned_active_directives"],
+        "held_leases": evidence["held_leases"],
+        "running_work": evidence["work_subprocesses"],
+        "idle_source": source,
+    }
+
+
+def read_local_idle(path: pathlib.Path) -> Any:
+    """Read bounded node-owned data without following runtime-directory links.
+
+    Runtime data is a node attestation, not a code or root-state trust root.
+    Do not apply trusted_path's ownership/mode policy to this shared directory.
+    """
+    path = path.absolute()
+    if sys.platform == "darwin" and path.parts[1] in {"var", "tmp"}:
+        path = pathlib.Path("/private") / path.relative_to("/")
+    descriptors = []
+    try:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        directory = os.open("/", flags)
+        descriptors.append(directory)
+        for component in path.parts[1:-1]:
+            directory = os.open(component, flags, dir_fd=directory)
+            descriptors.append(directory)
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        descriptors.append(fd)
+        info = os.fstat(fd)
+        if not stat_module.S_ISREG(info.st_mode) or info.st_size > 65536:
+            return None
+        return json.loads(os.read(fd, 65537))
+    except (OSError, ValueError, RecursionError):
+        return None
+    finally:
+        for fd in reversed(descriptors):
+            os.close(fd)
+
+
+def read_idle_snapshot(plan: VerifiedPlan, explicit_path: str | None = None) -> dict[str, Any] | None:
+    if explicit_path:
+        # Preserve the explicit legacy probe format and its stricter limits.
+        data = read_local_idle(pathlib.Path(explicit_path))
+        return {**data, "idle_source": "local_file"} if isinstance(data, dict) else None
+    now = utcnow()
+    local = node_idle_snapshot(read_local_idle(runtime_stamp_roots()[0] / "idle.json"), "local_file", now=now)
+    if local is not None:
+        return local
+    # Only the selected, digest/HMAC-verified desired row may supply fallback.
+    fold = plan.raw.get("current_fold")
+    return node_idle_snapshot(fold.get("idle"), "signed_plan", now=now) if isinstance(fold, dict) else None
+
+
 def evaluate_idle(snapshot: dict[str, Any] | None, *, now: dt.datetime | None = None) -> IdleSnapshot:
     now = now or utcnow()
     if not snapshot or not snapshot.get("query_ok"):
@@ -477,6 +554,15 @@ def evaluate_idle(snapshot: dict[str, Any] | None, *, now: dt.datetime | None = 
         return IdleSnapshot(False, "running_work_subprocess", snapshot)
     if snapshot.get("loop_lock_active"):
         return IdleSnapshot(False, "local_loop_lock", snapshot)
+
+    if "node_status" in snapshot:
+        if not fresh_node_idle(snapshot, now):
+            return IdleSnapshot(False, "coordination_probe_untrusted", snapshot)
+        if snapshot["node_status"] != "idle":
+            return IdleSnapshot(False, "node_busy_or_unknown", snapshot)
+        # This aggregate attestation has one real observation time and the
+        # approved 180s lifetime. Legacy per-probe limits below stay unchanged.
+        return IdleSnapshot(True, None, snapshot)
 
     checks = (
         ("directive_observed_at", "directive"),
@@ -660,7 +746,7 @@ def _executor(node_id: str, convergence_id: str) -> dict[str, str]:
     return {
         "kind": "hermes-converger",
         "version": CONVERGER_VERSION,
-        "instance": f"{node_id}/{convergence_id}/systemd",
+        "instance": f"{node_id}/{convergence_id}/{'launchd' if IS_MACOS else 'systemd'}",
     }
 
 
@@ -683,12 +769,18 @@ def _shared_convergence_data(plan: VerifiedPlan, observed_at: str) -> dict[str, 
 def convergence_event_data(event_name: str, plan: VerifiedPlan, extra: dict[str, Any], observed_at: str) -> dict[str, Any]:
     data = _shared_convergence_data(plan, observed_at)
     if event_name == "started":
-        data.update({"trigger": str(extra.get("trigger") or "operator"), "plan_digest": _nonempty(plan.raw.get("plan_digest"))})
+        trigger = str(extra.get("trigger") or plan.trigger)
+        # Chief Spec v1 has four categories; retain the exact pulse in the
+        # provenance URI on every event without emitting schema-invalid data.
+        category = {"boot": "boot_reconcile", "daemon-start": "boot_reconcile", "login": "boot_reconcile",
+                    "periodic": "next_idle", "wake": "next_idle", "network": "next_idle", "request": "operator"}.get(trigger, trigger)
+        data.update({"trigger": category, "plan_digest": _nonempty(plan.raw.get("plan_digest"))})
     elif event_name == "deferred":
+        probes = extra.get("idle_snapshot") if isinstance(extra.get("idle_snapshot"), dict) else {}
         data.update(
             {
                 "reason": _nonempty(extra.get("reason")),
-                "idle_snapshot": extra.get("idle_snapshot") if isinstance(extra.get("idle_snapshot"), dict) else {},
+                "idle_snapshot": {**probes, "idle_source": plan.idle_source},
                 "next_check_after": str(extra.get("next_check_after") or iso_after(60)),
             }
         )
@@ -759,7 +851,8 @@ def build_convergence_envelope(event_name: str, plan: VerifiedPlan, **extra: Any
     source = f"hermes-converger://{node_id}"
     entityid = f"ent_node_{node_id}"
     actorid = f"act_node_{node_id}"
-    sourceref = f"converger://{node_id}/{convergence_id}/{event_name}"
+    provenance = urllib.parse.urlencode({"trigger": str(extra.get("trigger") or plan.trigger), "idle_source": plan.idle_source})
+    sourceref = f"converger://{node_id}/{convergence_id}/{event_name}?{provenance}"
 
     # Prefer chief_spec.emit when it is importable; production installs may only carry
     # hermes_converger, so the fallback builds the same CloudEvents envelope by hand.
@@ -1084,6 +1177,8 @@ def execute_plan(
     def mark_success() -> None:
         ops.state.update_watermark(plan)
 
+    snapshot = current_idle_snapshot() if plan.apply_mode == "restart_required" else None
+    plan = dataclasses.replace(plan, idle_source=(snapshot or {}).get("idle_source", "none"))
     ops.emit("started", plan)
     if plan.apply_mode == "live_patch":
         try:
@@ -1100,13 +1195,15 @@ def execute_plan(
             ops.emit("failed", plan, reason=type(exc).__name__, verification=None)
             return "failed"
 
-    idle = evaluate_idle(current_idle_snapshot())
+    idle = evaluate_idle(snapshot)
     if not idle.idle:
         ops.emit("deferred", plan, reason=idle.reason, idle_snapshot=idle.probes)
         return "deferred"
     try:
         with ops.state.convergence_lease(plan.raw["node_id"], str(plan.raw.get("convergence_id") or secrets.token_hex(8)), plan.artifact, plan.affected_processes):
-            inside = evaluate_idle(current_idle_snapshot())
+            snapshot = current_idle_snapshot()
+            plan = dataclasses.replace(plan, idle_source=(snapshot or {}).get("idle_source", "none"))
+            inside = evaluate_idle(snapshot)
             if not inside.idle:
                 ops.emit("deferred", plan, reason="accepted_work_after_idle_check", idle_snapshot=inside.probes)
                 return "deferred"
@@ -1223,10 +1320,6 @@ def converge(args: argparse.Namespace, reconcile_mode: bool = False) -> int:
             plan = load_cached_plan(state)
             if not plan:
                 raise
-    def read_idle_snapshot() -> dict[str, Any] | None:
-        return json.loads(pathlib.Path(args.idle_snapshot).read_text()) if args.idle_snapshot else None
-
-    idle_snapshot = read_idle_snapshot()
     verified = verify_plan(
         plan,
         node_id=args.node_id,
@@ -1234,6 +1327,11 @@ def converge(args: argparse.Namespace, reconcile_mode: bool = False) -> int:
         watermarks=state.load_watermarks(),
         target_artifact=getattr(args, "target_artifact", None),
     )
+    verified = dataclasses.replace(verified, trigger=getattr(args, "trigger", None) or os.environ.get("CHIEF_PULSE_TRIGGER", "operator"))
+
+    def idle_reader() -> dict[str, Any] | None:
+        return read_idle_snapshot(verified, args.idle_snapshot)
+
     if getattr(args, "step0", False):
         from .runtime import full_wake, qualified_plan, wake_identity
         global mutation_allowed
@@ -1252,14 +1350,14 @@ def converge(args: argparse.Namespace, reconcile_mode: bool = False) -> int:
             return full_wake(qualified_plan(plan))
         mutation_allowed = admitted
         args.report_only = not mutation_allowed()
-    idle = evaluate_idle(idle_snapshot) if verified.apply_mode == "restart_required" else None
     if getattr(args, "report_only", False):
         HostOps(state, transport).emit("deferred", verified, reason="dark_or_unknown_wake")
         return 0
     if args.plan_only:
+        idle = evaluate_idle(idle_reader()) if verified.apply_mode == "restart_required" else None
         print(plan_only_output(verified, idle))
         return 0
-    result = execute_plan(verified, HostOps(state, transport), idle_snapshot, read_idle_snapshot)
+    result = execute_plan(verified, HostOps(state, transport), idle_snapshot_reader=idle_reader)
     return 0 if result in {"applied", "deferred", "rolled_back"} else 1
 
 
