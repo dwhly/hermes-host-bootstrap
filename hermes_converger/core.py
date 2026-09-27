@@ -648,13 +648,14 @@ class LocalState:
     def load_watermarks(self) -> dict[str, Any]:
         return self.read_json(self.state_dir / "desired-watermarks.json", {})
 
-    def update_watermark(self, plan: VerifiedPlan) -> None:
+    def update_watermark(self, plan: VerifiedPlan, *, applied: bool = True) -> None:
         marks = self.load_watermarks()
         marks.setdefault(plan.raw["node_id"], {})[plan.artifact] = {
             "desired_id": plan.raw["desired_id"],
             "target_ref": plan.raw["target_ref"],
             "issued_at": plan.raw["issued_at"],
             "plan_digest": plan.raw["plan_digest"],
+            "applied": applied,
         }
         self.write_json_0640(self.state_dir / "desired-watermarks.json", marks)
 
@@ -1084,13 +1085,53 @@ class HostOps:
         return None
 
 
-def read_runtime_proof(artifact: str, target_ref: str, signal_at: str | None = None) -> dict[str, Any] | None:
+def runtime_process_matches(pid: int, process_start_time: str) -> bool:
+    """Revalidate a startup stamp against a live process, including PID reuse.
+
+    Stamps need not be rewritten by a healthy long-running process. Use the
+    same OS start-time identity (one-second tolerance) as node RUNNING proof.
+    """
+    if pid <= 0:
+        return False
+    try:
+        expected = parse_time(process_start_time)
+        os.kill(pid, 0)
+        if IS_MACOS:
+            result = subprocess.run([_resolve_tool("ps"), "-o", "lstart=,stat=", "-p", str(pid)],
+                                    capture_output=True, text=True, timeout=5,
+                                    env={**_tool_subprocess_env(), "LC_ALL": "C"})
+            if result.returncode:
+                return False
+            started, status = result.stdout.strip().rsplit(None, 1)
+            if status.startswith("Z"):
+                return False
+            # Match the node writer/collector's local lstart encoding, which
+            # labels the value UTC. Forcing ps into UTC would change identity.
+            actual = dt.datetime.strptime(started, "%a %b %d %H:%M:%S %Y").replace(tzinfo=dt.timezone.utc)
+        else:
+            fields = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+            if fields[0] in {"Z", "X"}:
+                return False
+            boot = next(line.split()[1] for line in pathlib.Path("/proc/stat").read_text().splitlines()
+                        if line.startswith("btime "))
+            actual = dt.datetime.fromtimestamp(int(boot) + int(fields[19]) / os.sysconf("SC_CLK_TCK"), dt.timezone.utc)
+        return abs((actual - expected).total_seconds()) <= 1
+    except (OSError, ValueError, OverflowError, IndexError, StopIteration, subprocess.SubprocessError, ConvergerError):
+        return False
+
+
+def read_runtime_proof(artifact: str, target_ref: str, signal_at: str | None = None,
+                       *, process: str | None = None, require_running: bool = False) -> dict[str, Any] | None:
     roots = runtime_stamp_roots()
     min_time = parse_time(signal_at) if signal_at else None
     for root in roots:
         if not root.exists():
             continue
         for stamp in root.glob(f"*/{artifact}.json"):
+            # The node self-runtime writer uses chief-node.service on both OSes;
+            # also accept the canonical token and native service-manager name.
+            if process and stamp.parent.name not in {process, LINUX_UNIT_MAP[process], MACOS_UNIT_MAP[process]}:
+                continue
             try:
                 fd = os.open(stamp, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
                 try:
@@ -1105,16 +1146,22 @@ def read_runtime_proof(artifact: str, target_ref: str, signal_at: str | None = N
             except (OSError, ValueError):
                 continue
             observed = data.get("observed_at") or data.get("written_at")
-            if data.get("loaded_ref") != target_ref or data.get("health") not in {None, "healthy"}:
-                continue
-            if min_time and (not observed or parse_time(str(observed)) <= min_time):
-                continue
-            if min_time and dt.datetime.fromtimestamp(stat.st_mtime, dt.timezone.utc) <= min_time:
+            if data.get("loaded_ref") != target_ref or data.get("health") not in (None, "healthy"):
                 continue
             try:
+                observed_time = parse_time(str(observed))
+                mtime = dt.datetime.fromtimestamp(stat.st_mtime, dt.timezone.utc)
+                if min_time and (observed_time <= min_time or mtime <= min_time):
+                    continue
                 pid = int(data["pid"])
                 monotonic_nonce = int(data["monotonic_nonce"])
                 process_start_time = str(data["process_start_time"])
+                if require_running:
+                    now = utcnow()
+                    if observed_time > now or mtime > now:
+                        continue
+                    if not runtime_process_matches(pid, process_start_time):
+                        continue
             except (KeyError, TypeError, ValueError):
                 continue
             return {
@@ -1131,6 +1178,23 @@ def read_runtime_proof(artifact: str, target_ref: str, signal_at: str | None = N
                 },
             }
     return None
+
+
+def already_converged(plan: VerifiedPlan, state: LocalState) -> bool:
+    mark = state.load_watermarks().get(plan.raw["node_id"], {}).get(plan.artifact, {})
+    # Older watermarks predate the applied flag. Keep them usable, but never
+    # confuse a new rollback/replay watermark with a successful target apply.
+    if (mark.get("desired_id") != plan.raw["desired_id"]
+            or mark.get("target_ref") != plan.raw["target_ref"] or not mark.get("applied", True)):
+        return False
+    signals = state.read_json(state.state_dir / "reload-signal-times.json", {})
+    # A watermark alone is history: a crash or external rollback is divergence
+    # and must re-converge. Re-read local proof for every affected process.
+    return bool(plan.affected_processes) and all(
+        read_runtime_proof(plan.artifact, plan.raw["target_ref"],
+                           signals.get(process, {}).get(plan.artifact), process=process, require_running=True)
+        for process in plan.affected_processes
+    )
 
 
 def runtime_stamp_roots() -> list[pathlib.Path]:
@@ -1169,6 +1233,11 @@ def execute_plan(
     idle_snapshot: dict[str, Any] | None = None,
     idle_snapshot_reader: Callable[[], dict[str, Any] | None] | None = None,
 ) -> str:
+    if already_converged(plan, ops.state):
+        # Chief Spec v1 has no convergence.running event. Stay silent, before
+        # idle admission, events, leases, fetches, installs or reload/restart.
+        return "already_converged"
+
     def current_idle_snapshot() -> dict[str, Any] | None:
         if idle_snapshot_reader:
             return idle_snapshot_reader()
@@ -1226,7 +1295,7 @@ def execute_plan(
             # exception failures. Never restore after releasing admission.
             rolled = attempt_rollback_once(plan, ops)
             if rolled:
-                mark_success()
+                ops.state.update_watermark(plan, applied=False)
             return "rolled_back" if rolled else "failed"
     except Deferred as exc:
         ops.emit("deferred", plan, reason=exc.reason, idle_snapshot=exc.snapshot)
@@ -1358,7 +1427,7 @@ def converge(args: argparse.Namespace, reconcile_mode: bool = False) -> int:
         print(plan_only_output(verified, idle))
         return 0
     result = execute_plan(verified, HostOps(state, transport), idle_snapshot_reader=idle_reader)
-    return 0 if result in {"applied", "deferred", "rolled_back"} else 1
+    return 0 if result in {"already_converged", "applied", "deferred", "rolled_back"} else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
