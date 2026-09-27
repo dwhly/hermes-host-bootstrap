@@ -8,6 +8,14 @@ if [[ -z "${HOME:-}" ]]; then
   HOME="$(cd ~ && pwd)"
 fi
 
+# launchd/systemd run this with a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), which made Homebrew/uv tools
+# (tmux, rg, …) look "missing" on Macs. Prepend the standard tool dirs; this only changes lookup, never state.
+for _verify_dir in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin"; do
+  case ":$PATH:" in *":$_verify_dir:"*) ;; *) [[ -d "$_verify_dir" ]] && PATH="$_verify_dir:$PATH" ;; esac
+done
+unset _verify_dir
+export PATH
+
 HERMES_VERIFY_SCHEMA_VERSION=2
 HERMES_VERIFY_CHECKS=()
 
