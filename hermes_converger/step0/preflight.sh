@@ -43,7 +43,7 @@ preflight_policy() {
     policy=$(
         for file in /etc/sudoers /etc/sudoers.d/*; do
             [ -f "$file" ] || continue
-            case "${file##*/}" in *.*|*~) continue;; esac
+            case "${file##*/}" in (*.*|*~) continue;; esac
             /usr/bin/awk -f "$BASE/sudoers.awk" "$file" || exit 1
         done
     ) || return 1
