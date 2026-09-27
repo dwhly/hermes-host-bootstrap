@@ -15,3 +15,19 @@ jobs:
       # so run the suite as root, exactly like production. No test-only trust bypass exists or should be added.
       # "$(command -v python)" pins the setup-python 3.9 interpreter under sudo.
       - run: sudo -E env "PATH=$PATH" "$(command -v python)" -m pytest -q tests/test_converger.py tests/test_supervisor.py tests/test_currency_step0.py tests/test_currency_fix1.py tests/test_currency_fix2.py tests/test_currency_fix3.py tests/test_currency_fix4.py tests/test_currency_fix5.py tests/test_currency_fix6.py
+  macos-sh:
+    # macOS /bin/sh is bash 3.2 (POSIX mode). Linux bash -n and shellcheck do NOT catch its parser bugs: an unparenthesised
+    # case pattern inside $( ) broke preflight.sh on every Mac. Parse every shipped shell file with the real Mac /bin/sh,
+    # and import the payload with Apple's Python 3.9, the interpreter the daemon uses on Macs.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          /bin/sh --version | head -1
+          fail=0
+          for f in hermes_converger/step0/*.sh hermes_converger/step0/bin/* scripts/hermes-converger scripts/chief-update scripts/chief-update-request scripts/chief-update-resume scripts/chief-node-supervisor lib/94-chief-fleet-convergence.sh; do
+            [ -f "$f" ] || continue
+            if /bin/sh -n "$f"; then echo "ok   $f"; else echo "FAIL $f"; fail=1; fi
+          done
+          exit $fail
+      - run: /usr/bin/python3 -I -S -B -c 'import sys; sys.path.insert(0, "."); import hermes_converger.core, hermes_converger.runtime, hermes_converger.supervisor, hermes_converger.preflight; print(sys.version)'
