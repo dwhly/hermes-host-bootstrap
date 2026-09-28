@@ -1,0 +1,17 @@
+[Unit]
+Description=Buzz relay (prod compose project): ensure the services are up after every boot
+Documentation=https://github.com/dwhly/hermes-host-bootstrap/blob/main/lib/97-stack-boot.sh
+# Same failure mode as chief-stack.service: `unless-stopped` services stay down after a clean stop and reboot.
+Requires=docker.service
+After=docker.service network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/root/services/buzz
+ExecStart=/usr/bin/docker compose -p buzz-prod -f deploy/compose/compose.yml -f deploy/compose/compose.hdo1.yml up -d --no-build
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
