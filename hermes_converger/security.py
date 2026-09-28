@@ -59,7 +59,7 @@ def read_env(path: pathlib.Path) -> dict[str, str]:
 
 
 def validate_config(data: dict[str, str]) -> dict[str, str]:
-    allowed = {"CHIEF_NODE_ID", "CHIEF_CORE_URL", "CHIEF_NODE_PLAN_KEY", "CHIEF_NODE_AUTH_TOKEN", "CHIEF_RUNTIME_USER"}
+    allowed = {"CHIEF_NODE_ID", "CHIEF_CORE_URL", "CHIEF_NODE_PLAN_KEY", "CHIEF_NODE_AUTH_TOKEN", "CHIEF_RUNTIME_USER", "CHIEF_CODE_ROOT"}
     if data.keys() - allowed:
         raise TrustError("unexpected_node_config_key")
     for key, fixed in (("CHIEF_NODE_PLAN_KEY", "/etc/chief/node-plan.key"), ("CHIEF_NODE_AUTH_TOKEN", "/etc/chief/node-auth.token")):
@@ -73,9 +73,15 @@ def validate_config(data: dict[str, str]) -> dict[str, str]:
         raise TrustError("invalid_core_url")
     if url.hostname in {"localhost", "127.0.0.1", "::1"} and node != "h-do1":
         raise TrustError("loopback_core_on_remote_node")
-    return {"CHIEF_NODE_ID": node, "CHIEF_CORE_URL": data["CHIEF_CORE_URL"].rstrip("/"),
-            "CHIEF_NODE_PLAN_KEY": "/etc/chief/node-plan.key",
-            "CHIEF_NODE_AUTH_TOKEN": "/etc/chief/node-auth.token"}
+    result = {"CHIEF_NODE_ID": node, "CHIEF_CORE_URL": data["CHIEF_CORE_URL"].rstrip("/"),
+              "CHIEF_NODE_PLAN_KEY": "/etc/chief/node-plan.key",
+              "CHIEF_NODE_AUTH_TOKEN": "/etc/chief/node-auth.token"}
+    if "CHIEF_CODE_ROOT" in data:
+        if (data["CHIEF_CODE_ROOT"] != "/opt/chief/deploy" or sys.platform != "linux"
+                or data.get("CHIEF_RUNTIME_USER") != "root"):
+            raise TrustError("invalid_code_root")
+        result["CHIEF_CODE_ROOT"] = data["CHIEF_CODE_ROOT"]
+    return result
 
 
 def resolve_config(existing: dict[str, str] | None, hostname: str, registry: dict) -> dict[str, str]:
@@ -86,9 +92,12 @@ def resolve_config(existing: dict[str, str] | None, hostname: str, registry: dic
     if len(matches) != 1:
         raise TrustError(f"host_not_in_trusted_registry:{hostname}")
     record = matches[0]
-    expected = validate_config({k: v for k, v in record.items() if k.startswith("CHIEF_")})
+    expected = validate_config({**{k: v for k, v in record.items() if k.startswith("CHIEF_")},
+                                "CHIEF_RUNTIME_USER": record["runtime_user"]})
     if existing:
-        actual = validate_config(existing)
+        actual = validate_config({"CHIEF_RUNTIME_USER": record["runtime_user"], **existing})
+        if "CHIEF_CODE_ROOT" in actual and actual["CHIEF_CODE_ROOT"] != expected.get("CHIEF_CODE_ROOT"):
+            raise TrustError("invalid_code_root")
         if actual["CHIEF_NODE_ID"] != expected["CHIEF_NODE_ID"]:
             raise TrustError("node_identity_conflicts_with_registry")
         # A deliberate root-owned endpoint is allowed, including hub loopback.

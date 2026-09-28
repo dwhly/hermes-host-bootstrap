@@ -977,7 +977,8 @@ class HostOps:
             self.run_artifact([git, "checkout", "--detach", target_ref], path, env=env, check=True)
 
     def _chief_code_root(self) -> str:
-        # Where the chief git working copies live. Linux/h-do1: /root/code/chief.
+        # Where the chief git working copies live. Step 0 supplies h-do1's
+        # /opt/chief/deploy override only from trusted node.env.
         # macOS: the login user's ~/code/chief (the converger runs as root, so derive
         # the login user's REAL home from the password DB — NOT /Users/<user>, because
         # the username can differ from the home dir basename, e.g. user 'danz' lives in
@@ -1006,6 +1007,16 @@ class HostOps:
     def run_artifact(self, cmd: list[str], cwd: str, **kwargs):
         guard_mutation()
         user = os.environ.get("CHIEF_RUNTIME_USER", "root")
+        if os.environ.get("CHIEF_CODE_ROOT") == "/opt/chief/deploy":
+            # Reject aliases as well as writable/non-root deployment directories
+            # before any git/build child, including rollback checkouts.
+            for path in ("/", "/opt", "/opt/chief", "/opt/chief/deploy", "/opt/chief/deploy/hermes-node"):
+                try:
+                    info = pathlib.Path(path).lstat()
+                except OSError as exc:
+                    raise ConvergerError(f"unavailable_code_root:{path}") from exc
+                if info.st_uid != 0 or info.st_mode & 0o022 or not stat_module.S_ISDIR(info.st_mode):
+                    raise ConvergerError(f"unsafe_code_root:{path}")
         account = pwd.getpwnam(user)
         if account.pw_uid:
             # Python drops supplementary groups, gid and uid before exec. User

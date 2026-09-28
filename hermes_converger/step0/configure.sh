@@ -8,7 +8,7 @@ configure_node_env() {
         trusted_path /etc/chief/node.env || return 1
         old_id=$(/usr/bin/sed -n 's/^CHIEF_NODE_ID=//p' /etc/chief/node.env)
         old_core=$(/usr/bin/sed -n 's/^CHIEF_CORE_URL=//p' /etc/chief/node.env)
-        [ -n "$old_id" ] && [ -n "$old_core" ] || { hold missing_node_identity_or_core; return 1; }
+        if [ -z "$old_id" ] || [ -z "$old_core" ]; then hold missing_node_identity_or_core; return 1; fi
     fi
     selected=''
     for record in "$BASE"/hosts/*.env; do
@@ -24,18 +24,29 @@ configure_node_env() {
                 [ ! -f "$BASE/hosts/$old_id.env" ] || selected=$BASE/hosts/$old_id.env;; esac;; esac
     fi
     [ -n "$selected" ] || { hold host_not_in_trusted_registry; return 1; }
-    id='' core='' runtime_user=''
+    id='' core='' runtime_user='' code_root='' code_root_set=no
     while IFS='=' read -r key value; do
-        case "$key" in CHIEF_NODE_ID) id=$value;; CHIEF_CORE_URL) core=$value;; CHIEF_RUNTIME_USER) runtime_user=$value;; esac
+        case "$key" in
+            CHIEF_NODE_ID) id=$value;; CHIEF_CORE_URL) core=$value;; CHIEF_RUNTIME_USER) runtime_user=$value;;
+            CHIEF_CODE_ROOT) code_root=$value; code_root_set=yes;;
+        esac
     done < "$selected"
+    if [ "$code_root_set" = yes ]; then
+        if [ "$code_root" != /opt/chief/deploy ] || [ "${TRUST_OS:-${OS:-}}" != Linux ] ||
+           [ "$runtime_user" != root ]; then hold invalid_code_root; return 1; fi
+    fi
     if [ -e /etc/chief/node.env ]; then
         # Never rewrite owner config on preserved hosts, even when invalid.
         # Accept only the established grammar; comments and bytes are retained.
         /usr/bin/awk -F= '
             /^#/ || /^$/ { next }
             NF != 2 || seen[$1]++ { exit 1 }
-            $1 !~ /^(CHIEF_NODE_ID|CHIEF_CORE_URL|CHIEF_NODE_PLAN_KEY|CHIEF_NODE_AUTH_TOKEN|CHIEF_RUNTIME_USER)$/ { exit 1 }
+            $1 !~ /^(CHIEF_NODE_ID|CHIEF_CORE_URL|CHIEF_NODE_PLAN_KEY|CHIEF_NODE_AUTH_TOKEN|CHIEF_RUNTIME_USER|CHIEF_CODE_ROOT)$/ { exit 1 }
         ' /etc/chief/node.env || { hold unexpected_node_config; return 1; }
+        if /usr/bin/grep -q '^CHIEF_CODE_ROOT=' /etc/chief/node.env; then
+            actual=$(/usr/bin/sed -n 's/^CHIEF_CODE_ROOT=//p' /etc/chief/node.env)
+            if [ "$actual" != /opt/chief/deploy ] || [ "$actual" != "$code_root" ]; then hold invalid_code_root; return 1; fi
+        fi
         [ "$old_id" = "$id" ] || { hold node_identity_conflicts_with_registry; return 1; }
         core=$old_core
         for pair in CHIEF_NODE_PLAN_KEY=/etc/chief/node-plan.key CHIEF_NODE_AUTH_TOKEN=/etc/chief/node-auth.token "CHIEF_RUNTIME_USER=$runtime_user"; do
@@ -56,6 +67,7 @@ configure_node_env() {
         printf 'CHIEF_NODE_ID=%s\nCHIEF_CORE_URL=%s\n' "$id" "$core"
         printf 'CHIEF_NODE_PLAN_KEY=/etc/chief/node-plan.key\nCHIEF_NODE_AUTH_TOKEN=/etc/chief/node-auth.token\n'
         printf 'CHIEF_RUNTIME_USER=%s\n' "$runtime_user"
+        [ "$code_root_set" != yes ] || printf 'CHIEF_CODE_ROOT=%s\n' "$code_root"
     } > "$tmp"
     /usr/sbin/chown root:chief "$tmp" 2>/dev/null || /bin/chown root:chief "$tmp"
     /bin/chmod 0640 "$tmp"

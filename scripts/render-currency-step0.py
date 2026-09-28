@@ -132,4 +132,6 @@ for old in (BASE / "hosts").glob("*.env"):
 for node, record in registry.items():
     data = {"CHIEF_NODE_ID": node, "CHIEF_CORE_URL": record["CHIEF_CORE_URL"],
             "CHIEF_RUNTIME_USER": record["runtime_user"], "REGISTRY_FQDN": record["fqdn"]}
+    if "CHIEF_CODE_ROOT" in record:
+        data["CHIEF_CODE_ROOT"] = record["CHIEF_CODE_ROOT"]
     (BASE / "hosts" / (node + ".env")).write_text("".join(f"{k}={v}\n" for k, v in data.items()))

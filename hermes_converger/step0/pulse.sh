@@ -52,10 +52,13 @@ read_state wake ''; previous=$value
 for hint in login wake network request; do
     if [ -s "$REQUESTS/$hint" ]; then trigger=$hint; pending=yes; fi
 done
-url=''
+url='' code_root=''
+unset CHIEF_CODE_ROOT
 while IFS='=' read -r name value; do
-    [ "$name" != CHIEF_CORE_URL ] || url=$value
+    case "$name" in CHIEF_CORE_URL) url=$value;; CHIEF_CODE_ROOT) code_root=$value;; esac
 done < "$CONFIG"
+# CONFIG was checked by the launcher; Python revalidates its registry contract.
+[ -z "$code_root" ] || export CHIEF_CODE_ROOT="$code_root"
 [ -n "$url" ] || { hold missing_core_url; exit 1; }
 online=no
 # Cold/relayed Tailscale paths need more than one second. Retry one miss without
@@ -98,5 +101,5 @@ if [ "$noop" = yes ]; then
 fi
 trusted_runtime
 printf 'chief-pulse at=%s decision=check trigger=%s full=%s online=%s\n' "$now" "$trigger" "$full" "$online"
-export CHIEF_PULSE_BOOT=$boot CHIEF_PULSE_TRIGGER=$trigger CHIEF_PULSE_WAKE=$wake CHIEF_PULSE_ONLINE=$online CHIEF_PULSE_FULL=$full
+export CHIEF_PULSE_BOOT="$boot" CHIEF_PULSE_TRIGGER=$trigger CHIEF_PULSE_WAKE="$wake" CHIEF_PULSE_ONLINE=$online CHIEF_PULSE_FULL=$full
 exec "$PY" -I -S -B -c 'import sys; sys.path.append("/opt/chief/lib/hermes-host-bootstrap"); from hermes_converger.runtime import run; raise SystemExit(run("converge"))'

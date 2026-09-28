@@ -33,6 +33,8 @@ def check() -> int:
         for node, record in registry.items():
             expected = {"CHIEF_NODE_ID": node, "CHIEF_CORE_URL": record["CHIEF_CORE_URL"],
                         "CHIEF_RUNTIME_USER": record["runtime_user"], "REGISTRY_FQDN": record["fqdn"]}
+            if "CHIEF_CODE_ROOT" in record:
+                expected["CHIEF_CODE_ROOT"] = record["CHIEF_CODE_ROOT"]
             actual = dict(line.split("=", 1) for line in (BASE / "hosts" / (node + ".env")).read_text().splitlines())
             if actual != expected:
                 raise ValueError("host_contract_projection_mismatch:" + node)

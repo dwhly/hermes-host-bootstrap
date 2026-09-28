@@ -187,6 +187,19 @@ closure; existing bytes are never rewritten. If their owner config is missing
 or incompatible, resolve the ownership/config contract before rollout, without
 using closure to repair owner assets.
 
+h-do1's reviewed host record sets `CHIEF_CODE_ROOT=/opt/chief/deploy`, as required
+by the product-owner amendment of 2026-09-27 in the fleet software currency EDD.
+Its converger uses a separate deployment checkout; it must never fetch into,
+check out or restart from the development tree `/root/code/chief/*`.
+Only trusted `/etc/chief/node.env` supplies this override; caller environment is
+discarded. The key accepts only `/opt/chief/deploy`, on Linux with runtime user
+`root`. Before git/build operations, the deployment root, its `hermes-node`
+directory and their parents must be root-owned directories, without symlinks or
+group/world write access. Existing node.env files stay byte-identical, including
+files without this optional key. For rollout, add the matching key to h-do1's
+trusted config and cut `chief-node.service` over to the deployment checkout;
+closure does not perform that service cutover.
+
 For an unreachable Mac, transfer the verified archive plus the reviewed
 `install-archive.sh` using verified media. For root Linux targets, transfer the
 same files through registry-derived SSH. Record **both** SHA256 values on the

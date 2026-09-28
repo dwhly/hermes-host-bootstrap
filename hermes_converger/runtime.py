@@ -186,6 +186,7 @@ def run(mode: str) -> int:
 def _run(mode: str) -> int:
     initial_wake = wake_identity()
     config = load_config()
+    os.environ.pop("CHIEF_CODE_ROOT", None)
     os.environ.update(config)
     trusted_path(STATE)
     trusted_path(pathlib.Path("/var/lib/chief/converger"), tree=True)

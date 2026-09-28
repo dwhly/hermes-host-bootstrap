@@ -121,6 +121,186 @@ def test_dispatcher_clears_all_caller_environment(tmp_path):
     assert "HOME=/var/empty" in out.stdout
 
 
+@pytest.fixture
+def configure_host(tmp_path):
+    """Run the real config writer with all writes confined to a private host."""
+    base = tmp_path / "payload"
+    (base / "hosts").mkdir(parents=True)
+    config_dir = tmp_path / "etc/chief"
+    config_dir.mkdir(parents=True)
+    config = config_dir / "node.env"
+    source = (PAYLOAD / "configure.sh").read_text().replace("/etc/chief", str(config_dir))
+    source = source.replace("host=$(/bin/hostname)", "host=h-do1")
+    source = source.replace("/usr/sbin/chown", "/usr/bin/true").replace("/bin/chown", "/usr/bin/true")
+
+    def run(code_root=None, platform="Linux", user="root"):
+        record = "CHIEF_NODE_ID=h-do1\nCHIEF_CORE_URL=http://core:8088\nCHIEF_RUNTIME_USER=" + user + "\n"
+        if code_root is not None:
+            record += "CHIEF_CODE_ROOT=" + code_root + "\n"
+        (base / "hosts/h-do1.env").write_text(record)
+        prelude = f"set -eu\nBASE={shlex.quote(str(base))}\nTRUST_OS={platform}\n"
+        prelude += 'trusted_path() { :; }\nhold() { echo "HOLD: $*" >&2; return 1; }\n'
+        return subprocess.run(["/bin/sh"], input=prelude + source + "\nconfigure_node_env\n",
+                              text=True, capture_output=True)
+    return config, run
+
+
+@pytest.mark.parametrize("code_root", [None, "/opt/chief/deploy"])
+def test_configure_optional_deployment_root_preserves_legacy_bytes(configure_host, code_root):
+    config, run = configure_host
+    result = run(code_root)
+    assert result.returncode == 0, result.stderr
+    expected = ("CHIEF_NODE_ID=h-do1\nCHIEF_CORE_URL=http://core:8088\n"
+                f"CHIEF_NODE_PLAN_KEY={config.parent}/node-plan.key\n"
+                f"CHIEF_NODE_AUTH_TOKEN={config.parent}/node-auth.token\nCHIEF_RUNTIME_USER=root\n")
+    if code_root is not None:
+        expected += "CHIEF_CODE_ROOT=/opt/chief/deploy\n"
+    assert config.read_text() == expected
+    assert stat.S_IMODE(config.stat().st_mode) == 0o640
+
+
+@pytest.mark.parametrize("code_root,platform,user", [
+    ("/evil", "Linux", "root"), ("", "Linux", "root"),
+    ("/opt/chief/deploy/", "Linux", "root"), ("/root/code/chief", "Linux", "root"),
+    ("/opt/chief/deploy", "Darwin", "root"), ("/opt/chief/deploy", "Linux", "nobody"),
+])
+def test_configure_rejects_invalid_deployment_root(configure_host, code_root, platform, user):
+    config, run = configure_host
+    result = run(code_root, platform, user)
+    assert result.returncode != 0 and "invalid_code_root" in result.stderr
+    assert not config.exists()
+
+
+@pytest.mark.parametrize("record_root,existing_root,ok", [
+    ("/opt/chief/deploy", None, True), ("/opt/chief/deploy", "/opt/chief/deploy", True),
+    ("/opt/chief/deploy", "/evil", False), ("/opt/chief/deploy", "", False),
+    (None, "/opt/chief/deploy", False),
+])
+def test_configure_existing_deployment_root_matches_record_without_rewriting(configure_host, record_root, existing_root, ok):
+    config, run = configure_host
+    content = "# retained\nCHIEF_NODE_ID=h-do1\nCHIEF_CORE_URL=http://core:8088\nCHIEF_RUNTIME_USER=root\n"
+    if existing_root is not None:
+        content += "CHIEF_CODE_ROOT=" + existing_root + "\n"
+    config.write_text(content)
+    before = config.stat()
+    result = run(record_root)
+    assert (result.returncode == 0) is ok, result.stderr
+    if not ok:
+        assert "invalid_code_root" in result.stderr
+    assert config.read_text() == content
+    assert (config.stat().st_ino, config.stat().st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+
+
+@pytest.mark.parametrize("code_root,platform,user,ok", [
+    ("/opt/chief/deploy", "linux", "root", True), (None, "linux", "root", True),
+    ("/evil", "linux", "root", False), ("", "linux", "root", False),
+    ("/opt/chief/deploy/", "linux", "root", False),
+    ("/opt/chief/deploy", "darwin", "root", False),
+    ("/opt/chief/deploy", "linux", "nobody", False),
+])
+def test_python_config_validates_optional_deployment_root(monkeypatch, code_root, platform, user, ok):
+    monkeypatch.setattr(security.sys, "platform", platform)
+    data = {"CHIEF_NODE_ID": "h-do1", "CHIEF_CORE_URL": "http://core:8088", "CHIEF_RUNTIME_USER": user}
+    if code_root is not None:
+        data["CHIEF_CODE_ROOT"] = code_root
+    if ok:
+        result = security.resolve_config(data, "h-do1", REGISTRY)
+        assert result.get("CHIEF_CODE_ROOT") == code_root
+    else:
+        with pytest.raises(security.TrustError, match="invalid_code_root"):
+            security.resolve_config(data, "h-do1", REGISTRY)
+
+
+def test_python_config_rejects_deployment_root_absent_from_record(monkeypatch):
+    monkeypatch.setattr(security.sys, "platform", "linux")
+    data = {"CHIEF_NODE_ID": "h-af", "CHIEF_CORE_URL": "http://core:8088",
+            "CHIEF_RUNTIME_USER": "root", "CHIEF_CODE_ROOT": "/opt/chief/deploy"}
+    with pytest.raises(security.TrustError, match="invalid_code_root"):
+        security.resolve_config(data, "h-af", REGISTRY)
+
+
+@pytest.mark.parametrize("code_root", [None, "/opt/chief/deploy"])
+def test_launcher_pulse_passes_only_configured_code_root(tmp_path, code_root):
+    # Execute the real env-i launcher prelude and pulse; OS/network/runtime
+    # helpers are fixtures, and the child only prints its environment.
+    state = tmp_path / "state"; state.mkdir()
+    hints = tmp_path / "hints"; hints.mkdir()
+    (hints / "network").touch()
+    config = tmp_path / "node.env"
+    config.write_text("CHIEF_CORE_URL=http://fixture\n" +
+                      ("CHIEF_CODE_ROOT=" + code_root + "\n" if code_root else ""))
+    python = tmp_path / "python"
+    python.write_text('#!/bin/sh\nprintf "code_root=%s\\n" "${CHIEF_CODE_ROOT-unset}"\n')
+    python.chmod(0o755)
+    body = f"set -eu\nTRUST_OS=Linux\nSTATE={shlex.quote(str(state))}\n"
+    body += f"REQUESTS={shlex.quote(str(hints))}\nCONFIG={shlex.quote(str(config))}\n"
+    body += f"read_state() {{ value=$2; }}\ntrusted_runtime() {{ PY={shlex.quote(str(python))}; }}\n"
+    body += (PAYLOAD / "pulse.sh").read_text().replace("/usr/bin/curl", "/usr/bin/true")
+    launcher = (PAYLOAD / "bin/hermes-converger").read_text()
+    prefix = launcher.split(" /bin/sh -c ", 1)[0] + " /bin/sh -c "
+    probe = tmp_path / "probe.sh"
+    probe.write_text(prefix + shlex.quote(body) + "\n")
+    result = subprocess.run(["/bin/sh", str(probe)], env=dict(os.environ, CHIEF_CODE_ROOT="/evil"),
+                            text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+    assert "code_root=" + (code_root or "unset") + "\n" in result.stdout
+    assert "/evil" not in result.stdout
+
+
+@pytest.mark.parametrize("code_root", [None, "/opt/chief/deploy"])
+def test_runtime_code_root_comes_only_from_loaded_config(tmp_path, monkeypatch, code_root):
+    config = {} if code_root is None else {"CHIEF_CODE_ROOT": code_root}
+    monkeypatch.setenv("CHIEF_CODE_ROOT", "/evil")
+    monkeypatch.setattr(runtime, "load_config", lambda: config)
+    monkeypatch.setattr(runtime, "wake_identity", lambda: "linux")
+    # Stop immediately after loading config, before any host state access.
+    def check_environment(path):
+        assert os.environ.get("CHIEF_CODE_ROOT") == code_root
+        raise RuntimeError("checked_environment")
+    monkeypatch.setattr(runtime, "trusted_path", check_environment)
+    with pytest.raises(RuntimeError, match="checked_environment"):
+        runtime._run("converge")
+    ops = core.HostOps(core.LocalState(tmp_path), SimpleNamespace())
+    monkeypatch.setattr(core, "IS_MACOS", False)
+    assert ops.artifact_path("hermes-node") == (code_root or "/root/code/chief") + "/hermes-node"
+
+
+@pytest.mark.parametrize("bad_path", ["/opt/chief/deploy", "/opt/chief/deploy/hermes-node"])
+@pytest.mark.parametrize("uid,mode", [(501, stat.S_IFDIR | 0o755), (0, stat.S_IFDIR | 0o775),
+                                     (0, stat.S_IFDIR | 0o757), (0, stat.S_IFLNK | 0o755), (0, None)])
+def test_deployment_trust_rejects_before_git(tmp_path, monkeypatch, bad_path, uid, mode):
+    monkeypatch.setenv("CHIEF_CODE_ROOT", "/opt/chief/deploy")
+    monkeypatch.setenv("CHIEF_RUNTIME_USER", "root")
+    def lstat(path):
+        if str(path) == bad_path:
+            if mode is None:
+                raise FileNotFoundError(str(path))
+            return SimpleNamespace(st_uid=uid, st_mode=mode)
+        return SimpleNamespace(st_uid=0, st_mode=stat.S_IFDIR | 0o755)
+    monkeypatch.setattr(pathlib.Path, "lstat", lstat)
+    monkeypatch.setattr(core.subprocess, "run", lambda *a, **k: pytest.fail("git before deployment trust"))
+    ops = core.HostOps(core.LocalState(tmp_path), SimpleNamespace())
+    with pytest.raises(core.ConvergerError, match="(unsafe|unavailable)_code_root:" + bad_path):
+        ops.run_artifact(["/usr/bin/git", "fetch", "--all", "--prune"], ops.artifact_path("hermes-node"))
+
+
+def test_trusted_deployment_root_runs_git_in_deployment_checkout(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHIEF_CODE_ROOT", "/opt/chief/deploy")
+    monkeypatch.setenv("CHIEF_RUNTIME_USER", "root")
+    observed = []
+    def lstat(path):
+        observed.append(str(path))
+        return SimpleNamespace(st_uid=0, st_mode=stat.S_IFDIR | 0o755)
+    monkeypatch.setattr(pathlib.Path, "lstat", lstat)
+    monkeypatch.setattr(core, "trusted_path", lambda *a, **k: None)
+    calls = []
+    monkeypatch.setattr(core.subprocess, "run", lambda *a, **k: calls.append((a, k)))
+    ops = core.HostOps(core.LocalState(tmp_path), SimpleNamespace())
+    ops.run_artifact(["/usr/bin/git", "fetch", "--all", "--prune"], ops.artifact_path("hermes-node"))
+    assert observed == ["/", "/opt", "/opt/chief", "/opt/chief/deploy", "/opt/chief/deploy/hermes-node"]
+    assert calls[0][1]["cwd"] == "/opt/chief/deploy/hermes-node"
+
+
 def test_root_tool_lookup_ignores_login_path(monkeypatch, tmp_path):
     monkeypatch.setenv("PATH", str(tmp_path))
     monkeypatch.setenv("SUDO_USER", "attacker")
@@ -427,9 +607,11 @@ subprocess.run(['/usr/bin/install',*args],check=True)
     validator.write_text('#!/bin/sh\necho visudo >> '+shlex.quote(str(log))+'\nif [ "$#" = 1 ]; then exec /usr/sbin/visudo -c -f '+shlex.quote(str(policy))+'; fi\nexec /usr/sbin/visudo "$@"\n')
     validator.chmod(0o755)
     for path in (base/'close.sh',base/'closure-lock.sh',base/'contain.sh',base/'configure.sh'):
-        source=path.read_text()
+        # This value is config data, never accessed by the no-Python closure.
+        source=path.read_text().replace('/opt/chief/deploy', '@DEPLOY_ROOT@')
         for directory in ('/opt/','/usr/local/','/var/lib','/var/log','/var/run','/run/','/Library/','/usr/lib/systemd','/etc/'):
             source=source.replace(directory,str(host)+directory)
+        source=source.replace('@DEPLOY_ROOT@', '/opt/chief/deploy')
         tool_pattern='|'.join(re.escape(c) for c in sorted([*commands,'/usr/bin/install','/usr/sbin/visudo'],key=len,reverse=True))
         source=re.sub(tool_pattern,lambda m:str(bin/m.group().rsplit('/',1)[1]),source)
         path.write_text(source)
