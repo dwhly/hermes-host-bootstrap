@@ -1,7 +1,7 @@
 [Unit]
 Description=Buzz relay (prod compose project): ensure the services are up after every boot
 Documentation=https://github.com/dwhly/hermes-host-bootstrap/blob/main/lib/S0-stack-boot.sh
-# Same failure mode as chief-stack.service: `unless-stopped` services stay down after a clean stop and reboot.
+# Same failure mode as hermes-chief-stack.service: `unless-stopped` services stay down after a clean stop and reboot.
 # The only one-shot is minio-init (`mc mb --ignore-existing`, idempotent), which relay requires, so a bare `up` is safe.
 Wants=docker.service tailscaled.service network-online.target
 After=docker.service tailscaled.service network-online.target

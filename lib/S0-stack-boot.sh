@@ -9,7 +9,7 @@
 # Deliberately untiered beyond E: this is incident-driven infrastructure for the boss host.
 # Gate: the host must actually own the control-plane tailnet IP that the compose overlays bind to (100.122.202.37).
 # Any other headless Linux box with a Chief checkout counts as role=server but must NOT start an h-do1-shaped stack.
-# Installs: chief-stack.service, buzz-prod.service (enabled + restarted; only when that stack's dir exists).
+# Installs: hermes-chief-stack.service, buzz-prod.service (enabled + restarted; only when that stack's dir exists).
 # Skip key: stack-boot.
 
 set -euo pipefail
@@ -41,9 +41,9 @@ if ! ip -4 addr show 2>/dev/null | grep -q "inet ${CONTROL_PLANE_IP}/"; then
   return 0 2>/dev/null || exit 0
 fi
 
-declare -A STACK_DIR=([chief-stack]=/root/code/chief/chief-stack [buzz-prod]=/root/services/buzz)
+declare -A STACK_DIR=([hermes-chief-stack]=/root/code/chief/chief-stack [buzz-prod]=/root/services/buzz)
 installed=()
-for unit in chief-stack buzz-prod; do
+for unit in hermes-chief-stack buzz-prod; do
   if [[ ! -d "${STACK_DIR[$unit]}" ]]; then
     skip "$unit: ${STACK_DIR[$unit]} not present on this host"
     continue
