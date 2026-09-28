@@ -46,6 +46,8 @@ configure_node_env() {
         if /usr/bin/grep -q '^CHIEF_CODE_ROOT=' /etc/chief/node.env; then
             actual=$(/usr/bin/sed -n 's/^CHIEF_CODE_ROOT=//p' /etc/chief/node.env)
             if [ "$actual" != /opt/chief/deploy ] || [ "$actual" != "$code_root" ]; then hold invalid_code_root; return 1; fi
+        elif [ "$code_root_set" = yes ]; then
+            hold missing_code_root; return 1
         fi
         [ "$old_id" = "$id" ] || { hold node_identity_conflicts_with_registry; return 1; }
         core=$old_core

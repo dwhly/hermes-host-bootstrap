@@ -195,10 +195,18 @@ Only trusted `/etc/chief/node.env` supplies this override; caller environment is
 discarded. The key accepts only `/opt/chief/deploy`, on Linux with runtime user
 `root`. Before git/build operations, the deployment root, its `hermes-node`
 directory and their parents must be root-owned directories, without symlinks or
-group/world write access. Existing node.env files stay byte-identical, including
-files without this optional key. For rollout, add the matching key to h-do1's
-trusted config and cut `chief-node.service` over to the deployment checkout;
-closure does not perform that service cutover.
+group/world write access. Root operations also trust-check the `hermes-node`
+and `chief-spec` trees, including the build backend used by `uv`. h-do1 refuses
+artifact commands unless the resolved code root is `/opt/chief/deploy`.
+Closure generates a missing node.env from the reviewed host record, including
+its deployment root; use that flow for fresh rollout. Existing node.env files
+are never rewritten. If the selected record requires `CHIEF_CODE_ROOT`, an
+existing file must contain the identical value: a missing key HOLDs with
+`missing_code_root`, and a mismatch HOLDs with `invalid_code_root`. Resolve an
+existing config's HOLD through reviewed config repair, then re-run closure.
+Only hosts whose record omits the key may keep a node.env without it.
+The `chief-node.service` deployment checkout cutover remains a separate rollout
+action; closure does not perform it.
 
 For an unreachable Mac, transfer the verified archive plus the reviewed
 `install-archive.sh` using verified media. For root Linux targets, transfer the

@@ -18,7 +18,7 @@ import urllib.error
 
 import pytest
 from hermes_converger import core, runtime, security
-from test_converger import make_plan, KEY, NODE, NOW
+from test_converger import make_plan, verify, KEY, NODE, NOW
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PAYLOAD = ROOT / "hermes_converger/step0"
@@ -172,9 +172,9 @@ def test_configure_rejects_invalid_deployment_root(configure_host, code_root, pl
 
 
 @pytest.mark.parametrize("record_root,existing_root,ok", [
-    ("/opt/chief/deploy", None, True), ("/opt/chief/deploy", "/opt/chief/deploy", True),
+    ("/opt/chief/deploy", None, False), ("/opt/chief/deploy", "/opt/chief/deploy", True),
     ("/opt/chief/deploy", "/evil", False), ("/opt/chief/deploy", "", False),
-    (None, "/opt/chief/deploy", False),
+    (None, "/opt/chief/deploy", False), (None, None, True),
 ])
 def test_configure_existing_deployment_root_matches_record_without_rewriting(configure_host, record_root, existing_root, ok):
     config, run = configure_host
@@ -186,29 +186,58 @@ def test_configure_existing_deployment_root_matches_record_without_rewriting(con
     result = run(record_root)
     assert (result.returncode == 0) is ok, result.stderr
     if not ok:
-        assert "invalid_code_root" in result.stderr
+        reason = "missing_code_root" if existing_root is None else "invalid_code_root"
+        assert "HOLD: " + reason in result.stderr
     assert config.read_text() == content
     assert (config.stat().st_ino, config.stat().st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
 
 
 @pytest.mark.parametrize("code_root,platform,user,ok", [
-    ("/opt/chief/deploy", "linux", "root", True), (None, "linux", "root", True),
+    ("/opt/chief/deploy", "linux", "root", True), (None, "linux", "root", False),
     ("/evil", "linux", "root", False), ("", "linux", "root", False),
     ("/opt/chief/deploy/", "linux", "root", False),
     ("/opt/chief/deploy", "darwin", "root", False),
     ("/opt/chief/deploy", "linux", "nobody", False),
 ])
-def test_python_config_validates_optional_deployment_root(monkeypatch, code_root, platform, user, ok):
+def test_python_config_validates_optional_deployment_root(tmp_path, monkeypatch, code_root, platform, user, ok):
     monkeypatch.setattr(security.sys, "platform", platform)
     data = {"CHIEF_NODE_ID": "h-do1", "CHIEF_CORE_URL": "http://core:8088", "CHIEF_RUNTIME_USER": user}
     if code_root is not None:
         data["CHIEF_CODE_ROOT"] = code_root
+    config = tmp_path / "node.env"
+    content = "# retained\n" + "".join(f"{key}={value}\n" for key, value in data.items())
+    config.write_text(content)
+    before = config.stat()
+    data = security.read_env(config)
     if ok:
         result = security.resolve_config(data, "h-do1", REGISTRY)
         assert result.get("CHIEF_CODE_ROOT") == code_root
     else:
-        with pytest.raises(security.TrustError, match="invalid_code_root"):
+        reason = "missing_code_root" if code_root is None else "invalid_code_root"
+        with pytest.raises(security.TrustError, match=reason):
             security.resolve_config(data, "h-do1", REGISTRY)
+    assert config.read_text() == content
+    assert (config.stat().st_ino, config.stat().st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+
+
+def test_python_config_accepts_missing_deployment_root_when_record_omits_it():
+    data = {"CHIEF_NODE_ID": "h-af", "CHIEF_CORE_URL": "http://core:8088"}
+    result = security.resolve_config(data, "h-af", REGISTRY)
+    assert "CHIEF_CODE_ROOT" not in result
+    assert result["CHIEF_CORE_URL"] == data["CHIEF_CORE_URL"]
+
+
+def test_python_config_rejects_empty_existing_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(security.sys, "platform", "linux")
+    config = tmp_path / "node.env"
+    content = "# retained\n"
+    config.write_text(content)
+    before = config.stat()
+    with pytest.raises(security.TrustError, match="missing_or_invalid_node_config"):
+        security.resolve_config(security.read_env(config), "h-do1", REGISTRY)
+    assert config.read_text() == content
+    assert (config.stat().st_ino, config.stat().st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+    assert security.resolve_config(None, "h-do1", REGISTRY)["CHIEF_CODE_ROOT"] == "/opt/chief/deploy"
 
 
 def test_python_config_rejects_deployment_root_absent_from_record(monkeypatch):
@@ -266,10 +295,11 @@ def test_runtime_code_root_comes_only_from_loaded_config(tmp_path, monkeypatch, 
 
 
 @pytest.mark.parametrize("bad_path", ["/opt/chief/deploy", "/opt/chief/deploy/hermes-node"])
+@pytest.mark.parametrize("code_root", ["/opt/chief/deploy", "/opt/chief/deploy/"])
 @pytest.mark.parametrize("uid,mode", [(501, stat.S_IFDIR | 0o755), (0, stat.S_IFDIR | 0o775),
                                      (0, stat.S_IFDIR | 0o757), (0, stat.S_IFLNK | 0o755), (0, None)])
-def test_deployment_trust_rejects_before_git(tmp_path, monkeypatch, bad_path, uid, mode):
-    monkeypatch.setenv("CHIEF_CODE_ROOT", "/opt/chief/deploy")
+def test_deployment_trust_rejects_before_git(tmp_path, monkeypatch, bad_path, code_root, uid, mode):
+    monkeypatch.setenv("CHIEF_CODE_ROOT", code_root)
     monkeypatch.setenv("CHIEF_RUNTIME_USER", "root")
     def lstat(path):
         if str(path) == bad_path:
@@ -284,21 +314,124 @@ def test_deployment_trust_rejects_before_git(tmp_path, monkeypatch, bad_path, ui
         ops.run_artifact(["/usr/bin/git", "fetch", "--all", "--prune"], ops.artifact_path("hermes-node"))
 
 
-def test_trusted_deployment_root_runs_git_in_deployment_checkout(tmp_path, monkeypatch):
-    monkeypatch.setenv("CHIEF_CODE_ROOT", "/opt/chief/deploy")
+@pytest.mark.parametrize("code_root", ["/opt/chief/deploy", "/opt/chief/deploy/"])
+def test_trusted_deployment_root_runs_git_in_deployment_checkout(tmp_path, monkeypatch, code_root):
+    monkeypatch.setenv("CHIEF_CODE_ROOT", code_root)
+    monkeypatch.setenv("CHIEF_NODE_ID", "h-do1")
     monkeypatch.setenv("CHIEF_RUNTIME_USER", "root")
     observed = []
     def lstat(path):
         observed.append(str(path))
         return SimpleNamespace(st_uid=0, st_mode=stat.S_IFDIR | 0o755)
     monkeypatch.setattr(pathlib.Path, "lstat", lstat)
-    monkeypatch.setattr(core, "trusted_path", lambda *a, **k: None)
+    trusted = []
+    monkeypatch.setattr(core, "trusted_path", lambda path, **kw: trusted.append((str(path), kw)))
     calls = []
     monkeypatch.setattr(core.subprocess, "run", lambda *a, **k: calls.append((a, k)))
     ops = core.HostOps(core.LocalState(tmp_path), SimpleNamespace())
     ops.run_artifact(["/usr/bin/git", "fetch", "--all", "--prune"], ops.artifact_path("hermes-node"))
     assert observed == ["/", "/opt", "/opt/chief", "/opt/chief/deploy", "/opt/chief/deploy/hermes-node"]
+    assert trusted == [("/opt/chief/deploy/chief-spec", {"tree": True}),
+                       ("/opt/chief/deploy/hermes-node", {"tree": True}), ("/usr/bin/git", {})]
     assert calls[0][1]["cwd"] == "/opt/chief/deploy/hermes-node"
+
+
+@pytest.mark.parametrize("code_root", [None, "", "/root/code/chief", "/evil", "/opt/chief/deploy"])
+def test_h_do1_refuses_non_deployment_root_before_subprocess(tmp_path, monkeypatch, code_root):
+    monkeypatch.setenv("CHIEF_NODE_ID", "h-do1")
+    monkeypatch.setattr(core, "IS_MACOS", False)
+    if code_root is None:
+        monkeypatch.delenv("CHIEF_CODE_ROOT", raising=False)
+    else:
+        monkeypatch.setenv("CHIEF_CODE_ROOT", code_root)
+    ops = core.HostOps(core.LocalState(tmp_path), SimpleNamespace())
+    if code_root == "/opt/chief/deploy":
+        # Even a matching env string cannot override a different resolved root.
+        monkeypatch.setattr(ops, "_chief_code_root", lambda: "/root/code/chief")
+    monkeypatch.setattr(core.subprocess, "run", lambda *a, **k: pytest.fail("subprocess before root refusal"))
+    with pytest.raises(core.ConvergerError, match="unsafe_code_root:" + ops._chief_code_root()):
+        ops.run_artifact(["/usr/bin/git", "fetch"], ops.artifact_path("hermes-node"))
+
+
+@pytest.mark.parametrize("operation", ["install", "rollback"])
+@pytest.mark.parametrize("unsafe", ["symlink", "group_writable"])
+def test_install_and_rollback_refuse_real_unsafe_checkout(tmp_path, monkeypatch, operation, unsafe):
+    deployment = tmp_path / "deploy"
+    checkout = deployment / "hermes-node"
+    checkout.mkdir(parents=True)
+    if unsafe == "symlink":
+        target = tmp_path / "checkout-target"
+        target.mkdir()
+        checkout.rmdir()
+        checkout.symlink_to(target, target_is_directory=True)
+        assert checkout.is_symlink()
+    else:
+        checkout.chmod(0o775)
+        assert checkout.stat().st_mode & stat.S_IWGRP
+
+    monkeypatch.setenv("CHIEF_NODE_ID", "h-do1")
+    monkeypatch.setenv("CHIEF_CODE_ROOT", "/opt/chief/deploy")
+    monkeypatch.setenv("CHIEF_RUNTIME_USER", "root")
+    original_lstat = pathlib.Path.lstat
+    observed = []
+    def lstat(path):
+        # Redirect only deployment metadata reads to real files under tmp_path.
+        # Ownership/outer parents are synthetic so this also runs without root.
+        if str(path) in {"/", "/opt", "/opt/chief"}:
+            return SimpleNamespace(st_uid=0, st_mode=stat.S_IFDIR | 0o755)
+        if str(path) in {"/opt/chief/deploy", "/opt/chief/deploy/hermes-node"}:
+            observed.append(str(path))
+            actual = deployment / path.relative_to("/opt/chief/deploy")
+            info = list(original_lstat(actual))
+            info[4] = 0
+            return os.stat_result(info)
+        return original_lstat(path)
+    monkeypatch.setattr(pathlib.Path, "lstat", lstat)
+    monkeypatch.setattr(core, "_resolve_tool", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(core, "_git_fetch_env", lambda: {})
+    monkeypatch.setattr(core.subprocess, "run", lambda *a, **k: pytest.fail("subprocess before unsafe-root refusal"))
+    state = core.LocalState(tmp_path)
+    state.write_json_0640(state.state_dir / "last-known-good.json", {"hermes-node": {
+        "restore_method": "git_checkout+uv_install+systemd_restart",
+        "disk_ref": "def5678", "running_ref": "def5678",
+    }})
+    ops = core.HostOps(state, SimpleNamespace())
+    events = []
+    monkeypatch.setattr(ops, "emit", lambda event, plan, **kw: events.append((event, kw)))
+    plan = verify(make_plan())
+    if operation == "install":
+        with pytest.raises(core.ConvergerError, match="unsafe_code_root:/opt/chief/deploy/hermes-node"):
+            ops.install_restart_required(plan)
+    else:
+        assert core.attempt_rollback_once(plan, ops) is False
+        assert events == [("failed", {"reason": "rollback_ConvergerError", "verification": None})]
+    assert observed == ["/opt/chief/deploy", "/opt/chief/deploy/hermes-node"]
+
+
+def test_install_rejects_untrusted_chief_spec_tree_before_uv(tmp_path, monkeypatch, metadata):
+    spec = tmp_path / "chief-spec"
+    backend = spec / "sdk/python/build_backend.py"
+    backend.parent.mkdir(parents=True)
+    backend.write_text("# fixture build backend\n")
+    backend.chmod(0o664)
+    monkeypatch.setenv("CHIEF_NODE_ID", "h-do1")
+    monkeypatch.setenv("CHIEF_CODE_ROOT", "/opt/chief/deploy")
+    monkeypatch.setenv("CHIEF_RUNTIME_USER", "root")
+    original_lstat = pathlib.Path.lstat
+    def lstat(path):
+        if str(path) in {"/", "/opt", "/opt/chief", "/opt/chief/deploy", "/opt/chief/deploy/hermes-node"}:
+            return SimpleNamespace(st_uid=0, st_mode=stat.S_IFDIR | 0o755)
+        return original_lstat(path)
+    monkeypatch.setattr(pathlib.Path, "lstat", lstat)
+    def trusted_path(path, **kwargs):
+        if str(path) == "/opt/chief/deploy/chief-spec":
+            security.trusted_path(spec, **kwargs)
+    monkeypatch.setattr(core, "trusted_path", trusted_path)
+    monkeypatch.setattr(core, "_resolve_tool", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(core.subprocess, "run", lambda *a, **k: pytest.fail("uv before chief-spec trust"))
+    ops = core.HostOps(core.LocalState(tmp_path), SimpleNamespace())
+    with pytest.raises(security.TrustError, match="untrusted_path:" + re.escape(str(backend))):
+        ops.install_restart_required(verify(make_plan()))
 
 
 def test_root_tool_lookup_ignores_login_path(monkeypatch, tmp_path):

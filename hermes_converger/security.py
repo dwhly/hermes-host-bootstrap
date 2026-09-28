@@ -94,8 +94,10 @@ def resolve_config(existing: dict[str, str] | None, hostname: str, registry: dic
     record = matches[0]
     expected = validate_config({**{k: v for k, v in record.items() if k.startswith("CHIEF_")},
                                 "CHIEF_RUNTIME_USER": record["runtime_user"]})
-    if existing:
+    if existing is not None:
         actual = validate_config({"CHIEF_RUNTIME_USER": record["runtime_user"], **existing})
+        if "CHIEF_CODE_ROOT" in expected and "CHIEF_CODE_ROOT" not in actual:
+            raise TrustError("missing_code_root")
         if "CHIEF_CODE_ROOT" in actual and actual["CHIEF_CODE_ROOT"] != expected.get("CHIEF_CODE_ROOT"):
             raise TrustError("invalid_code_root")
         if actual["CHIEF_NODE_ID"] != expected["CHIEF_NODE_ID"]:

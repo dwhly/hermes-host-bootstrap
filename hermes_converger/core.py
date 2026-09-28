@@ -1007,7 +1007,10 @@ class HostOps:
     def run_artifact(self, cmd: list[str], cwd: str, **kwargs):
         guard_mutation()
         user = os.environ.get("CHIEF_RUNTIME_USER", "root")
-        if os.environ.get("CHIEF_CODE_ROOT") == "/opt/chief/deploy":
+        code_root = self._chief_code_root()
+        if os.environ.get("CHIEF_NODE_ID") == "h-do1" and code_root != "/opt/chief/deploy":
+            raise ConvergerError(f"unsafe_code_root:{code_root}")
+        if code_root == "/opt/chief/deploy":
             # Reject aliases as well as writable/non-root deployment directories
             # before any git/build child, including rollback checkouts.
             for path in ("/", "/opt", "/opt/chief", "/opt/chief/deploy", "/opt/chief/deploy/hermes-node"):
@@ -1025,6 +1028,9 @@ class HostOps:
                              "PATH": f"{account.pw_dir}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"}
             kwargs.update(user=account.pw_uid, group=account.pw_gid, extra_groups=[])
         else:
+            if code_root == "/opt/chief/deploy":
+                # The hermes-node uv install also executes this sibling's build backend.
+                trusted_path(pathlib.Path(code_root) / "chief-spec", tree=True)
             trusted_path(pathlib.Path(cwd), tree=True)
             trusted_path(pathlib.Path(cmd[0]))
         return subprocess.run(cmd, cwd=cwd, **kwargs)
