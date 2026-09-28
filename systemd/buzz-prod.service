@@ -1,17 +1,22 @@
 [Unit]
 Description=Buzz relay (prod compose project): ensure the services are up after every boot
-Documentation=https://github.com/dwhly/hermes-host-bootstrap/blob/main/lib/97-stack-boot.sh
+Documentation=https://github.com/dwhly/hermes-host-bootstrap/blob/main/lib/S0-stack-boot.sh
 # Same failure mode as chief-stack.service: `unless-stopped` services stay down after a clean stop and reboot.
-Requires=docker.service
-After=docker.service network-online.target tailscaled.service
-Wants=network-online.target
+# The only one-shot is minio-init (`mc mb --ignore-existing`, idempotent), which relay requires, so a bare `up` is safe.
+Wants=docker.service tailscaled.service network-online.target
+After=docker.service tailscaled.service network-online.target
+StartLimitIntervalSec=15min
+StartLimitBurst=8
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/root/services/buzz
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 90); do ip -4 addr show dev tailscale0 2>/dev/null | grep -q "inet 100.122.202.37/" && exit 0; sleep 2; done; echo "tailnet IP 100.122.202.37 not up after 180s" >&2; exit 1'
 ExecStart=/usr/bin/docker compose -p buzz-prod -f deploy/compose/compose.yml -f deploy/compose/compose.hdo1.yml up -d --no-build
-TimeoutStartSec=300
+Restart=on-failure
+RestartSec=15s
+TimeoutStartSec=480
 
 [Install]
 WantedBy=multi-user.target
