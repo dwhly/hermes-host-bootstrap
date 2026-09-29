@@ -14,8 +14,32 @@ else
   VERIFY=0
 fi
 
+# ── Failure explanation ────────────────────────────────────────────────
+# hmw must never fail silently. Every launcher error goes to stderr AND, when
+# running as the remote re-entry, to HMW_ERR_FILE on that host so the origin
+# can re-print it AFTER the post-SSH terminal reset (which otherwise leaves the
+# remote's message as a one-frame flicker).
+HMW_LOG_DIR="${HMW_LOG_DIR:-$HOME/.hermes/logs}"
+HMW_ERR_FILE="$HMW_LOG_DIR/hmw-last-error.log"
+HMW_FAILURE_LOG="$HMW_LOG_DIR/hmw-last-failure.log"
+
+hmw_errf() {
+  local fmt=$1
+  shift
+  # shellcheck disable=SC2059
+  printf "$fmt" "$@" >&2
+  if [ "${HMW_REMOTE:-0}" = "1" ]; then
+    # shellcheck disable=SC2059
+    { mkdir -p "$HMW_LOG_DIR" && printf "$fmt" "$@" >>"$HMW_ERR_FILE"; } 2>/dev/null || :
+  fi
+}
+
+hmw_note() {
+  printf 'hmw: %s\n' "$*" >&2
+}
+
 usage_error() {
-  printf 'hermes-workspace: %s\n' "$1" >&2
+  hmw_errf 'hermes-workspace: %s\n' "$1"
   exit 2
 }
 
@@ -79,16 +103,112 @@ resolve_default_target() {
 resolve_ssh_target() {
   local resolved
 
+  RESOLVE_NOTE=""
   case "$REQUEST_HOST" in
     *@*) SSH_TARGET="$REQUEST_HOST" ;;
     *)
       resolved=""
       if command -v hermes-host-resolve >/dev/null 2>&1; then
         resolved="$(hermes-host-resolve "$REQUEST_HOST" 2>/dev/null)"
+      else
+        RESOLVE_NOTE="the fleet resolver (hermes-host-resolve) is not on PATH — run hmr to install it"
       fi
       SSH_TARGET="${resolved:-$REQUEST_HOST}"
+      case "$SSH_TARGET" in
+        *@*) ;;
+        *)
+          [ -n "$RESOLVE_NOTE" ] || RESOLVE_NOTE="'$REQUEST_HOST' is not in the fleet registry (${HERMES_HOME:-$HOME/.hermes}/hosts/$REQUEST_HOST.yaml is missing), so ssh picks the login user from ~/.ssh/config or your local username ($(id -un 2>/dev/null))"
+          hmw_note "warning: $RESOLVE_NOTE."
+          hmw_note "         if that's the wrong user, copy the registry entry from h-do1 or run: hmw <user>@$REQUEST_HOST"
+          ;;
+      esac
       ;;
   esac
+}
+
+# Classify a failed SSH attempt into a human reason + fix. Runs ONLY after a
+# failure (never on the happy path), using a bounded non-interactive probe.
+explain_ssh_failure() {
+  local probe reason fix offered user
+  user="${SSH_TARGET%@*}"
+  [ "$user" != "$SSH_TARGET" ] || user="(ssh default: $(id -un 2>/dev/null))"
+  probe="$(ssh -v -o BatchMode=yes -o ConnectTimeout="${HMW_DIAG_TIMEOUT:-8}" \
+    -o ServerAliveInterval=5 -o ServerAliveCountMax=2 "$SSH_TARGET" true 2>&1 </dev/null)"
+  case "$probe" in
+    *"Could not resolve hostname"*)
+      reason="the name '${SSH_TARGET#*@}' does not resolve"
+      fix="check Tailscale on THIS machine (tailscale status; tailscale up), or add the host to ~/.hermes/hosts/" ;;
+    *"login.tailscale.com"*)
+      reason="Tailscale SSH on the target wants a browser re-approval"
+      fix="open the login.tailscale.com URL shown in: ssh $SSH_TARGET true" ;;
+    *"REMOTE HOST IDENTIFICATION HAS CHANGED"*|*"Host key verification failed"*)
+      reason="the target's SSH host key does not match ~/.ssh/known_hosts (host rebuilt/re-keyed?)"
+      fix="verify the host, then: ssh-keygen -R ${SSH_TARGET#*@}" ;;
+    *"Permission denied"*)
+      offered="$(printf '%s\n' "$probe" | tr -d '\r' | sed -n 's/^debug1: Offering public key: //p' | awk '{print $1" "$3}' | tr '\n' ';' | sed 's/;$//; s/;/; /g')"
+      reason="the target rejected every key this machine offered for user '$user'${offered:+ (offered: $offered)}"
+      fix="either the user is wrong (fix ~/.hermes/hosts/<host>.yaml ssh_user, or run hmw <user>@host), or this machine's key is not authorized there — append your ~/.ssh/id_*.pub to the target user's ~/.ssh/authorized_keys (e.g. via h-do1, which reaches every node)" ;;
+    *"Connection refused"*)
+      reason="nothing is listening on the target's SSH port"
+      fix="start sshd on the target (on a Mac: System Settings → General → Sharing → Remote Login)" ;;
+    *"timed out"*|*"Operation timed out"*|*"No route to host"*|*"Network is unreachable"*)
+      reason="the target did not answer within ${HMW_DIAG_TIMEOUT:-8}s (offline, asleep, or network path down)"
+      fix="check: tailscale status; tailscale ping ${SSH_TARGET#*@}" ;;
+    *)
+      if ssh -o BatchMode=yes -o ConnectTimeout="${HMW_DIAG_TIMEOUT:-8}" "$SSH_TARGET" true </dev/null >/dev/null 2>&1; then
+        reason="SSH works now, so the session was dropped (network change, sleep, or a transient error)"
+        fix="rerun hmw — the workspace keeps running on the host and will reattach"
+      else
+        reason="ssh failed for an unrecognised reason"
+        fix="see the ssh -v transcript in $HMW_FAILURE_LOG"
+      fi ;;
+  esac
+  EXPLAIN_REASON="$reason"
+  EXPLAIN_FIX="$fix"
+  EXPLAIN_PROBE="$probe"
+}
+
+report_failure() {
+  local status=$1 elapsed=$2 remote_err=""
+
+  EXPLAIN_REASON=""; EXPLAIN_FIX=""; EXPLAIN_PROBE=""
+  if [ "$status" -eq 255 ]; then
+    if [ "$VERIFY" != "1" ] && [ "$elapsed" -ge "${HMW_DROP_SECONDS:-30}" ]; then
+      hmw_note "connection to ${REQUEST_HOST} dropped after ${elapsed}s (network change or sleep). The workspace is still running there — rerun hmw to reattach."
+      return 0
+    fi
+    explain_ssh_failure
+  else
+    remote_err="$(ssh -o BatchMode=yes -o ConnectTimeout="${HMW_DIAG_TIMEOUT:-8}" "$SSH_TARGET" \
+      "cat \"\$HOME/.hermes/logs/hmw-last-error.log\" 2>/dev/null" </dev/null 2>/dev/null)"
+    if [ "$status" -eq 127 ]; then
+      EXPLAIN_REASON="'hermes-workspace' was not found on ${REQUEST_HOST}'s PATH"
+      EXPLAIN_FIX="on ${REQUEST_HOST}: run hmr (bootstrap links ~/.local/bin/hermes-workspace), or check the repo checkout"
+    elif [ -n "$remote_err" ]; then
+      EXPLAIN_REASON="the workspace launcher on ${REQUEST_HOST} failed: $(printf '%s' "$remote_err" | sed 's/^hermes-workspace: //' | tr '\n' ' ')"
+      EXPLAIN_FIX="act on the message above; re-run with HMW_VERIFY=1 hmw ${REQUEST_HOST} for a non-attaching check"
+    else
+      EXPLAIN_REASON="the remote workspace exited with status $status and recorded no launcher error"
+      EXPLAIN_FIX="re-run with HMW_VERIFY=1 hmw ${REQUEST_HOST}; inspect the Herdr/tmux session there"
+    fi
+  fi
+
+  {
+    printf '\nhmw: ✗ could not open the workspace on %s (%s), exit %s\n' "$REQUEST_HOST" "$SSH_TARGET" "$status"
+    [ -z "${RESOLVE_NOTE:-}" ] || printf '  note: %s\n' "$RESOLVE_NOTE"
+    printf '  why:  %s\n' "$EXPLAIN_REASON"
+    printf '  fix:  %s\n' "$EXPLAIN_FIX"
+    printf '  log:  %s\n' "$HMW_FAILURE_LOG"
+  } >&2
+  {
+    mkdir -p "$HMW_LOG_DIR"
+    {
+      printf '%s hmw %s -> %s exit=%s elapsed=%ss\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$REQUEST_HOST" "$SSH_TARGET" "$status" "$elapsed"
+      printf 'note: %s\nwhy: %s\nfix: %s\n' "${RESOLVE_NOTE:-}" "$EXPLAIN_REASON" "$EXPLAIN_FIX"
+      [ -z "$remote_err" ] || printf -- '--- remote launcher error ---\n%s\n' "$remote_err"
+      [ -z "$EXPLAIN_PROBE" ] || printf -- '--- ssh -v probe ---\n%s\n' "$EXPLAIN_PROBE"
+    } >"$HMW_FAILURE_LOG"
+  } 2>/dev/null || :
 }
 
 shell_quote() {
@@ -98,7 +218,7 @@ shell_quote() {
 }
 
 dispatch_remote() {
-  local payload remote_command ssh_status
+  local payload remote_command ssh_status ssh_started
   local ssh_keepalive_interval ssh_keepalive_count
 
   # shellcheck disable=SC2016
@@ -117,8 +237,12 @@ dispatch_remote() {
   case "$ssh_keepalive_count" in ''|*[!0-9]*) usage_error 'HMW_SERVER_ALIVE_COUNT_MAX must be a non-negative decimal' ;; esac
 
   if [ "$VERIFY" = "1" ]; then
-    exec ssh -o "ServerAliveInterval=$ssh_keepalive_interval" -o "ServerAliveCountMax=$ssh_keepalive_count" "$SSH_TARGET" "$remote_command"
+    ssh -o "ServerAliveInterval=$ssh_keepalive_interval" -o "ServerAliveCountMax=$ssh_keepalive_count" "$SSH_TARGET" "$remote_command"
+    ssh_status=$?
+    [ "$ssh_status" -eq 0 ] || report_failure "$ssh_status" 0
+    return "$ssh_status"
   else
+    ssh_started=$SECONDS
     ssh -o "ServerAliveInterval=$ssh_keepalive_interval" -o "ServerAliveCountMax=$ssh_keepalive_count" -t "$SSH_TARGET" "$remote_command"
     ssh_status=$?
     # Herdr/Hermes enable Kitty keyboard + modifyOtherKeys on the OUTER local
@@ -133,6 +257,8 @@ dispatch_remote() {
         stty sane 2>/dev/null || true
       fi
     fi
+    # Explain AFTER the terminal reset so the message survives on screen.
+    [ "$ssh_status" -eq 0 ] || report_failure "$ssh_status" "$((SECONDS - ssh_started))"
     return "$ssh_status"
   fi
 }
@@ -206,7 +332,7 @@ tmux_slot_inventory() {
 
   tmux_slots_clear
   if ! TMUX_INVENTORY="$(tmux list-panes -t ws:ws -F "#{pane_id}${TMUX_SEPARATOR}#{@hmw_label}${TMUX_SEPARATOR}#{pane_start_command}")"; then
-    printf 'hermes-workspace: unable to inventory tmux workspace ws:ws\n' >&2
+    hmw_errf 'hermes-workspace: unable to inventory tmux workspace ws:ws\n'
     return 1
   fi
 
@@ -269,7 +395,7 @@ ensure_tmux_workspace() {
   local number label command pane_id added
 
   if ! command -v hermes-pane >/dev/null 2>&1; then
-    printf "hermes-workspace: 'hermes-pane' not on PATH — run hermes-reload (hmr) to install it.\n" >&2
+    hmw_errf "hermes-workspace: 'hermes-pane' not on PATH — run hermes-reload (hmr) to install it.\n"
     return 1
   fi
 
@@ -380,7 +506,7 @@ ensure_herdr_server() {
   done
 
   socket="${XDG_CONFIG_HOME:-$HOME/.config}/herdr/sessions/$SESSION/herdr.sock"
-  printf "hermes-workspace: Herdr session '%s' did not become ready at %s\n" "$SESSION" "$socket" >&2
+  hmw_errf "hermes-workspace: Herdr session '%s' did not become ready at %s\n" "$SESSION" "$socket"
   return 1
 }
 
@@ -459,7 +585,7 @@ try:
 except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError):
     raise SystemExit(1)
 sys.stdout.write("\n".join(name + "\t" + target for name, target in records.items()))')"; then
-    printf "hermes-workspace: malformed agent inventory for Herdr session '%s'; refusing to create agents\n" "$SESSION" >&2
+    hmw_errf "hermes-workspace: malformed agent inventory for Herdr session '%s'; refusing to create agents\n" "$SESSION"
     return 1
   fi
 
@@ -497,7 +623,7 @@ herdr_slot_inventory() {
     fi
     attempt=$((attempt + 1))
   done
-  printf "hermes-workspace: unable to inventory Herdr session '%s' after 3 attempts\n" "$SESSION" >&2
+  hmw_errf "hermes-workspace: unable to inventory Herdr session '%s' after 3 attempts\n" "$SESSION"
   return 1
 }
 
@@ -556,14 +682,14 @@ herdr_resolve_requested_slots() {
   while [ "$number" -le "$REQUEST_COUNT" ]; do
     label="$(label_for "$number")"
     if ! herdr_has_label "$label"; then
-      printf "hermes-workspace: Herdr session '%s' is missing expected agent %s after creation\n" "$SESSION" "$label" >&2
+      hmw_errf "hermes-workspace: Herdr session '%s' is missing expected agent %s after creation\n" "$SESSION" "$label"
       return 1
     fi
     target="$(herdr_resolve_label "$label")" || return
     while IFS= read -r record; do
       old_target=${record#*$'\t'}
       if [ "$old_target" = "$target" ]; then
-        printf "hermes-workspace: duplicate resolved target %s for %s in session '%s'\n" "$target" "$label" "$SESSION" >&2
+        hmw_errf "hermes-workspace: duplicate resolved target %s for %s in session '%s'\n" "$target" "$label" "$SESSION"
         return 1
       fi
     done <<< "$resolved"
@@ -582,7 +708,7 @@ try:
         raise ValueError
 except (ValueError, KeyError, TypeError, AttributeError, IndexError):
     raise SystemExit(1)'; then
-    printf "hermes-workspace: conflicting inventory identity for resolved slots in Herdr session '%s'; refusing to reuse panes\n" "$SESSION" >&2
+    hmw_errf "hermes-workspace: conflicting inventory identity for resolved slots in Herdr session '%s'; refusing to reuse panes\n" "$SESSION"
     return 1
   fi
   # Cache the complete checked mapping, including legacy agent-get results.
@@ -642,13 +768,13 @@ try:
         raise ValueError
 except (OSError, ValueError, KeyError, TypeError, AttributeError):
     raise SystemExit(1)' "$target"; then
-      printf "hermes-workspace: unable to focus exact pane %s for %s in session '%s'\n" "$target" "$label" "$SESSION" >&2
+      hmw_errf "hermes-workspace: unable to focus exact pane %s for %s in session '%s'\n" "$target" "$label" "$SESSION"
       return 1
     fi
   fi
   pane_json="$("${HERDR[@]}" pane get "$target")" || return
   if ! printf '%s' "$pane_json" | herdr_pane_matches_slot "$target" "$label" 1; then
-    printf "hermes-workspace: exact focus of %s (%s) was not confirmed in session '%s'\n" "$label" "$target" "$SESSION" >&2
+    hmw_errf "hermes-workspace: exact focus of %s (%s) was not confirmed in session '%s'\n" "$label" "$target" "$SESSION"
     return 1
   fi
 }
@@ -876,7 +1002,7 @@ start_herdr_agent_in_new_pane() {
   "${HERDR[@]}" pane rename "$pane_id" "$label" >/dev/null || return
   "${HERDR[@]}" pane run "$pane_id" "hermes-pane $label" >/dev/null || return
   if ! herdr_wait_for_agent_pane "$pane_id" "$label"; then
-    printf "hermes-workspace: Hermes did not become ready in pane %s for %s in session '%s'\n" "$pane_id" "$label" "$SESSION" >&2
+    hmw_errf "hermes-workspace: Hermes did not become ready in pane %s for %s in session '%s'\n" "$pane_id" "$label" "$SESSION"
     return 1
   fi
   if [ -n "$HERDR_NAMES" ]; then
@@ -893,15 +1019,15 @@ ensure_herdr_workspace() {
   local number label added legacy_start target
 
   if ! command -v python3 >/dev/null 2>&1; then
-    printf 'hermes-workspace: Python 3 is required for the Herdr backend; install python3 and retry.\n' >&2
+    hmw_errf 'hermes-workspace: Python 3 is required for the Herdr backend; install python3 and retry.\n'
     return 1
   fi
   if ! command -v herdr >/dev/null 2>&1; then
-    printf "hermes-workspace: 'herdr' not on PATH — install Herdr before using the Herdr backend.\n" >&2
+    hmw_errf "hermes-workspace: 'herdr' not on PATH — install Herdr before using the Herdr backend.\n"
     return 1
   fi
   if ! command -v hermes-pane >/dev/null 2>&1; then
-    printf "hermes-workspace: 'hermes-pane' not on PATH — run hermes-reload (hmr) to install it.\n" >&2
+    hmw_errf "hermes-workspace: 'hermes-pane' not on PATH — run hermes-reload (hmr) to install it.\n"
     return 1
   fi
 
@@ -922,11 +1048,11 @@ ensure_herdr_workspace() {
         start_herdr_agent_in_new_pane "$label" || return
       elif ! "${HERDR[@]}" agent start "$label" --split right --no-focus -- hermes-pane "$label" >/dev/null; then
         if ! herdr_slot_inventory; then
-          printf "hermes-workspace: Herdr agent start failed for %s in session '%s', and inventory refresh could not confirm a competing launch; inspect Herdr server output and retry\n" "$label" "$SESSION" >&2
+          hmw_errf "hermes-workspace: Herdr agent start failed for %s in session '%s', and inventory refresh could not confirm a competing launch; inspect Herdr server output and retry\n" "$label" "$SESSION"
           return 1
         fi
         if ! herdr_has_label "$label"; then
-          printf "hermes-workspace: Herdr agent start failed for %s in session '%s', and %s is still absent after inventory refresh; inspect Herdr server output and retry\n" "$label" "$SESSION" "$label" >&2
+          hmw_errf "hermes-workspace: Herdr agent start failed for %s in session '%s', and %s is still absent after inventory refresh; inspect Herdr server output and retry\n" "$label" "$SESSION" "$label"
           return 1
         fi
       fi
@@ -944,7 +1070,7 @@ ensure_herdr_workspace() {
     label="$(label_for "$number")"
     target="$(herdr_target_for_label "$label")" || return
     if ! herdr_wait_for_agent_pane "$target" "$label"; then
-      printf "hermes-workspace: Hermes is not ready in existing pane %s for %s in session '%s'; inspect the pane and relaunch Hermes there (no duplicate was created)\n" "$target" "$label" "$SESSION" >&2
+      hmw_errf "hermes-workspace: Hermes is not ready in existing pane %s for %s in session '%s'; inspect the pane and relaunch Hermes there (no duplicate was created)\n" "$target" "$label" "$SESSION"
       return 1
     fi
     number=$((number + 1))
@@ -974,6 +1100,10 @@ if [ "$BACKEND" = "herdr" ]; then
   [ -n "$SESSION" ] || usage_error 'HERDR_SESSION must not be empty'
 fi
 
+if [ "${HMW_REMOTE:-0}" = "1" ]; then
+  # Fresh error record per remote run, so the origin never re-prints a stale one.
+  rm -f "$HMW_ERR_FILE" 2>/dev/null || :
+fi
 parse_request "$@"
 if [ "${HMW_REMOTE:-0}" != "1" ]; then
   resolve_default_target

@@ -111,6 +111,8 @@ reset_state() {
   export SSH_REMOTE_HOST=target
   unset TMUX HMW_VERIFY HMW_HERDR_VERIFY HMW_BACKEND HMW_REMOTE HMW_DEFAULT_HOST HERDR_SESSION
   unset HERDR_START_FAIL_LABEL HERDR_START_FAIL_ADD
+  unset SSH_STDERR_TEXT SSH_STDOUT_TEXT SSH_EXIT_STATUS RESOLVER_EMPTY
+  rm -rf "$HOME_DIR/.hermes/logs"
 }
 
 cat >"$FAKE_BIN/hostname" <<'EOF'
@@ -151,6 +153,8 @@ if [ "${SSH_EXECUTE:-0}" = 1 ]; then
   fi
   exec /bin/sh -c "$1"
 fi
+[ -z "${SSH_STDERR_TEXT:-}" ] || printf '%s\n' "$SSH_STDERR_TEXT" >&2
+[ -z "${SSH_STDOUT_TEXT:-}" ] || printf '%s\n' "$SSH_STDOUT_TEXT"
 exit "${SSH_EXIT_STATUS:-0}"
 EOF
 
@@ -885,6 +889,59 @@ EOF
   pass 'backend-selecting wrappers are transparent'
 }
 
+test_failure_explanations() {
+  local status flog="$HOME_DIR/.hermes/logs/hmw-last-failure.log"
+
+  # Registry miss is announced instead of silently falling back to $USER.
+  reset_state
+  run_core env HMW_VERIFY=1 RESOLVER_EMPTY=1 STUB_HOSTNAME=origin "$CORE" h-new 1 || return 1
+  assert_contains "$STDERR_FILE" "'h-new' is not in the fleet registry" 'registry miss is explained' || return 1
+  assert_line_count 1 "$LOG" $'ssh\t' 'successful launch still uses exactly one SSH call' || return 1
+
+  # Auth rejection names the user and the keys offered, after terminal reset.
+  reset_state
+  set +e
+  run_core env HMW_BACKEND=herdr STUB_HOSTNAME=origin SSH_EXIT_STATUS=255 \
+    SSH_STDERR_TEXT=$'debug1: Offering public key: /k/id_ed25519 ED25519 SHA256:abcKEY agent\nroot@x: Permission denied (publickey).' \
+    "$CORE" remote 1
+  status=$?
+  set -e
+  assert_eq 255 "$status" 'auth failure keeps the ssh exit status' || return 1
+  assert_contains "$STDERR_FILE" 'could not open the workspace on remote' 'auth failure headline' || return 1
+  assert_contains "$STDERR_FILE" "rejected every key this machine offered for user 'root'" 'auth failure reason' || return 1
+  assert_contains "$STDERR_FILE" 'SHA256:abcKEY' 'auth failure lists offered keys' || return 1
+  [ -s "$flog" ] || { fail 'failure log written'; return 1; }
+  assert_contains "$flog" 'Permission denied' 'failure log keeps the ssh -v probe' || return 1
+
+  # Network timeout classification.
+  reset_state
+  set +e
+  run_core env HMW_BACKEND=herdr HMW_VERIFY=1 STUB_HOSTNAME=origin SSH_EXIT_STATUS=255 \
+    SSH_STDERR_TEXT='ssh: connect to host x port 22: Operation timed out' "$CORE" remote 1
+  status=$?
+  set -e
+  assert_eq 255 "$status" 'verify-mode failure keeps the ssh exit status' || return 1
+  assert_contains "$STDERR_FILE" 'did not answer within' 'timeout is explained' || return 1
+
+  # Remote launcher failure is fetched and re-printed at the origin.
+  reset_state
+  set +e
+  run_core env HMW_BACKEND=herdr STUB_HOSTNAME=origin SSH_EXIT_STATUS=1 \
+    SSH_STDOUT_TEXT="hermes-workspace: 'herdr' not on PATH" "$CORE" remote 1
+  status=$?
+  set -e
+  assert_eq 1 "$status" 'remote launcher failure keeps its status' || return 1
+  assert_contains "$STDERR_FILE" "launcher on remote failed: 'herdr' not on PATH" 'remote error is re-printed locally' || return 1
+
+  # Remote re-entry records its own error for the origin to fetch.
+  reset_state
+  set +e
+  run_core env HMW_REMOTE=1 "$CORE" 0
+  set -e
+  assert_contains "$HOME_DIR/.hermes/logs/hmw-last-error.log" 'pane count must be' 'remote re-entry records launcher errors' || return 1
+  pass 'failures explain why (registry, auth, timeout, remote launcher)'
+}
+
 main() {
   local test
   set -e
@@ -900,7 +957,8 @@ main() {
     test_herdr_prerequisite_scoping_and_readiness \
     test_herdr_add_only_json_and_verify \
     test_herdr_concurrent_start_reconciliation \
-    test_wrapper_forwarding; do
+    test_wrapper_forwarding \
+    test_failure_explanations; do
     if ! "$test"; then
       printf 'FAILED: %s\n' "$test" >&2
       exit 1

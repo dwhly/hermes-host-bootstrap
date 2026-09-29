@@ -1,0 +1,29 @@
+[Unit]
+Description=Chief stack (postgres, core, fleet console): ensure the long-lived compose services are up after every boot
+Documentation=https://github.com/dwhly/hermes-host-bootstrap/blob/main/lib/S0-stack-boot.sh
+# WHY: compose services use `restart: unless-stopped`, so a clean `docker compose stop` (the resize/maintenance quiesce)
+# left them DOWN after boot, and every fleet node lost Core. This oneshot re-asserts the desired state at boot.
+# NOTES:
+#  - The service list is EXPLICIT. The base compose file also defines one-shot seed containers (seed, chief-seed,
+#    build-seed) that POST synthetic fixtures; a bare `up` would start them against production Core.
+#  - `up -d` converges to the CURRENT compose files and .env, so an edited-but-unapplied overlay takes effect at boot.
+#  - `systemctl restart chief-stack` is the "bring it all back" lever. `start` on an active unit does nothing.
+#  - Wants= (not Requires=) docker, so a dockerd restart or upgrade doesn't resurrect deliberately stopped containers.
+Wants=docker.service tailscaled.service network-online.target
+After=docker.service tailscaled.service network-online.target
+StartLimitIntervalSec=15min
+StartLimitBurst=8
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/root/code/chief/chief-stack
+# The overlay publishes on the literal tailnet IP; tailscaled is READY before tailscale0 has an address.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 90); do ip -4 addr show dev tailscale0 2>/dev/null | grep -q "inet 100.122.202.37/" && exit 0; sleep 2; done; echo "tailnet IP 100.122.202.37 not up after 180s" >&2; exit 1'
+ExecStart=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.hdo1.yml up -d --no-build postgres core fleet
+Restart=on-failure
+RestartSec=15s
+TimeoutStartSec=480
+
+[Install]
+WantedBy=multi-user.target
