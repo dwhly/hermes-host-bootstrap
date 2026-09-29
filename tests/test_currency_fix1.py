@@ -172,8 +172,9 @@ hold() {{ HOLD_REASON=$*; echo "HOLD: $*" >&2; return 1; }}
         return result
 
     def output(self, result):
-        log = self.root/'var/log/chief-closure.log'
-        return result.stdout + result.stderr + (log.read_text() if log.exists() else '')
+        # macOS logs closure to /var/log; Linux to /var/lib/chief (its /var/log is root:syslog 0775 by design).
+        logs = [self.root/'var/log/chief-closure.log', self.root/'var/lib/chief/chief-closure.log']
+        return result.stdout + result.stderr + ''.join(log.read_text() for log in logs if log.exists())
 
 
 @pytest.mark.parametrize('platform,host', [('Darwin','h-mini2'),('Linux','h-do1'),('Linux','h-af'),('Linux','h-btp')])

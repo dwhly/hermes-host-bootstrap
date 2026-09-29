@@ -79,7 +79,11 @@ closure_preflight() {
     fi
     payload_ok=yes
     trusted_tree "$BASE/.." || { failures=$((failures + 1)); payload_ok=no; }
-    for dir in /var/log /etc /var; do preflight_check trusted_path "$dir"; done
+    # The closure log parent: /var/log on macOS; /var/lib/chief on Linux, whose /var/log is root:syslog 0775 by design.
+    closure_log_dir=/var/log
+    [ "$OS" = Darwin ] || closure_log_dir=/var/lib/chief
+    for dir in /etc /var; do preflight_check trusted_path "$dir"; done
+    if [ -e "$closure_log_dir" ] || [ "$OS" = Darwin ]; then preflight_check trusted_path "$closure_log_dir"; fi
     if [ "$BASE" = /opt/chief/lib/hermes-host-bootstrap/hermes_converger/step0 ]; then
         preflight_check trusted_path /opt/chief/bin
     fi
@@ -99,7 +103,7 @@ closure_preflight() {
         preflight_check preflight_entry_chain "$entry"
     done
     for path in /etc/chief/node.env /etc/chief/supervisor-allowlist.json \
-                /etc/chief/node-plan.key /etc/chief/node-auth.token /var/log/chief-closure.log; do
+                /etc/chief/node-plan.key /etc/chief/node-auth.token "$closure_log_dir/chief-closure.log"; do
         preflight_check preflight_destination "$path"
     done
     for name in hermes-converger chief-node-supervisor chief-update chief-update-request; do

@@ -107,11 +107,20 @@ trusted_path "${lock%/*}"
 closure_lock_acquire
 cleanup() { /bin/rm -rf "$lock"; }
 trap 'cleanup' EXIT
-trusted_path /var/log
-[ ! -L /var/log/chief-closure.log ] || exit 1
-[ ! -e /var/log/chief-closure.log ] || trusted_path /var/log/chief-closure.log
+# The closure log needs a root-only parent chain. On Linux, /var/log is root:syslog 0775 BY DESIGN (rsyslog creates
+# its files there), so the trust check correctly refuses it. Linux uses /var/lib/chief instead; macOS keeps /var/log
+# (root:wheel 0755).
+closure_log_dir=/var/log
+if [ "$OS" != Darwin ]; then
+    closure_log_dir=/var/lib/chief
+    [ -d "$closure_log_dir" ] || /bin/mkdir -m 0755 "$closure_log_dir"
+fi
+closure_log=$closure_log_dir/chief-closure.log
+trusted_path "$closure_log_dir"
+[ ! -L "$closure_log" ] || exit 1
+[ ! -e "$closure_log" ] || trusted_path "$closure_log"
 exec 3>&1
-exec >>/var/log/chief-closure.log 2>&1
+exec >>"$closure_log" 2>&1
 trap 'cleanup' EXIT
 
 revocation_failed() {

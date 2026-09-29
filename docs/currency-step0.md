@@ -285,7 +285,7 @@ replacing any payload or removing markers. Launchd activation skips loaded jobs 
 bootstrap failures. The bridge, both installers and closure ignore HUP/PIPE.
 Installer cleanup restores or retains the previous payload if publication fails;
 even a failed restore never deletes the only remaining copy. All closure output remains in
-`/var/log/chief-closure.log`; the caller receives the final receipt when connected.
+`/var/log/chief-closure.log` (macOS) or `/var/lib/chief/chief-closure.log` (Linux: Ubuntu's `/var/log` is `root:syslog 0775` by design, which fails the root-only chain); the caller receives the final receipt when connected.
 Post-preparation trust failures refuse that run and retain enabled readers for retry.
 Preparation publishes `hold: preparing` before stopping unsafe jobs. Every trigger
 is disabled before any service is stopped, so even termination of a legacy caller
