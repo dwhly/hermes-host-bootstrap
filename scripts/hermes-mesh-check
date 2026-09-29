@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# hermes-mesh-check — can THIS node open a non-interactive SSH session to every
+# other fleet node in ~/.hermes/hosts/*.yaml?  Read-only; prints one line per
+# target and a reason for every failure.  Exit 0 only if all targets are OK.
+#
+#   hermes-mesh-check            # all registry hosts except this one
+#   hermes-mesh-check h-af h-do1 # just these
+#
+# Each attempt is hard-capped (perl alarm — portable across macOS and Linux) so
+# a Tailscale SSH "check" prompt or a stalled key exchange cannot hang the run.
+set -uo pipefail
+
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+CAP="${HMW_MESH_TIMEOUT:-12}"
+self="$(hostname -s 2>/dev/null || hostname)"
+
+cap() { perl -e 'alarm shift; exec @ARGV or exit 127' "$@"; }
+
+if [ "$#" -gt 0 ]; then
+  hosts="$*"
+else
+  hosts=""
+  for f in "$HERMES_HOME"/hosts/*.yaml; do
+    [ -f "$f" ] || continue
+    b="$(basename "$f" .yaml)"
+    [ "${b#*.}" = "$b" ] || continue   # skip h-do1.live etc.
+    hosts="$hosts $b"
+  done
+fi
+[ -n "${hosts# }" ] || { echo "hermes-mesh-check: no hosts in $HERMES_HOME/hosts/" >&2; exit 2; }
+
+fails=0
+for h in $hosts; do
+  [ "$h" = "$self" ] && continue
+  target="$(hermes-host-resolve "$h" 2>/dev/null || printf '%s' "$h")"
+  case "$target" in
+    *@*) ;;
+    *) echo "MESH $self -> $h : FAIL not in fleet registry ($HERMES_HOME/hosts/$h.yaml missing)"; fails=$((fails + 1)); continue ;;
+  esac
+  out="$(cap "$CAP" ssh -n -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new "$target" 'hostname -s' 2>&1)"
+  rc=$?
+  why="$(printf '%s' "$out" | grep -v -e '^#' -e '^Warning: Permanently added' | tr '\r\n' '  ' | cut -c1-140)"
+  if [ "$rc" -eq 0 ]; then
+    echo "MESH $self -> $h : OK ($target)"
+    continue
+  fi
+  fails=$((fails + 1))
+  if [ "$rc" -eq 142 ]; then
+    if printf '%s' "$out" | grep -q 'login.tailscale.com'; then
+      echo "MESH $self -> $h : BLOCKED Tailscale SSH 'check' wants browser approval (run: ssh $target true)"
+    else
+      echo "MESH $self -> $h : HANG no answer in ${CAP}s ($target) $why"
+    fi
+  elif printf '%s' "$out" | grep -q 'Permission denied'; then
+    echo "MESH $self -> $h : FAIL key not authorized for $target (add this node's ~/.ssh/id_*.pub to its authorized_keys)"
+  else
+    echo "MESH $self -> $h : FAIL rc=$rc $why"
+  fi
+done
+exit $(( fails > 0 ))

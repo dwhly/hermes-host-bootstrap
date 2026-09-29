@@ -380,6 +380,17 @@ if [[ -f "$REPO_ROOT/scripts/hermes-workspace" ]]; then
   ok "hermes-workspace → $TARGET_LINK"
 fi
 
+# ── Install hermes-mesh-check on PATH ──────────────────────────────────
+# Read-only fleet SSH reachability check (this node → every registry host),
+# with a reason per failure. Pair with hmw failure explanations.
+if [[ -f "$REPO_ROOT/scripts/hermes-mesh-check" ]]; then
+  mkdir -p "$HOME/.local/bin"
+  TARGET_LINK="$HOME/.local/bin/hermes-mesh-check"
+  rm -f "$TARGET_LINK"
+  ln -s "$REPO_ROOT/scripts/hermes-mesh-check" "$TARGET_LINK"
+  ok "hermes-mesh-check → $TARGET_LINK"
+fi
+
 # Helpful hint for the user: if ~/.hermes is git-tracked (the typical
 # hermes-config-sync setup), nudge them to commit the snapshot.
 if [[ -d "${HERMES_HOME:-$HOME/.hermes}/.git" ]]; then
