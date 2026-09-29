@@ -676,6 +676,44 @@ def test_root_symlink_through_login_owned_alias_is_rejected(tmp_path,metadata):
         security.trusted_path(entry)
 
 
+def _grants_fixture(tmp_path, visudo_body):
+    etc=tmp_path/"etc"; etc.mkdir()
+    fragments=etc/"sudoers.d"; fragments.mkdir()
+    policy=etc/"sudoers"; policy.write_text('root ALL=(ALL) ALL\n@includedir '+str(fragments)+'\n'); policy.chmod(0o440)
+    fragment=fragments/"chief-converger"
+    fragment.write_text('fixture ALL=(root) NOPASSWD: /usr/local/bin/chief-update\n'); fragment.chmod(0o440)
+    validator=tmp_path/"visudo"; validator.write_text('#!/bin/sh\n'+visudo_body); validator.chmod(0o755)
+    source=(PAYLOAD/"contain.sh").read_text().replace('/etc/',str(etc)+'/').replace('/usr/sbin/visudo',str(validator)).replace('/usr/bin/id', '/bin/false')
+    script='set -eu\ntrusted_path() { :; }\nhold() { echo "HOLD $*" >&2; return 1; }\n'+source+'\nremove_grants\n'
+    return policy, fragment, script
+
+
+def test_sudoers_replacement_is_root_owned_under_nonroot_process_group(tmp_path):
+    # Regression: on Linux a new file takes the PROCESS group (h-do1 closure ran with gid chief), and mv carried it
+    # onto /etc/sudoers. sudo then refused all policy ("wrong owner (uid, gid) should be (0, 0)").
+    import os, shutil
+    if os.uname().sysname != "Linux" or os.geteuid() != 0 or not shutil.which("setpriv"):
+        pytest.skip("needs Linux root + setpriv to run under a non-root group")
+    policy, fragment, script = _grants_fixture(tmp_path, 'exit 0\n')
+    os.chmod(tmp_path, 0o755)
+    result=subprocess.run(["setpriv","--regid","65534","--clear-groups","/bin/sh"],input=script,text=True,capture_output=True)
+    assert result.returncode == 0, result.stderr
+    replaced=[p for p in (policy, *policy.parent.joinpath("sudoers.d").iterdir())]
+    assert replaced and all(p.stat().st_uid == 0 and p.stat().st_gid == 0 for p in replaced), \
+        [(p.name, p.stat().st_uid, p.stat().st_gid) for p in replaced]
+
+
+def test_sudoers_post_swap_check_failure_holds_instead_of_succeeding(tmp_path):
+    # visudo -c -f <staged> passes, but the post-swap whole-policy check fails: closure must HOLD, never report success.
+    # The pre-check and the post-swap check are both `visudo -c`; fail only the SECOND one-argument call.
+    count=tmp_path/"count"
+    policy, fragment, script = _grants_fixture(tmp_path, '[ "$#" = 1 ] || exit 0\n'
+        'echo x >> '+shlex.quote(str(count))+'\n[ "$(wc -l < '+shlex.quote(str(count))+')" -ge 2 ] && exit 1\nexit 0\n')
+    result=subprocess.run(["/bin/sh"],input=script,text=True,capture_output=True)
+    assert result.returncode != 0
+    assert "sudoers_postcheck_failed" in result.stderr
+
+
 def test_sudoers_alias_keeps_references_valid(tmp_path):
     source='Cmnd_Alias CHIEF = /usr/local/bin/chief-update\nfixture ALL=(root) NOPASSWD: CHIEF\n'
     result=subprocess.run(['/usr/bin/awk','-f',str(PAYLOAD/'sudoers.awk')],input=source,text=True,capture_output=True,check=True)

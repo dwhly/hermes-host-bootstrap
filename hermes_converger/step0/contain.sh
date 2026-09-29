@@ -37,9 +37,14 @@ function flush() {
 END { if (record != "") flush() }
 ' "$f" > "$out"
         /bin/chmod 0440 "$out"
+        # sudo refuses policy not owned by uid 0 / gid 0. A NEW file's group is the directory's group on macOS
+        # (wheel, gid 0) but the PROCESS's group on Linux (h-do1: chief), and mv carries it onto /etc/sudoers.
+        # So set the owner explicitly. (Linux closure left /etc/sudoers root:chief and sudo broken.)
+        /usr/sbin/chown 0:0 "$out" 2>/dev/null || /bin/chown 0:0 "$out"
     done
     /usr/bin/sed "s|/private/etc/sudoers[.]d|$stage/d|g; s|/etc/sudoers[.]d|$stage/d|g" "$stage/main" > "$stage/check"
     /bin/chmod 0440 "$stage/check"
+    /usr/sbin/chown 0:0 "$stage/check" 2>/dev/null || /bin/chown 0:0 "$stage/check"
     /usr/sbin/visudo -c -f "$stage/check"
     # This is the last privileged phase. Atomic renames within /etc; no grant
     # restoration, bootstrap/service activation, or privileged remote call follows.
@@ -48,7 +53,9 @@ END { if (record != "") flush() }
         /bin/mv -f "$f" "/etc/sudoers.d/${f##*/}"
     done
     /bin/mv -f "$stage/main" /etc/sudoers
-    /usr/sbin/visudo -c
+    # An explicit check: `set -e` does not apply when the caller runs this function inside a condition, and a
+    # post-swap failure (for example, wrong owner) must never be reported as a successful closure.
+    /usr/sbin/visudo -c || { hold sudoers_postcheck_failed; return 1; }
     /bin/rm -rf "$stage"
     # Effective policy catches aliases, wildcards and directory grants that a
     # literal rule rewrite cannot safely remove. Root is already unrestricted.
