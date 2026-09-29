@@ -49,6 +49,12 @@ class Host:
         stat_tool.write_text('#!'+sys.executable+'\n'+f'''
 import os,sys
 root={str(self.root)!r}
+if sys.argv[1:3] in (['-c', '%u:%g:%a'], ['-f', '%u:%g:%Lp']):
+    # contain.sh sudoers_mode: answer from the REAL lstat (the sudoers owner/mode invariant).
+    for path in sys.argv[3:]:
+        info=os.lstat(path)
+        print(f"{{info.st_uid}}:{{info.st_gid}}:{{info.st_mode & 0o7777:o}}")
+    sys.exit(0)
 for path in sys.argv[3:]:
     info=os.lstat(path)
     uid,mode=(info.st_uid,info.st_mode) if path.startswith(root) else (0,0o40755)

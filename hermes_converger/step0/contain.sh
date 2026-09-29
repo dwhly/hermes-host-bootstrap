@@ -1,12 +1,22 @@
 #!/bin/sh
+# chown by numeric 0:0 (wheel is gid 0 on macOS). Linux has no /usr/sbin/chown, so pick the path by what exists.
+sudoers_root_own() {
+    if [ -x /usr/sbin/chown ]; then /usr/sbin/chown 0:0 "$1"; else /bin/chown 0:0 "$1"; fi
+}
+# uid:gid:mode, for example 0:0:440. GNU stat first, then BSD stat (macOS).
+sudoers_mode() {
+    /usr/bin/stat -c '%u:%g:%a' "$1" 2>/dev/null || /usr/bin/stat -f '%u:%g:%Lp' "$1"
+}
 remove_grants() {
     # Stage the whole standard include tree. Never replace policy that has not
     # passed a combined visudo -c. Nonstandard includes require admin review.
     trusted_path /etc/sudoers
     trusted_path /etc/sudoers.d
-    /usr/sbin/visudo -c
-    stage=$(/usr/bin/mktemp -d /etc/.chief-sudoers.XXXXXX)
-    /bin/mkdir "$stage/d"
+    # Every step that must stop the swap HOLDs explicitly. `set -e` does not apply if a caller ever runs this function
+    # inside a condition, and this is root policy (review step0-sudoers-owner r1, finding 2).
+    /usr/sbin/visudo -c || { hold "sudoers_precheck_failed: live policy invalid; repair from a root console"; return 1; }
+    stage=$(/usr/bin/mktemp -d /etc/.chief-sudoers.XXXXXX) || { hold sudoers_stage_failed; return 1; }
+    /bin/mkdir "$stage/d" || { hold sudoers_stage_failed; return 1; }
     for f in /etc/sudoers /etc/sudoers.d/*; do
         [ -f "$f" ] || continue
         trusted_path "$f"
@@ -35,27 +45,34 @@ function flush() {
 }
 { record = record $0 "\n"; if ($0 !~ /\\[[:space:]]*$/) flush() }
 END { if (record != "") flush() }
-' "$f" > "$out"
-        /bin/chmod 0440 "$out"
+' "$f" > "$out" || { hold sudoers_stage_failed; return 1; }
+        /bin/chmod 0440 "$out" || { hold sudoers_stage_failed; return 1; }
         # sudo refuses policy not owned by uid 0 / gid 0. A NEW file's group is the directory's group on macOS
         # (wheel, gid 0) but the PROCESS's group on Linux (h-do1: chief), and mv carries it onto /etc/sudoers.
         # So set the owner explicitly. (Linux closure left /etc/sudoers root:chief and sudo broken.)
-        /usr/sbin/chown 0:0 "$out" 2>/dev/null || /bin/chown 0:0 "$out"
+        sudoers_root_own "$out" || { hold sudoers_stage_owner; return 1; }
     done
-    /usr/bin/sed "s|/private/etc/sudoers[.]d|$stage/d|g; s|/etc/sudoers[.]d|$stage/d|g" "$stage/main" > "$stage/check"
-    /bin/chmod 0440 "$stage/check"
-    /usr/sbin/chown 0:0 "$stage/check" 2>/dev/null || /bin/chown 0:0 "$stage/check"
-    /usr/sbin/visudo -c -f "$stage/check"
+    /usr/bin/sed "s|/private/etc/sudoers[.]d|$stage/d|g; s|/etc/sudoers[.]d|$stage/d|g" "$stage/main" > "$stage/check" ||
+        { hold sudoers_stage_failed; return 1; }
+    /bin/chmod 0440 "$stage/check" || { hold sudoers_stage_failed; return 1; }
+    sudoers_root_own "$stage/check" || { hold sudoers_stage_owner; return 1; }
+    /usr/sbin/visudo -c -f "$stage/check" || { hold sudoers_stage_invalid; return 1; }
+    # visudo -c -f checks syntax, NOT owner or mode (sudo checks those only without -f). So assert the invariant sudo
+    # enforces on every file that is about to become live policy.
+    for f in "$stage/main" "$stage"/d/*; do
+        [ -f "$f" ] || continue
+        [ "$(sudoers_mode "$f")" = 0:0:440 ] || { hold "sudoers_stage_owner: $(sudoers_mode "$f") ${f##*/}"; return 1; }
+    done
     # This is the last privileged phase. Atomic renames within /etc; no grant
     # restoration, bootstrap/service activation, or privileged remote call follows.
     for f in "$stage"/d/*; do
         [ -f "$f" ] || continue
-        /bin/mv -f "$f" "/etc/sudoers.d/${f##*/}"
+        /bin/mv -f "$f" "/etc/sudoers.d/${f##*/}" || { hold sudoers_swap_failed; return 1; }
     done
-    /bin/mv -f "$stage/main" /etc/sudoers
+    /bin/mv -f "$stage/main" /etc/sudoers || { hold sudoers_swap_failed; return 1; }
     # An explicit check: `set -e` does not apply when the caller runs this function inside a condition, and a
     # post-swap failure (for example, wrong owner) must never be reported as a successful closure.
-    /usr/sbin/visudo -c || { hold sudoers_postcheck_failed; return 1; }
+    /usr/sbin/visudo -c || { hold "sudoers_postcheck_failed: sudo policy invalid; repair from a root console; do not restore grants"; return 1; }
     /bin/rm -rf "$stage"
     # Effective policy catches aliases, wildcards and directory grants that a
     # literal rule rewrite cannot safely remove. Root is already unrestricted.

@@ -684,7 +684,10 @@ def _grants_fixture(tmp_path, visudo_body):
     fragment.write_text('fixture ALL=(root) NOPASSWD: /usr/local/bin/chief-update\n'); fragment.chmod(0o440)
     validator=tmp_path/"visudo"; validator.write_text('#!/bin/sh\n'+visudo_body); validator.chmod(0o755)
     source=(PAYLOAD/"contain.sh").read_text().replace('/etc/',str(etc)+'/').replace('/usr/sbin/visudo',str(validator)).replace('/usr/bin/id', '/bin/false')
-    script='set -eu\ntrusted_path() { :; }\nhold() { echo "HOLD $*" >&2; return 1; }\n'+source+'\nremove_grants\n'
+    # Run remove_grants INSIDE a condition: set -e is then off, so only the explicit HOLD guards can stop the swap
+    # (review step0-sudoers-owner r1, findings 2 and 6). CLOSED must never print after a failure.
+    script=('set -eu\ntrusted_path() { :; }\nhold() { echo "HOLD $*" >&2; return 1; }\n'+source+
+            '\nif remove_grants; then echo CLOSED; else exit 1; fi\n')
     return policy, fragment, script
 
 
@@ -699,8 +702,22 @@ def test_sudoers_replacement_is_root_owned_under_nonroot_process_group(tmp_path)
     result=subprocess.run(["setpriv","--regid","65534","--clear-groups","/bin/sh"],input=script,text=True,capture_output=True)
     assert result.returncode == 0, result.stderr
     replaced=[p for p in (policy, *policy.parent.joinpath("sudoers.d").iterdir())]
-    assert replaced and all(p.stat().st_uid == 0 and p.stat().st_gid == 0 for p in replaced), \
-        [(p.name, p.stat().st_uid, p.stat().st_gid) for p in replaced]
+    assert "CLOSED" in result.stdout
+    assert replaced and all(p.stat().st_uid == 0 and p.stat().st_gid == 0 and (p.stat().st_mode & 0o7777) == 0o440
+                            for p in replaced), [(p.name, p.stat().st_uid, p.stat().st_gid, oct(p.stat().st_mode)) for p in replaced]
+
+
+@pytest.mark.parametrize("fault", ["chown", "stat"])
+def test_sudoers_stage_owner_failure_holds_and_leaves_live_policy_untouched(tmp_path, fault):
+    # A failed chown, or a staged file that is not 0:0:440, must HOLD BEFORE the swap. Live policy stays byte-identical.
+    policy, fragment, script = _grants_fixture(tmp_path, 'exit 0\n')
+    before = (policy.read_bytes(), fragment.read_bytes())
+    stub = ('sudoers_root_own() { return 1; }' if fault == "chown" else "sudoers_mode() { echo 0:1234:440; }")
+    script = script.replace("\nif remove_grants;", "\n" + stub + "\nif remove_grants;")
+    result=subprocess.run(["/bin/sh"],input=script,text=True,capture_output=True)
+    assert result.returncode != 0 and "CLOSED" not in result.stdout
+    assert "sudoers_stage_owner" in result.stderr, result.stderr
+    assert (policy.read_bytes(), fragment.read_bytes()) == before
 
 
 def test_sudoers_post_swap_check_failure_holds_instead_of_succeeding(tmp_path):
@@ -710,7 +727,7 @@ def test_sudoers_post_swap_check_failure_holds_instead_of_succeeding(tmp_path):
     policy, fragment, script = _grants_fixture(tmp_path, '[ "$#" = 1 ] || exit 0\n'
         'echo x >> '+shlex.quote(str(count))+'\n[ "$(wc -l < '+shlex.quote(str(count))+')" -ge 2 ] && exit 1\nexit 0\n')
     result=subprocess.run(["/bin/sh"],input=script,text=True,capture_output=True)
-    assert result.returncode != 0
+    assert result.returncode != 0 and "CLOSED" not in result.stdout
     assert "sudoers_postcheck_failed" in result.stderr
 
 
@@ -756,6 +773,12 @@ def test_closure_without_python_repairs_config_disables_jobs_and_revokes_last(tm
     commands.extend(['/usr/bin/stat', '/bin/ls'])
     (bin/'stat').write_text('#!'+sys.executable+'\n'+f'''
 import os,sys
+if sys.argv[1:3] in (['-c', '%u:%g:%a'], ['-f', '%u:%g:%Lp']):
+    # contain.sh sudoers_mode: answer from the REAL lstat (the sudoers owner/mode invariant).
+    for path in sys.argv[3:]:
+        info=os.lstat(path)
+        print(f"{{info.st_uid}}:{{info.st_gid}}:{{info.st_mode & 0o7777:o}}")
+    sys.exit(0)
 for path in sys.argv[3:]:
     info=os.lstat(path)
     uid,mode=(info.st_uid,info.st_mode) if path.startswith({str(host)!r}) else (0,0o40755)
