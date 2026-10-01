@@ -190,8 +190,8 @@ sync_baseline() {
   # Pinned, reviewed sources only: bootstrap at its committed HEAD (git archive, not the dirty tree),
   # plus the Chief node package + SDK. Never the common Hermes home.
   local rev; rev="$(git -C "$REPO" rev-parse HEAD)"
-  [[ -z "$(git -C "$REPO" status --porcelain -- scripts systemd verify.sh)" ]] \
-    || die "bootstrap repo has uncommitted/untracked files under scripts/ systemd/ verify.sh — commit them first (only committed, reviewed code is deployed)"
+  [[ -z "$(git -C "$REPO" status --porcelain -- scripts systemd dotfiles verify.sh)" ]] \
+    || die "bootstrap repo has uncommitted/untracked files under scripts/ systemd/ dotfiles/ verify.sh — commit them first (only committed, reviewed code is deployed)"
   remote 'mkdir -p /opt/hermes-host-bootstrap-baseline.new && rm -rf /opt/hermes-host-bootstrap-baseline.new/*'
   git -C "$REPO" archive --format=tar HEAD | remote 'tar -x -C /opt/hermes-host-bootstrap-baseline.new'
   remote "printf 'repo=hermes-host-bootstrap\ncommit=$rev\nsynced=%s\n' \"\$(date -u +%FT%TZ)\" >/opt/hermes-host-bootstrap-baseline.new/PROVENANCE &&
