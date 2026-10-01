@@ -145,6 +145,11 @@ TARGET_TMP_CHECK="$REGISTRY_DIR/${HOSTNAME_VAL}.yaml"
 if [[ -z "$HOST_NOTE" ]] && [[ -f "$TARGET_TMP_CHECK" ]]; then
   HOST_NOTE="$(awk -F': ' '/^note:/ {sub(/^note:[[:space:]]*/, ""); gsub(/^"|"$/, ""); print; exit}' "$TARGET_TMP_CHECK" 2>/dev/null)"
 fi
+# Preserve hand-set desired state that the snapshot does not measure: `shell_users` (extra local accounts that
+# get the fleet shell aliases; read by scripts/fleet-enroll-existing shell-aliases). Must stay ONE line,
+# space-separated: shell_users: "hermes alice" (block lists are not supported and would be dropped).
+SHELL_USERS_LINE=""
+[[ -f "$TARGET_TMP_CHECK" ]] && SHELL_USERS_LINE="$(grep -m1 '^shell_users:' "$TARGET_TMP_CHECK" 2>/dev/null || true)"
 
 # ── Write yaml ────────────────────────────────────────────────────────
 TARGET="$REGISTRY_DIR/${HOSTNAME_VAL}.yaml"
@@ -164,7 +169,8 @@ cat > "$TARGET" <<YAML
 # know what you're doing — the next bootstrap rewrites most fields.
 hostname: $HOSTNAME_VAL
 fqdn: $FQDN_VAL
-note: "${HOST_NOTE}"
+note: "${HOST_NOTE}"${SHELL_USERS_LINE:+
+$SHELL_USERS_LINE}
 default_user: "$DEFAULT_USER"
 ssh_user: "$SSH_USER"
 ssh_host: "$SSH_HOST"
