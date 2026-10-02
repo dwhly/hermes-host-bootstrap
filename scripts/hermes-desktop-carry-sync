@@ -17,8 +17,9 @@
 #         only (otherwise held `update_first`: the next normal update moves HEAD forward);
 #       - upstream main conflicts with the local branch (the update would stall): the
 #         fleet branch carries the resolution. This brings upstream code in, so it holds
-#         (`needs_full_update`) if the merge would change a runtime dependency manifest
-#         (Python or TUI; Desktop's own are only used by the rebuild).
+#         (`needs_full_update`) if the merge would change a Python dependency manifest
+#         (running processes import Python; JS deps are only used by the normal update's
+#         rebuild, which installs them first).
 #   * Retirement: when merging the fleet branch into upstream main would change nothing
 #     under apps/desktop (true after a merge or a squash merge upstream, regardless of
 #     whether the fleet branch has caught up), the job sets the strategy back to
@@ -171,15 +172,15 @@ merged_tree() {
   out="$(g merge-tree --write-tree "$1" "$2" 2>/dev/null)" || return 1
   printf '%s\n' "$out" | sed -n 1p
 }
-# Would merging the fleet ref change a runtime dependency manifest in the checkout?
+# Would merging the fleet ref change a Python dependency manifest in the checkout?
 # Compares HEAD with the actual merge result, so changes HEAD already has don't count.
-# Desktop's manifests are excluded: they are only used by the normal update's rebuild.
+# JS manifests (root workspace lock, ui-tui, web, desktop) are excluded on purpose: they
+# are only used by the normal update's rebuild, which installs dependencies first.
 deps_change() {
   local t
   t="$(merged_tree HEAD "$FLEET_REF")" || return 1   # conflicting merge fails safe below
   ! g diff --quiet HEAD "$t" -- ':(glob)**/pyproject.toml' ':(glob)**/uv.lock' \
-      ':(glob)**/requirements*.txt' 'ui-tui/package.json' 'ui-tui/package-lock.json' \
-      ':(exclude)apps/desktop/**' 2>/dev/null
+      ':(glob)**/requirements*.txt' 2>/dev/null
 }
 
 # guarded_merge <reason-on-conflict>: merge the fleet ref under the update marker. On
