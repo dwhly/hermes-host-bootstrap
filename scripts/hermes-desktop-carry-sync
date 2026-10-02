@@ -17,9 +17,11 @@
 #         only (otherwise held `update_first`: the next normal update moves HEAD forward);
 #       - upstream main conflicts with the local branch (the update would stall): the
 #         fleet branch carries the resolution. This brings upstream code in, so it holds
-#         (`needs_full_update`) if dependency manifests would change.
-#   * Retirement: when upstream contains the fleet branch, or the fleet branch's
-#     apps/desktop equals upstream's (squash merge), the job sets the strategy back to
+#         (`needs_full_update`) if the merge would change a runtime dependency manifest
+#         (Python or TUI; Desktop's own are only used by the rebuild).
+#   * Retirement: when merging the fleet branch into upstream main would change nothing
+#     under apps/desktop (true after a merge or a squash merge upstream, regardless of
+#     whether the fleet branch has caught up), the job sets the strategy back to
 #     `switch`; the next update returns the checkout to main.
 #
 # Contract for the fleet-branch maintainer: merge upstream (never rebase/force-push),
@@ -34,7 +36,7 @@
 # (Hermes fork mode). Local edits in files the merge doesn't touch are left alone; git
 # refuses a merge that would overwrite one, and that is reported as merge_refused.
 # Every run writes one line to $STATE/sync.log and key=value lines to $STATE/last.
-# Exit 0 = ok/nothing to do, 3 = held (safe, nothing changed), 1 = error.
+# Exit 0 = ok/nothing to do, 3 = held (checkout content unchanged), 1 = error.
 # bash 3.2-safe (macOS /bin/bash).
 set -u
 PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -58,7 +60,11 @@ BUSY=""
 MERGE_FAIL=""
 
 g() { git -C "$REPO" "$@"; }
-gfetch() { git -C "$REPO" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 fetch --no-tags --quiet "$@"; }
+gfetch() {
+  git -C "$REPO" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 \
+    -c core.sshCommand='ssh -o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=4' \
+    fetch --no-tags --quiet "$@"
+}
 
 release_marker() {
   if [ "$OWN_MARKER" = 1 ] && [ "$(head -n 1 "$MARKER" 2>/dev/null)" = "$$" ]; then
@@ -159,10 +165,21 @@ base_in_head() {
   mb="$(g merge-base "$FLEET_REF" origin/main 2>/dev/null)" || return 1
   g merge-base --is-ancestor "$mb" HEAD
 }
-# Dependency manifests the merge would change (fleet-side changes since the fork point).
+# merged_tree <a> <b>: tree OID of merging a and b, or fail on conflict/unknown.
+merged_tree() {
+  local out
+  out="$(g merge-tree --write-tree "$1" "$2" 2>/dev/null)" || return 1
+  printf '%s\n' "$out" | sed -n 1p
+}
+# Would merging the fleet ref change a runtime dependency manifest in the checkout?
+# Compares HEAD with the actual merge result, so changes HEAD already has don't count.
+# Desktop's manifests are excluded: they are only used by the normal update's rebuild.
 deps_change() {
-  ! g diff --quiet "HEAD...$FLEET_REF" -- pyproject.toml uv.lock package.json package-lock.json \
-      ':(glob)**/package.json' ':(glob)**/package-lock.json' ':(glob)**/pyproject.toml' 2>/dev/null
+  local t
+  t="$(merged_tree HEAD "$FLEET_REF")" || return 1   # conflicting merge fails safe below
+  ! g diff --quiet HEAD "$t" -- ':(glob)**/pyproject.toml' ':(glob)**/uv.lock' \
+      ':(glob)**/requirements*.txt' 'ui-tui/package.json' 'ui-tui/package-lock.json' \
+      ':(exclude)apps/desktop/**' 2>/dev/null
 }
 
 # guarded_merge <reason-on-conflict>: merge the fleet ref under the update marker. On
@@ -190,13 +207,17 @@ guarded_merge() {
   return 1
 }
 
+# Retired: merging the fleet branch into upstream would change nothing under apps/desktop.
+# Doesn't depend on the fleet branch having caught up with upstream; a conflict = not retired.
 retired() {
+  local t
   g merge-base --is-ancestor "$FLEET_REF" origin/main && return 0
-  g diff --quiet origin/main "$FLEET_REF" -- apps/desktop 2>/dev/null
+  t="$(merged_tree origin/main "$FLEET_REF")" || return 1
+  g diff --quiet origin/main "$t" -- apps/desktop 2>/dev/null
 }
 
 if retired; then
-  if [ "$branch" = "$LOCAL_BRANCH" ] && strategy_is_in_place; then
+  if strategy_is_in_place; then
     set_strategy switch
     finish ok retired_strategy_switch 0
   fi

@@ -33,7 +33,7 @@ MARKER="$HERMES_HOME/.hermes-update-in-progress"
 git init -q --bare "$W/up.git"; git init -q --bare "$W/fork.git"
 git clone -q "$W/up.git" "$W/dev" 2>/dev/null; cd "$W/dev"
 mkdir -p apps/desktop
-printf 'a\nb\nc\n' > apps/desktop/shared.txt; echo base > other.txt; echo '{}' > package.json
+printf 'a\nb\nc\n' > apps/desktop/shared.txt; echo base > other.txt; echo '[project]' > pyproject.toml
 git add .; git commit -qm base; git push -q origin main
 git checkout -qb fleet/desktop-switcher
 echo switcher > apps/desktop/switcher.txt; git add .; git commit -qm "feat: switcher"
@@ -54,7 +54,7 @@ expect() { # expect <rc> <reason>
 }
 head_of() { git -C "$REPO" rev-parse HEAD; }
 branch_of() { git -C "$REPO" symbolic-ref --short HEAD; }
-client_update() { git -C "$REPO" merge -q --no-edit origin/main >/dev/null; } # what hermes update does
+client_update() { git -C "$REPO" fetch -q origin main && git -C "$REPO" merge -q --no-edit origin/main >/dev/null; } # what hermes update does
 
 # 1. Untracked file the carry would overwrite: git refuses; checkout restored to main.
 echo mine > "$REPO/apps/desktop/switcher.txt"; h0="$(head_of)"
@@ -69,7 +69,8 @@ sleep 300 & SLEEPER=$!
 printf '%s\n%s\n' "$SLEEPER" "$(date +%s)" > "$MARKER"
 run; expect 3 update_running; [[ "$(branch_of)" == main ]] || fail "moved under live marker"
 kill "$SLEEPER"; wait "$SLEEPER" 2>/dev/null || true
-printf '999999\n%s\n' "$(date +%s)" > "$MARKER"
+sleep 0 & DEAD=$!; wait "$DEAD" 2>/dev/null || true
+printf '%s\n%s\n' "$DEAD" "$(date +%s)" > "$MARKER"
 
 # 3. Adoption with an unrelated local edit: adopts, keeps the edit, releases the marker.
 echo local-edit >> "$REPO/other.txt"
@@ -97,19 +98,22 @@ h2="$(head_of)"; run; expect 3 update_first; [[ "$(head_of)" == "$h2" ]] || fail
 client_update; run; expect 0 merged_new_carry_rebuild_pending
 grep -q v3 "$REPO/apps/desktop/switcher.txt" || fail "v3 not merged after update"
 
-# 7. Upstream conflicts with the carry; fleet hasn't resolved yet: held.
+# 7. Carry touches a shared line. Upstream then changes pyproject.toml (the client takes it
+#    with a normal update) and then conflicts with the carry: held until the fleet resolves.
 fleet_do sh -c "sed -i.bak 's/^b\$/carry-b/' apps/desktop/shared.txt && rm -f apps/desktop/shared.txt.bak && git commit -qam 'feat: carry touches shared'"
 client_update; run; expect 0 merged_new_carry_rebuild_pending
+up_commit sh -c 'echo "deps = [1]" >> pyproject.toml'; client_update
 up_commit sh -c "sed -i.bak 's/^b\$/upstream-b/' apps/desktop/shared.txt && rm -f apps/desktop/shared.txt.bak"
 h3="$(head_of)"; run; expect 3 waiting_for_fleet_merge; [[ "$(head_of)" == "$h3" ]] || fail "held run moved HEAD"
 
-# 8. Resolution lands, but the upstream it brings changes package.json: needs_full_update.
-up_commit sh -c "echo '{\"v\":2}' > package.json"
+# 8. The resolution brings a NEW pyproject change the client lacks: needs_full_update.
+up_commit sh -c 'echo "deps = [2]" >> pyproject.toml'
 resolve() { git merge -q main >/dev/null 2>&1 || true; printf 'a\ncarry-b\nc\n' > apps/desktop/shared.txt; git add -A; git commit -qm "merge main (resolved)"; }
 fleet_do resolve
 run; expect 3 needs_full_update; [[ "$(head_of)" == "$h3" ]] || fail "deps hold moved HEAD"
 
-# 9. Without a dependency change the resolution is taken and upstream merges cleanly again.
+# 9. Without the new deps commit, the resolution only carries the pyproject change HEAD
+#    already has (step 7): no false positive, resolution taken, upstream merges cleanly.
 git checkout -q main; git reset -q --hard HEAD~1; git push -q -f origin main
 git checkout -q fleet/desktop-switcher; git reset -q --hard HEAD~1; resolve
 git push -q -f "$W/fork.git" fleet/desktop-switcher; git checkout -q main
@@ -124,6 +128,16 @@ run; expect 3 origin_not_official
 git -C "$REPO" config remote.origin.url https://github.com/NousResearch/hermes-agent.git
 touch "$REPO/.git/REVERT_HEAD"; run; expect 3 git_busy_REVERT_HEAD; rm "$REPO/.git/REVERT_HEAD"
 mkdir "$HERMES_HOME/desktop-carry/lock"; run; expect 3 lock_busy; rmdir "$HERMES_HOME/desktop-carry/lock"
+
+# 10b. A conflicting fleet merge with an unrelated local edit: aborted, edit kept, HEAD unchanged.
+printf 'x\n' > "$REPO/apps/desktop/switcher.txt"; git -C "$REPO" commit -q -am "local: conflicting"
+fleet_do sh -c 'printf "y\n" > apps/desktop/switcher.txt && git commit -qam "fix: switcher v4"'
+echo keep-me >> "$REPO/other.txt"; h4="$(head_of)"
+run; expect 3 merge_conflict
+[[ "$(head_of)" == "$h4" ]] || fail "conflict moved HEAD"
+grep -q keep-me "$REPO/other.txt" || fail "abort lost the unrelated edit"
+[[ -e "$REPO/.git/MERGE_HEAD" ]] && fail "merge left in progress"
+git -C "$REPO" checkout -q -- other.txt; git -C "$REPO" reset -q --hard HEAD~1
 
 # 11. Switched back to main by an update (strategy reset): stale carry branch with nothing
 #     unique is dropped and the host re-adopts. With a unique commit it holds.
@@ -143,4 +157,12 @@ fleet_do sh -c 'git merge -q --no-edit main'
 run; expect 0 retired_strategy_switch; [[ "$(strategy)" == switch ]] || fail "strategy not switched back"
 run; expect 0 retired
 
-echo "PASS test_desktop_switcher_carry (12 scenarios)"
+# 12b. Sticky: a later upstream desktop commit the fleet hasn't merged yet keeps it retired.
+up_commit sh -c 'echo later >> apps/desktop/shared.txt'
+run; expect 0 retired; [[ "$(strategy)" == switch ]] || fail "un-retired after upstream desktop commit"
+
+# 12c. A host on main that set update_in_place but never adopted is reset on retirement.
+git -C "$REPO" checkout -q main; "$HOME/.local/bin/hermes" config set updates.parked_branch_strategy update_in_place
+run; expect 0 retired_strategy_switch; [[ "$(strategy)" == switch ]] || fail "main host strategy not reset"
+
+echo "PASS test_desktop_switcher_carry (16 scenarios)"

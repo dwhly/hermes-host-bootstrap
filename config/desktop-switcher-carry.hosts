@@ -1,4 +1,7 @@
 # Mac clients that carry the Desktop gateway switcher (lib/M7-desktop-switcher-carry.sh).
 # One short hostname per line. Activate host by host, each in its own reviewed commit.
 # Removing a host removes its sync agent (its checkout is left as is).
+# RULE: h-air2 is the only canary. Do NOT add a second host until the boss job that
+# maintains fleet/desktop-switcher and a fleet-visible carry status have landed; until
+# then ~/.hermes/desktop-carry/last on h-air2 is checked by hand at least daily.
 h-air2

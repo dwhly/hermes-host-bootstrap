@@ -124,8 +124,8 @@ else
   fi
 fi
 if ! launchctl print "$domain/$label" >/dev/null 2>&1; then
-  launchctl bootstrap "$domain" "$plist"
   launchctl enable "$domain/$label"
+  launchctl bootstrap "$domain" "$plist"
 fi
 launchctl print "$domain/$label" >/dev/null
 ok "desktop carry agent loaded on $host_short (sync at login and every 3 h, catching up after sleep; log $state_dir/sync.log)"
