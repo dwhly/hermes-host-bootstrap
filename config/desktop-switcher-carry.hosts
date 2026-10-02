@@ -1,0 +1,4 @@
+# Mac clients that carry the Desktop gateway switcher (lib/M7-desktop-switcher-carry.sh).
+# One short hostname per line. Activate host by host, each in its own reviewed commit.
+# Removing a host removes its sync agent (its checkout is left as is).
+h-air2

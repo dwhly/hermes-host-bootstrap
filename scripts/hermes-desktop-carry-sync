@@ -1,0 +1,160 @@
+#!/bin/bash
+# hermes-desktop-carry-sync — keep this Mac's Hermes checkout on the fleet's carried
+# Desktop patch (the gateway switcher, upstream PR #125267) until upstream merges it.
+#
+# GIT ONLY. It never rebuilds Desktop and never restarts anything. Desktop's own
+# bundle-skew check sees the newer desktop code in the checkout and the next normal
+# update (`hermes update`, or Desktop's Update) rebuilds the app from it.
+#
+# How the carry works:
+#   * The checkout is parked on local branch carry/desktop-switcher with
+#     updates.parked_branch_strategy=update_in_place, so `hermes update` merges
+#     origin/main into it and rebuilds Desktop (native Hermes carry mode).
+#   * The fork branch fleet/desktop-switcher (maintained centrally) holds the carry
+#     commits plus resolved merges of upstream main. This job merges it into the local
+#     branch ONLY when needed: the fleet branch has new carry commits, or upstream main
+#     would conflict with the local branch (the update would otherwise stall).
+#   * Retirement: once the fleet branch is contained in upstream main (PR merged), the
+#     job sets parked_branch_strategy back to `switch`; the next update returns to main.
+#
+# Never touches: a dirty tree, a merge/rebase in progress, a running `hermes update`,
+# any branch other than main/carry, a non-official origin (fork mode).
+# Every run writes one line to $STATE/sync.log and key=value lines to $STATE/last.
+# Exit 0 = ok/nothing to do, 3 = held (safe, nothing changed), 1 = error.
+# bash 3.2-safe (macOS /bin/bash).
+set -u
+PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH GIT_TERMINAL_PROMPT=0
+
+HH="${HERMES_HOME:-$HOME/.hermes}"
+REPO="${HERMES_CARRY_REPO:-$HH/hermes-agent}"
+FLEET_URL="${HERMES_CARRY_URL:-https://github.com/dwhly/hermes-agent.git}"
+FLEET_BRANCH="${HERMES_CARRY_FLEET_BRANCH:-fleet/desktop-switcher}"
+LOCAL_BRANCH="carry/desktop-switcher"
+FLEET_REF="refs/fleet/desktop-switcher"
+STATE="${HERMES_CARRY_STATE:-$HH/desktop-carry}"
+LOCK="$STATE/lock"
+OFFICIAL_RE='^(https://github\.com/|git@github\.com:|ssh://git@github\.com/)NousResearch/hermes-agent(\.git)?/?$'
+
+mkdir -p "$STATE"
+
+finish() { # finish <result> <reason> <exit>
+  local head
+  head="$(git -C "$REPO" rev-parse --short=10 HEAD 2>/dev/null || echo none)"
+  printf '%s result=%s reason=%s head=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$head" >>"$STATE/sync.log"
+  printf 'result=%s\nreason=%s\nhead=%s\nat=%s\n' "$1" "$2" "$head" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$STATE/last.tmp" &&
+    mv -f "$STATE/last.tmp" "$STATE/last"
+  echo "desktop-carry: $1 ($2) head=$head"
+  exit "$3"
+}
+
+# Single instance. mkdir is atomic; a lock older than 1 h is from a killed run.
+if ! mkdir "$LOCK" 2>/dev/null; then
+  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
+    rmdir "$LOCK" 2>/dev/null; mkdir "$LOCK" 2>/dev/null || finish held lock_busy 3
+  else
+    finish held lock_busy 3
+  fi
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
+g() { git -C "$REPO" "$@"; }
+
+[ -d "$REPO/.git" ] || finish held no_checkout 3
+GITDIR="$(g rev-parse --absolute-git-dir 2>/dev/null)" || finish held no_checkout 3
+for f in MERGE_HEAD rebase-merge rebase-apply CHERRY_PICK_HEAD index.lock; do
+  [ -e "$GITDIR/$f" ] && finish held "git_busy_$f" 3
+done
+if pgrep -f '[h]ermes update' >/dev/null 2>&1 || pgrep -f '[h]ermes_cli[^ ]* update' >/dev/null 2>&1; then
+  finish held update_running 3
+fi
+
+# Raw configured URL (not insteadOf-rewritten): what hermes update itself classifies.
+origin_url="$(g config --get remote.origin.url 2>/dev/null || true)"
+printf '%s\n' "$origin_url" | grep -Eq "$OFFICIAL_RE" || finish held origin_not_official 3
+# Fork-mode hazard: an `upstream` remote makes hermes update push to origin. Never on clients.
+g config --get remote.upstream.url >/dev/null 2>&1 && finish held upstream_remote_present 3
+
+branch="$(g symbolic-ref --short -q HEAD || true)"
+case "$branch" in
+  main|"$LOCAL_BRANCH") ;;
+  "") finish held detached_head 3 ;;
+  *) finish held "foreign_branch" 3 ;;
+esac
+
+g fetch --no-tags --quiet origin main || finish held fetch_origin_failed 3
+g fetch --no-tags --quiet "$FLEET_URL" "+refs/heads/$FLEET_BRANCH:$FLEET_REF" || finish held fetch_fleet_failed 3
+
+strategy_is_in_place() {
+  hermes config get updates.parked_branch_strategy 2>/dev/null | grep -q update_in_place
+}
+set_strategy() {
+  hermes config set updates.parked_branch_strategy "$1" >/dev/null 2>&1 || finish error "config_set_$1_failed" 1
+}
+
+# Retired: upstream merged the carry. Hand the checkout back to the normal updater.
+if g merge-base --is-ancestor "$FLEET_REF" origin/main; then
+  if [ "$branch" = "$LOCAL_BRANCH" ] && strategy_is_in_place; then
+    set_strategy switch
+    finish ok retired_strategy_switch 0
+  fi
+  finish ok retired 0
+fi
+
+clean() { [ -z "$(g status --porcelain --untracked-files=no 2>/dev/null)" ]; }
+
+# upstream_conflicts: true only on PROOF that merging origin/main into HEAD conflicts.
+# merge-tree --write-tree (git >= 2.38) exits 1 on conflict, 0 when clean; anything else
+# (old git, error) is "unknown" and counts as no conflict, so we never merge on a guess.
+upstream_conflicts() {
+  g merge-tree --write-tree HEAD origin/main >/dev/null 2>&1
+  [ $? -eq 1 ]
+}
+
+merge_fleet() { # merge_fleet <reason>
+  clean || finish held dirty_tree 3
+  if ! GIT_AUTHOR_NAME="Hermes fleet carry" GIT_AUTHOR_EMAIL="fleet-carry@hermes.local" \
+       GIT_COMMITTER_NAME="Hermes fleet carry" GIT_COMMITTER_EMAIL="fleet-carry@hermes.local" \
+       g merge --no-edit --quiet "$FLEET_REF" >/dev/null 2>&1; then
+    g merge --abort >/dev/null 2>&1 || true
+    finish held merge_conflict 3
+  fi
+}
+
+if [ "$branch" = main ]; then
+  # Adoption: park on the carry branch at the current commit, then take the fleet branch.
+  clean || finish held dirty_tree 3
+  g show-ref --verify --quiet "refs/heads/$LOCAL_BRANCH" && finish held carry_branch_exists_unchecked_out 3
+  g checkout --quiet -b "$LOCAL_BRANCH" || finish error checkout_failed 1
+  clean || finish error dirty_after_checkout 1
+  if ! GIT_AUTHOR_NAME="Hermes fleet carry" GIT_AUTHOR_EMAIL="fleet-carry@hermes.local" \
+       GIT_COMMITTER_NAME="Hermes fleet carry" GIT_COMMITTER_EMAIL="fleet-carry@hermes.local" \
+       g merge --no-edit --quiet "$FLEET_REF" >/dev/null 2>&1; then
+    g merge --abort >/dev/null 2>&1 || true
+    g checkout --quiet main && g branch -D "$LOCAL_BRANCH" >/dev/null 2>&1
+    finish held adopt_merge_conflict 3
+  fi
+  set_strategy update_in_place
+  finish ok adopted_rebuild_pending 0
+fi
+
+# On the carry branch.
+strategy_is_in_place || set_strategy update_in_place
+if g merge-base --is-ancestor "$FLEET_REF" HEAD; then
+  # Fleet branch already in. If upstream now conflicts, the central merge hasn't landed yet.
+  if upstream_conflicts; then
+    finish held waiting_for_fleet_merge 3
+  fi
+  finish ok up_to_date 0
+fi
+# Fleet branch has commits we lack. Merge only when it matters.
+new_carry="$(g rev-list --no-merges --count HEAD.."$FLEET_REF" ^origin/main 2>/dev/null || echo 0)"
+if [ "${new_carry:-0}" -gt 0 ]; then
+  merge_fleet new_carry_commits
+  finish ok merged_new_carry_rebuild_pending 0
+fi
+if upstream_conflicts; then
+  merge_fleet upstream_conflict
+  finish ok merged_conflict_resolution_rebuild_pending 0
+fi
+finish ok no_merge_needed 0
