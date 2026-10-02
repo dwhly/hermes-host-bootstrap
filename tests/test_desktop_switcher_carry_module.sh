@@ -51,7 +51,8 @@ mk_repo "$WORK/r" h-air2
 run_case listed h-air2
 [[ -x "$H/.local/bin/hermes-desktop-carry-sync" ]] || fail "listed: sync not installed"
 cmp -s "$ROOT/scripts/hermes-desktop-carry-sync" "$H/.local/bin/hermes-desktop-carry-sync" || fail "listed: digest"
-grep -q '<integer>10800</integer>' "$PLIST" || fail "listed: interval"
+grep -q 'StartCalendarInterval' "$PLIST" || fail "listed: schedule"
+grep -q '<key>HERMES_HOME</key><string>'"$H"'/.hermes</string>' "$PLIST" || fail "listed: HERMES_HOME not pinned"
 grep -q 'launchctl bootstrap' "$LOG" || fail "listed: not bootstrapped"
 
 # 2. Rerun unchanged: no bootout/bootstrap churn.
@@ -78,7 +79,12 @@ grep -q 'launchctl bootout' "$LOG" || fail "removed: not booted out"
 run_case linux h-air2 FAKE_UNAME=Linux;  [[ -f "$PLIST" ]] && fail "linux installed"
 run_case server h-air2 ROLE=server;      [[ -f "$PLIST" ]] && fail "server installed"
 run_case minimal h-air2 TIER=minimal;    [[ -f "$PLIST" ]] && fail "minimal installed"
-grep -q 'desktop-switcher-carry needs' <<<"$OUT" || fail "minimal: no skip message"
+grep -q 'needs a Mac client on the recommended tier' <<<"$OUT" || fail "minimal: no skip message"
+# 6b. A listed Mac that drops to server role / minimal tier loses its agent.
+mkdir -p "$WORK/demoted/Library/LaunchAgents"; echo stale >"$WORK/demoted/Library/LaunchAgents/com.hermes.desktop-carry.plist"
+run_case demoted h-air2 TIER=minimal
+[[ -f "$PLIST" ]] && fail "demoted: plist kept"
+grep -q 'launchctl bootout' "$LOG" || fail "demoted: not booted out"
 
 # 7. A host name that is a prefix/regex of a listed one does not match.
 run_case prefix h-air;  [[ -f "$PLIST" ]] && fail "prefix matched"

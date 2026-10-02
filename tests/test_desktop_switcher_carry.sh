@@ -8,12 +8,13 @@ SYNC="$ROOT/scripts/hermes-desktop-carry-sync"
 bash -n "$SYNC"
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
-W="$(mktemp -d)"; trap 'rm -rf "$W"' EXIT
+W="$(mktemp -d)"; trap 'kill "${SLEEPER:-0}" 2>/dev/null || true; rm -rf "$W"' EXIT
 export HOME="$W/home"; mkdir -p "$HOME/.local/bin"
 export HERMES_HOME="$HOME/.hermes"; mkdir -p "$HERMES_HOME"
 export GIT_CONFIG_GLOBAL="$W/gitconfig" GIT_CONFIG_NOSYSTEM=1
 git config --global user.name t; git config --global user.email t@t
 git config --global init.defaultBranch main
+git config --global advice.detachedHead false
 git config --global url."$W/up.git".insteadOf https://github.com/NousResearch/hermes-agent.git
 git config --global url."$W/fork.git".insteadOf https://github.com/dwhly/hermes-agent.git
 cat >"$HOME/.local/bin/hermes" <<'SH'
@@ -26,79 +27,120 @@ esac
 SH
 chmod +x "$HOME/.local/bin/hermes"
 strategy() { grep '^updates.parked_branch_strategy=' "$HERMES_HOME/fake-config" 2>/dev/null | cut -d= -f2-; }
+MARKER="$HERMES_HOME/.hermes-update-in-progress"
 
-# Upstream repo with main; fork with fleet/desktop-switcher = main + carry commit.
+# Upstream main; fork fleet/desktop-switcher = main + carry commit under apps/desktop.
 git init -q --bare "$W/up.git"; git init -q --bare "$W/fork.git"
 git clone -q "$W/up.git" "$W/dev" 2>/dev/null; cd "$W/dev"
-printf 'a\nb\nc\n' > shared.txt; echo base > other.txt; git add .; git commit -qm base; git push -q origin main
-git checkout -qb fleet/desktop-switcher; echo switcher > switcher.txt; git add .; git commit -qm "feat: switcher"
+mkdir -p apps/desktop
+printf 'a\nb\nc\n' > apps/desktop/shared.txt; echo base > other.txt; echo '{}' > package.json
+git add .; git commit -qm base; git push -q origin main
+git checkout -qb fleet/desktop-switcher
+echo switcher > apps/desktop/switcher.txt; git add .; git commit -qm "feat: switcher"
 git push -q "$W/fork.git" fleet/desktop-switcher
 git checkout -q main
+up_commit() { git checkout -q main; "$@"; git commit -qam "up: change" >/dev/null; git push -q origin main; }
+fleet_do() { git checkout -q fleet/desktop-switcher; "$@"; git push -q "$W/fork.git" fleet/desktop-switcher; git checkout -q main; }
 
-# Client checkout: official origin URL (raw), on main.
 REPO="$HERMES_HOME/hermes-agent"
 git clone -q https://github.com/NousResearch/hermes-agent.git "$REPO"
-git -C "$REPO" config --get remote.origin.url | grep -q NousResearch || fail "origin url raw"
 
 run() { set +e; out="$(bash "$SYNC" 2>&1)"; rc=$?; set -e; }
 expect() { # expect <rc> <reason>
   [[ "$rc" == "$1" ]] || fail "rc=$rc want $1: $out"
   grep -q "^reason=$2\$" "$HERMES_HOME/desktop-carry/last" || fail "reason want $2: $out"
+  if [[ -e "$MARKER" && "$2" != update_running ]]; then fail "update marker left behind after $2"; fi
+  return 0
 }
 head_of() { git -C "$REPO" rev-parse HEAD; }
 branch_of() { git -C "$REPO" symbolic-ref --short HEAD; }
+client_update() { git -C "$REPO" merge -q --no-edit origin/main >/dev/null; } # what hermes update does
 
-# 1. Dirty tree on main: held, nothing changed.
-echo dirty >> "$REPO/other.txt"; h0="$(head_of)"
-run; expect 3 dirty_tree
-[[ "$(branch_of)" == main && "$(head_of)" == "$h0" ]] || fail "dirty changed checkout"
-git -C "$REPO" checkout -q -- other.txt
+# 1. Untracked file the carry would overwrite: git refuses; checkout restored to main.
+echo mine > "$REPO/apps/desktop/switcher.txt"; h0="$(head_of)"
+run; expect 3 merge_refused
+[[ "$(branch_of)" == main && "$(head_of)" == "$h0" ]] || fail "refused merge changed checkout"
+if git -C "$REPO" show-ref --quiet refs/heads/carry/desktop-switcher; then fail "rollback left carry branch"; fi
+[[ "$(cat "$REPO/apps/desktop/switcher.txt")" == mine ]] || fail "user file touched"
+rm "$REPO/apps/desktop/switcher.txt"
 
-# 2. Adoption.
+# 2. Live updater holds the marker: held, nothing changed. Stale marker: ignored, removed.
+sleep 300 & SLEEPER=$!
+printf '%s\n%s\n' "$SLEEPER" "$(date +%s)" > "$MARKER"
+run; expect 3 update_running; [[ "$(branch_of)" == main ]] || fail "moved under live marker"
+kill "$SLEEPER"; wait "$SLEEPER" 2>/dev/null || true
+printf '999999\n%s\n' "$(date +%s)" > "$MARKER"
+
+# 3. Adoption with an unrelated local edit: adopts, keeps the edit, releases the marker.
+echo local-edit >> "$REPO/other.txt"
 run; expect 0 adopted_rebuild_pending
 [[ "$(branch_of)" == carry/desktop-switcher ]] || fail "not on carry"
-[[ -f "$REPO/switcher.txt" ]] || fail "carry not merged"
+[[ -f "$REPO/apps/desktop/switcher.txt" ]] || fail "carry not merged"
+grep -q local-edit "$REPO/other.txt" || fail "local edit lost"
 [[ "$(strategy)" == update_in_place ]] || fail "strategy not set"
+git -C "$REPO" checkout -q -- other.txt
 
-# 3. Idempotent.
+# 4. Idempotent; upstream advancing cleanly needs no merge from us.
 h1="$(head_of)"; run; expect 0 up_to_date; [[ "$(head_of)" == "$h1" ]] || fail "rerun moved HEAD"
-
-# 4. Upstream advances cleanly: no merge by us (hermes update handles it).
-cd "$W/dev"; echo more >> other.txt; git commit -qam "up: clean"; git push -q origin main
+up_commit sh -c 'echo more >> other.txt'
 run; expect 0 up_to_date; [[ "$(head_of)" == "$h1" ]] || fail "clean upstream caused a merge"
 
-# 5. Upstream conflicts with the carry; fleet branch not resolved yet: held.
-git checkout -q fleet/desktop-switcher; sed -i.bak 's/^b$/carry-b/' shared.txt; rm -f shared.txt.bak
-git commit -qam "feat: switcher touches shared"; git push -q "$W/fork.git" fleet/desktop-switcher
-git checkout -q main
-run; expect 0 merged_new_carry_rebuild_pending   # new carry commit is taken
-h2="$(head_of)"
-sed -i.bak 's/^b$/upstream-b/' shared.txt; rm -f shared.txt.bak; git commit -qam "up: conflicting"; git push -q origin main
-run; expect 3 waiting_for_fleet_merge; [[ "$(head_of)" == "$h2" ]] || fail "held run moved HEAD"
+# 5. New carry commit, fleet base already in HEAD: taken.
+fleet_do sh -c 'echo v2 >> apps/desktop/switcher.txt && git commit -qam "fix: switcher v2"'
+run; expect 0 merged_new_carry_rebuild_pending
+grep -q v2 "$REPO/apps/desktop/switcher.txt" || fail "new carry not merged"
 
-# 6. Central resolution lands on the fleet branch: client takes it.
-git checkout -q fleet/desktop-switcher; git merge -q main 2>/dev/null || true
-printf 'a\ncarry-b\nc\n' > shared.txt; git add shared.txt; git commit -qm "merge main (resolved)"
-git push -q "$W/fork.git" fleet/desktop-switcher; git checkout -q main
+# 6. Fleet merged NEWER upstream plus a new carry commit; HEAD lacks that upstream: update_first.
+up_commit sh -c 'echo newer >> other.txt'
+fleet_do sh -c 'git merge -q --no-edit main && echo v3 >> apps/desktop/switcher.txt && git commit -qam "fix: v3"'
+h2="$(head_of)"; run; expect 3 update_first; [[ "$(head_of)" == "$h2" ]] || fail "update_first moved HEAD"
+client_update; run; expect 0 merged_new_carry_rebuild_pending
+grep -q v3 "$REPO/apps/desktop/switcher.txt" || fail "v3 not merged after update"
+
+# 7. Upstream conflicts with the carry; fleet hasn't resolved yet: held.
+fleet_do sh -c "sed -i.bak 's/^b\$/carry-b/' apps/desktop/shared.txt && rm -f apps/desktop/shared.txt.bak && git commit -qam 'feat: carry touches shared'"
+client_update; run; expect 0 merged_new_carry_rebuild_pending
+up_commit sh -c "sed -i.bak 's/^b\$/upstream-b/' apps/desktop/shared.txt && rm -f apps/desktop/shared.txt.bak"
+h3="$(head_of)"; run; expect 3 waiting_for_fleet_merge; [[ "$(head_of)" == "$h3" ]] || fail "held run moved HEAD"
+
+# 8. Resolution lands, but the upstream it brings changes package.json: needs_full_update.
+up_commit sh -c "echo '{\"v\":2}' > package.json"
+resolve() { git merge -q main >/dev/null 2>&1 || true; printf 'a\ncarry-b\nc\n' > apps/desktop/shared.txt; git add -A; git commit -qm "merge main (resolved)"; }
+fleet_do resolve
+run; expect 3 needs_full_update; [[ "$(head_of)" == "$h3" ]] || fail "deps hold moved HEAD"
+
+# 9. Without a dependency change the resolution is taken and upstream merges cleanly again.
+git checkout -q main; git reset -q --hard HEAD~1; git push -q -f origin main
+git checkout -q fleet/desktop-switcher; git reset -q --hard HEAD~1; resolve
+git push -q -f "$W/fork.git" fleet/desktop-switcher; git checkout -q main
 run; expect 0 merged_conflict_resolution_rebuild_pending
 git -C "$REPO" merge-tree --write-tree HEAD origin/main >/dev/null || fail "still conflicts after resolution"
 
-# 7. Foreign branch and upstream remote: held.
+# 10. Guards: foreign branch, upstream remote, non-official origin, git op in progress, sync lock.
 git -C "$REPO" checkout -q -b other; run; expect 3 foreign_branch; git -C "$REPO" checkout -q carry/desktop-switcher
 git -C "$REPO" remote add upstream "$W/up.git"; run; expect 3 upstream_remote_present; git -C "$REPO" remote remove upstream
-
-# 8. Non-official origin (fork mode): held.
 git -C "$REPO" config remote.origin.url https://github.com/dwhly/hermes-agent.git
 run; expect 3 origin_not_official
 git -C "$REPO" config remote.origin.url https://github.com/NousResearch/hermes-agent.git
+touch "$REPO/.git/REVERT_HEAD"; run; expect 3 git_busy_REVERT_HEAD; rm "$REPO/.git/REVERT_HEAD"
+mkdir "$HERMES_HOME/desktop-carry/lock"; run; expect 3 lock_busy; rmdir "$HERMES_HOME/desktop-carry/lock"
 
-# 9. Retirement: upstream merges the fleet branch -> strategy back to switch.
-git merge -q --no-edit fleet/desktop-switcher 2>/dev/null; git push -q origin main
-git fetch -q "$W/fork.git" fleet/desktop-switcher:fleet/desktop-switcher 2>/dev/null || true
+# 11. Switched back to main by an update (strategy reset): stale carry branch with nothing
+#     unique is dropped and the host re-adopts. With a unique commit it holds.
+client_update
+git -C "$REPO" checkout -q main; git -C "$REPO" merge -q --ff-only origin/main
+"$HOME/.local/bin/hermes" config set updates.parked_branch_strategy switch
+[[ "$(strategy)" == switch ]] || fail "shim reset"
+run; expect 0 adopted_rebuild_pending; [[ "$(strategy)" == update_in_place ]] || fail "re-adopt strategy"
+git -C "$REPO" commit -q --allow-empty -m "local only"
+git -C "$REPO" checkout -q main
+run; expect 3 carry_branch_has_unique_commits
+git -C "$REPO" checkout -q carry/desktop-switcher
+
+# 12. Retirement by squash merge: upstream gets the same apps/desktop content, no ancestry.
+git checkout -q main; git checkout -q fleet/desktop-switcher -- apps/desktop; git commit -qm "squash: switcher"; git push -q origin main
+fleet_do sh -c 'git merge -q --no-edit main'
 run; expect 0 retired_strategy_switch; [[ "$(strategy)" == switch ]] || fail "strategy not switched back"
 run; expect 0 retired
 
-# 10. Lock held by a live run: held, no change.
-mkdir "$HERMES_HOME/desktop-carry/lock"; run; expect 3 lock_busy; rmdir "$HERMES_HOME/desktop-carry/lock"
-
-echo "PASS test_desktop_switcher_carry (10 scenarios)"
+echo "PASS test_desktop_switcher_carry (12 scenarios)"
