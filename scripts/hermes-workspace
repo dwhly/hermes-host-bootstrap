@@ -1323,6 +1323,8 @@ hmw_snapshot_loop_alive() {
 hmw_snapshot_loop_ensure() {
   local pidfile pid start token
   [ "$HMW_SNAPSHOT_INTERVAL" != "0" ] || return 0
+  # Verify runs are probes that stop the server they started: never snapshot.
+  [ "$VERIFY" != "1" ] || return 0
   [ -n "$HMW_RESTORE_LOCK" ] || return 0
   mkdir -p "$HMW_STATE_DIR" 2>/dev/null || return 0
   pidfile="$HMW_STATE_DIR/$SESSION.snapshot-loop.pid"
@@ -1340,6 +1342,7 @@ hmw_snapshot_loop_ensure() {
 
 hmw_snapshot_spawn_once() {
   [ "$HMW_SNAPSHOT_INTERVAL" != "0" ] || return 0
+  [ "$VERIFY" != "1" ] || return 0
   HMW_SNAPSHOT=1 HERDR_SESSION="$SESSION" nohup bash "${BASH_SOURCE[0]}" >/dev/null 2>&1 &
 }
 
