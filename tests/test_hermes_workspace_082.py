@@ -183,6 +183,88 @@ class Herdr082Tests(unittest.TestCase):
         # Refused before touching Herdr at all (no calls log is fine).
         self.assertEqual(self.pane_runs() if self.log.exists() else [], [])
 
+    # ── pane memory: snapshot pane -> live Hermes session, resume on reboot ──
+    def fg(self, pid):
+        return {"shell_pid": 10, "foreground_process_group_id": pid,
+                "foreground_processes": [{"pid": pid, "name": "hermes", "argv": ["hermes"]}]}
+
+    def run_snapshot(self, leases, tree):
+        runtime = self.home / ".hermes/runtime"
+        runtime.mkdir(parents=True, exist_ok=True)
+        (runtime / "active_sessions.json").write_text(json.dumps({"entries": leases}))
+        (self.bin / "ps").write_text("#!/bin/sh\ncat <<'EOF'\n" + "".join(
+            "%d %d\n" % kv for kv in tree.items()) + "EOF\n")
+        (self.bin / "ps").chmod(0o755)
+        env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
+                   HMW_BACKEND="herdr", HMW_SNAPSHOT="1", HERDR_SESSION="review",
+                   HERMES_HOME=str(self.home / ".hermes"),
+                   HERDR_082_STATE=str(self.path), HERDR_082_LOG=str(self.log))
+        return subprocess.run(["bash", str(CORE)], env=env, capture_output=True, text=True, timeout=25)
+
+    def snapshot_path(self):
+        return self.home / ".hermes/hmw/review.panes.json"
+
+    def test_pane_memory_snapshot_maps_lease_descendants_to_panes(self):
+        self.write(panes=[self.pane("H1", agent="hermes"), dict(self.pane("", "w1:p3"), tab_id="w1:t2"),
+                          self.pane("", "w1:p4"), self.pane("", "w1:p5")],
+                   process_by_pane={"w1:p1": self.fg(100), "w1:p3": self.fg(300),
+                                    "w1:p4": SHELL, "w1:p5": self.fg(500)})
+        # TUI: hermes(100) -> node(101) -> tui_gateway(102) holds the lease.
+        tree = {100: 10, 101: 100, 102: 101, 300: 10, 301: 300, 500: 10, 501: 500, 502: 500, 999: 1}
+        leases = [dict(session_id="S_A", surface="tui", pid=102),
+                  dict(session_id="S_GW", surface="gateway", pid=102),   # not a chat surface
+                  dict(session_id="S_B", surface="cli", pid=300),
+                  dict(session_id="S_OTHER", surface="tui", pid=999),    # not under any pane
+                  dict(session_id="S_X", surface="cli", pid=501),        # two sessions in
+                  dict(session_id="S_Y", surface="cli", pid=502)]        # one pane: ambiguous
+        result = self.run_snapshot(leases, tree)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snap = json.loads(self.snapshot_path().read_text())
+        self.assertIn("saved_at", snap)
+        self.assertEqual([(p["pane_id"], p["tab_id"], p["pane_label"], p["session_id"]) for p in snap["panes"]],
+                         [("w1:p1", "w1:t1", "H1", "S_A"), ("w1:p3", "w1:t2", None, "S_B")])
+        self.assertEqual(list(self.snapshot_path().parent.glob("*.tmp.*")), [])
+
+    def test_pane_memory_snapshot_waits_out_a_pending_restore(self):
+        self.write(panes=[self.pane("H1")], process_by_pane={"w1:p1": SHELL})
+        self.snapshot_path().parent.mkdir(parents=True)
+        held = {"saved_at": 1, "restore_pending_until": 4102444800,
+                "panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "session_id": "S_A"}]}
+        self.snapshot_path().write_text(json.dumps(held))
+        self.assertEqual(self.run_snapshot([], {}).returncode, 0)
+        self.assertEqual(json.loads(self.snapshot_path().read_text()), held)
+
+    def test_pane_memory_reboot_resumes_every_pane_once(self):
+        tabbed = lambda label, pid, tab, **kw: dict(self.pane(label, pid, **kw), tab_id=tab)
+        self.write(panes=[self.pane("H1"), self.pane("H2", "w1:p2"), tabbed("", "w1:p3", "w1:t2"),
+                          tabbed("", "w1:p4", "w1:t3"), tabbed("", "w1:p5", "w1:t4", agent="hermes"),
+                          tabbed("", "w1:p6", "w1:t5"), tabbed("", "w1:p7", "w1:t6")],
+                   visible="", process=SHELL, stopped=True,
+                   launched_state={"visible": COMPOSER, "process": LIVE})
+        self.snapshot_path().parent.mkdir(parents=True)
+        self.snapshot_path().write_text(json.dumps({"saved_at": 1, "panes": [
+            {"pane_id": "w1:p1", "tab_id": "w1:t1", "pane_label": "H1", "session_id": "S_H1"},
+            {"pane_id": "w9:p3", "tab_id": "w9:t2", "session_id": "S_EMAIL"},   # renumbered workspace
+            {"pane_id": "w1:p4", "tab_id": "w1:t3", "session_id": "S_H1"},      # duplicate id
+            {"pane_id": "w1:p5", "tab_id": "w1:t4", "session_id": "S_LIVE"},    # already has Hermes
+            {"pane_id": "w1:p6", "tab_id": "w1:t5", "session_id": "x; rm -rf ~"},  # unsafe id
+        ]}))
+        result = self.run_core(2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.pane_runs(), [
+            ["pane", "run", "w1:p1", "env NO_TMUX=1 HMW_RESUME_ID=S_H1 hermes-pane H1"],
+            ["pane", "run", "w1:p2", "env NO_TMUX=1 hermes-pane H2"],               # labelled fallback
+            ["pane", "run", "w1:p3", "env NO_TMUX=1 hermes chat --resume S_EMAIL"]])  # unlabelled tab
+        self.assertGreater(json.loads(self.snapshot_path().read_text())["restore_pending_until"], 0)
+
+    def test_pane_memory_running_server_never_retypes_snapshot(self):
+        self.write(panes=[self.pane("H1", agent="hermes"), dict(self.pane("", "w1:p3"), tab_id="w1:t2")])
+        self.snapshot_path().parent.mkdir(parents=True)
+        self.snapshot_path().write_text(json.dumps({"saved_at": 1, "panes": [
+            {"pane_id": "w1:p3", "tab_id": "w1:t2", "session_id": "S_EMAIL"}]}))
+        self.assertEqual(self.run_core(1).returncode, 0)
+        self.assertEqual(self.pane_runs(), [])
+
     def test_reboot_verify_run_stops_server_it_started(self):
         self.restored(stopped=True, launched_state={"visible": COMPOSER, "process": LIVE})
         self.assertEqual(self.run_core(2).returncode, 0)

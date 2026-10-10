@@ -104,8 +104,20 @@ PY
   )
 }
 
-resolve_hermes_internals
-LAST_ID="$(resolve_last_session)"
+# hmw's reboot restore passes the exact session this pane held (from Hermes'
+# active-session leases), which beats the label lookup: `--resume` does not
+# retag a session's source, so pane:<label> can name a stale conversation.
+RESUME_ID="${HMW_RESUME_ID:-}"
+unset HMW_RESUME_ID
+case "$RESUME_ID" in
+  *[!A-Za-z0-9_.:-]*) RESUME_ID="" ;;
+esac
+if [[ -n "$RESUME_ID" ]]; then
+  LAST_ID="$RESUME_ID"
+else
+  resolve_hermes_internals
+  LAST_ID="$(resolve_last_session)"
+fi
 
 if [[ -n "${LAST_ID:-}" ]]; then
   echo "hermes-pane[$LABEL]: resuming session $LAST_ID"

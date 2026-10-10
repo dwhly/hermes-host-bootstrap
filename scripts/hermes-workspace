@@ -1059,23 +1059,207 @@ items += json.loads(os.environ["HERDR_PANE_INVENTORY"])["result"]["panes"]
 raise SystemExit(0 if any(i.get("pane_id") == os.environ["HMW_TARGET"] and i.get("agent") == "hermes" for i in items) else 1)'
 }
 
+# ── Pane memory: which Hermes conversation each pane holds ─────────────
+# Signal: Hermes' own cross-process lease registry,
+# $HERMES_HOME/runtime/active_sessions.json (hermes_cli/active_sessions.py:
+# _state_path L175, _lease_entry L461 writes {session_id, surface, pid}). The
+# CLI claims it at start (cli.py:916 _claim_active_session) and the TUI gateway
+# moves it on /new, resume and compression (tui_gateway/session_lifecycle.py:
+# transfer_active_session L176/L288), so it names the LIVE session. Herdr's
+# own pane agent_session value is not used: it stays on the launch id.
+# A lease belongs to a pane when its pid is a pane foreground process or a
+# descendant (the TUI lease is held by `python -m tui_gateway.entry`, a child
+# of node, a child of the pane's `hermes`).
+HMW_STATE_DIR="${HMW_STATE_DIR:-$HOME/.hermes/hmw}"
+HMW_SNAPSHOT_INTERVAL="${HMW_SNAPSHOT_INTERVAL:-300}"
+HMW_RESTORE_PENDING_SECONDS="${HMW_RESTORE_PENDING_SECONDS:-180}"
+
+hmw_snapshot_file() {
+  printf '%s/%s.panes.json\n' "$HMW_STATE_DIR" "$SESSION"
+}
+
+hmw_snapshot_panes() {
+  local panes_json pane_ids pane_id info infos="" ps_out file
+
+  file="$(hmw_snapshot_file)"
+  panes_json="$("${HERDR[@]}" pane list 2>/dev/null)" || return 1
+  pane_ids="$(printf '%s' "$panes_json" | python3 -c 'import json, sys
+for p in json.load(sys.stdin)["result"]["panes"]:
+    print(p["pane_id"])')" || return 1
+  while IFS= read -r pane_id; do
+    [ -n "$pane_id" ] || continue
+    info="$("${HERDR[@]}" pane process-info --pane "$pane_id" 2>/dev/null | tr -d '\n')" || continue
+    infos+="$info"$'\n'
+  done <<< "$pane_ids"
+  ps_out="$(ps -A -o pid= -o ppid= 2>/dev/null)" || return 1
+  mkdir -p "$HMW_STATE_DIR" 2>/dev/null || return 1
+  HMW_PANES="$panes_json" HMW_INFOS="$infos" HMW_PS="$ps_out" HMW_SNAPSHOT_FILE="$file" \
+  HMW_LEASES="${HERMES_HOME:-$HOME/.hermes}/runtime/active_sessions.json" python3 -c 'import json, os, time
+file = os.environ["HMW_SNAPSHOT_FILE"]
+try:
+    old = json.load(open(file))
+    # A restore just typed resume commands; Hermes may not hold its lease yet.
+    if float(old.get("restore_pending_until") or 0) > time.time():
+        raise SystemExit(0)
+except (OSError, ValueError, AttributeError, TypeError):
+    pass
+panes = json.loads(os.environ["HMW_PANES"])["result"]["panes"]
+fg = {}
+for line in os.environ["HMW_INFOS"].splitlines():
+    try:
+        info = json.loads(line)["result"]["process_info"]
+        fg[info["pane_id"]] = {j["pid"] for j in info["foreground_processes"] if type(j.get("pid")) is int}
+    except (ValueError, KeyError, TypeError):
+        continue
+parent = {}
+for line in os.environ["HMW_PS"].splitlines():
+    f = line.split()
+    if len(f) == 2 and f[0].isdigit() and f[1].isdigit():
+        parent[int(f[0])] = int(f[1])
+def ancestry(pid):
+    seen = set()
+    while pid in parent and pid not in seen and pid > 1:
+        seen.add(pid)
+        pid = parent[pid]
+    return seen
+try:
+    leases = json.load(open(os.environ["HMW_LEASES"])).get("entries") or []
+except (OSError, ValueError, AttributeError):
+    leases = []
+out, used = [], set()
+for p in panes:
+    pids = fg.get(p.get("pane_id"), set())
+    ids = {str(l.get("session_id")) for l in leases if isinstance(l, dict)
+           and l.get("surface") in ("cli", "tui") and l.get("session_id")
+           and type(l.get("pid")) is int and ancestry(l["pid"]) & pids}
+    if len(ids) != 1:
+        continue  # no Hermes here, or ambiguous: never guess
+    sid = ids.pop()
+    if sid in used:
+        continue
+    used.add(sid)
+    out.append({"pane_id": p["pane_id"], "workspace_id": p.get("workspace_id"), "tab_id": p.get("tab_id"),
+                "tab_label": p.get("tab_label"), "pane_label": p.get("label") or None, "session_id": sid})
+tmp = "%s.tmp.%d" % (file, os.getpid())
+with open(tmp, "w") as fh:
+    json.dump({"saved_at": time.time(), "panes": out}, fh, indent=1)
+os.replace(tmp, file)'
+}
+
+# Mapped pane_id<TAB>session_id lines for the CURRENT inventory. Herdr keeps
+# public pane/tab numbers across restarts (session.json public_pane_numbers),
+# so an exact pane_id wins; else a unique (tab, pane) number suffix match.
+hmw_snapshot_resume_map() {
+  local file
+  file="$(hmw_snapshot_file)"
+  [ -f "$file" ] || return 0
+  HMW_SNAPSHOT_FILE="$file" HERDR_PANE_INVENTORY="$HERDR_PANE_INVENTORY" python3 -c 'import json, os, re
+try:
+    snap = json.load(open(os.environ["HMW_SNAPSHOT_FILE"]))["panes"]
+    panes = json.loads(os.environ["HERDR_PANE_INVENTORY"])["result"]["panes"]
+except (OSError, ValueError, KeyError, TypeError):
+    raise SystemExit(0)
+safe = re.compile(r"[A-Za-z0-9_.:-]+")
+def tail(value):
+    return str(value or "").rsplit(":", 1)[-1]
+def key(p):
+    return (tail(p.get("tab_id")), tail(p.get("pane_id")))
+snap = [s for s in snap if isinstance(s, dict) and safe.fullmatch(str(s.get("session_id") or ""))]
+by_id = {s["pane_id"]: s for s in snap}
+skeys = [key(s) for s in snap]
+ckeys = [key(p) for p in panes]
+used = set()
+for p in panes:
+    s = by_id.get(p["pane_id"])
+    if s is None and ckeys.count(key(p)) == 1 and skeys.count(key(p)) == 1:
+        s = snap[skeys.index(key(p))]
+    if s is None or s["session_id"] in used:
+        continue
+    used.add(s["session_id"])
+    print(p["pane_id"] + "\t" + s["session_id"])'
+}
+
+hmw_mark_restore_pending() {
+  local file
+  file="$(hmw_snapshot_file)"
+  [ -f "$file" ] || return 0
+  HMW_SNAPSHOT_FILE="$file" HMW_PENDING="$HMW_RESTORE_PENDING_SECONDS" python3 -c 'import json, os, time
+file = os.environ["HMW_SNAPSHOT_FILE"]
+data = json.load(open(file))
+data["restore_pending_until"] = time.time() + float(os.environ["HMW_PENDING"])
+tmp = "%s.tmp.%d" % (file, os.getpid())
+with open(tmp, "w") as fh:
+    json.dump(data, fh, indent=1)
+os.replace(tmp, file)' 2>/dev/null || :
+}
+
+# One snapshot now (background) + one refresher loop per session, so the
+# snapshot is fresh before an unplanned reboot. The loop exits when the Herdr
+# server stops; the next hmw restarts it. No service unit needed.
+hmw_snapshot_loop_ensure() {
+  local pidfile pid self
+  [ "$HMW_SNAPSHOT_INTERVAL" != "0" ] || return 0
+  self="${BASH_SOURCE[0]}"
+  mkdir -p "$HMW_STATE_DIR" 2>/dev/null || return 0
+  HMW_SNAPSHOT=1 HERDR_SESSION="$SESSION" nohup bash "$self" >/dev/null 2>&1 &
+  pidfile="$HMW_STATE_DIR/$SESSION.snapshot-loop.pid"
+  pid="$(cat "$pidfile" 2>/dev/null || true)"
+  case "$pid" in ''|*[!0-9]*) pid="" ;; esac
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+  HMW_SNAPSHOT_LOOP=1 HERDR_SESSION="$SESSION" nohup bash "$self" >/dev/null 2>&1 &
+  printf '%s\n' "$!" >"$pidfile" 2>/dev/null || :
+}
+
+hmw_snapshot_loop() {
+  while herdr_status_running; do
+    sleep "$HMW_SNAPSHOT_INTERVAL" || return 0
+    herdr_status_running || return 0
+    hmw_snapshot_panes || :
+  done
+}
+
 herdr_relaunch_restored_panes() {
-  local record label target
+  local record label target resume_map pane_id sid labelled_ids=""
 
   # Only called when this run started the stopped server: Herdr restored these
   # panes from the saved layout milliseconds ago, so they hold fresh shells and
-  # nothing the user runs can be in them. Relaunch Hermes once per labelled
-  # slot. Never close panes: layout persistence is a feature Dan wants.
+  # nothing the user runs can be in them. Resume each pane's snapshotted
+  # conversation; labelled slots without one fall back to hermes-pane's own
+  # label resume. Never close panes: layout persistence is a feature Dan wants.
+  resume_map="$(hmw_snapshot_resume_map)"
   while IFS= read -r record; do
     [ -n "$record" ] || continue
     label=${record%%$'\t'*}
     target=${record#*$'\t'}
+    labelled_ids+="$target"$'\n'
     if herdr_pane_has_hermes "$target"; then
       continue
     fi
-    hmw_note "relaunching Hermes in restored pane $target ($label)"
-    "${HERDR[@]}" pane run "$target" "env NO_TMUX=1 hermes-pane $label" >/dev/null || return
+    sid="$(printf '%s\n' "$resume_map" | awk -F '\t' -v p="$target" '$1 == p { print $2; exit }')"
+    if [ -n "$sid" ]; then
+      hmw_note "resuming session $sid in restored pane $target ($label)"
+      "${HERDR[@]}" pane run "$target" "env NO_TMUX=1 HMW_RESUME_ID=$sid hermes-pane $label" >/dev/null || return
+    else
+      hmw_note "relaunching Hermes in restored pane $target ($label)"
+      "${HERDR[@]}" pane run "$target" "env NO_TMUX=1 hermes-pane $label" >/dev/null || return
+    fi
   done <<< "$HERDR_LABEL_TARGETS"
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    pane_id=${record%%$'\t'*}
+    sid=${record#*$'\t'}
+    if printf '%s' "$labelled_ids" | grep -Fqx -- "$pane_id"; then
+      continue
+    fi
+    if herdr_pane_has_hermes "$pane_id"; then
+      continue
+    fi
+    hmw_note "resuming session $sid in restored pane $pane_id"
+    "${HERDR[@]}" pane run "$pane_id" "env NO_TMUX=1 hermes chat --resume $sid" >/dev/null || return
+  done <<< "$resume_map"
+  [ -z "$resume_map" ] || hmw_mark_restore_pending
 }
 
 start_herdr_agent_in_new_pane() {
@@ -1175,6 +1359,7 @@ ensure_herdr_workspace() {
   # through its server-stop cleanup (released by the EXIT trap).
   if [ "$VERIFY" != "1" ]; then
     herdr_restore_lock_release
+    hmw_snapshot_loop_ensure
   fi
 }
 
@@ -1198,6 +1383,16 @@ SESSION=ws
 if [ "$BACKEND" = "herdr" ]; then
   SESSION="${HERDR_SESSION-ws}"
   [ -n "$SESSION" ] || usage_error 'HERDR_SESSION must not be empty'
+fi
+
+if [ "$BACKEND" = "herdr" ] && { [ "${HMW_SNAPSHOT:-0}" = "1" ] || [ "${HMW_SNAPSHOT_LOOP:-0}" = "1" ]; }; then
+  HERDR=(herdr --session "$SESSION")
+  if [ "${HMW_SNAPSHOT_LOOP:-0}" = "1" ]; then
+    hmw_snapshot_loop
+    exit 0
+  fi
+  hmw_snapshot_panes
+  exit $?
 fi
 
 if [ "${HMW_REMOTE:-0}" = "1" ]; then

@@ -71,7 +71,8 @@ elif cmd == ["pane", "read"]:
     sys.exit(state.get("read_status", 0))
 elif cmd == ["pane", "process-info"]:
     assert args[2:3] == ["--pane"]
-    emit("process_info", dict(state.get("process", {}), pane_id=args[3]))
+    info = state.get("process_by_pane", {}).get(args[3], state.get("process", {}))
+    emit("process_info", dict(info, pane_id=args[3]))
     sys.exit(state.get("process_status", 0))
 elif cmd == ["agent", "get"]:
     emit("agent", state.get("agent_get", {}).get(args[2]) or
