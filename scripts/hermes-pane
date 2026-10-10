@@ -47,11 +47,21 @@
 
 set -uo pipefail
 
+PRINT_RESUME_ID=0
+if [[ "${1:-}" == "--print-resume-id" ]]; then
+  # hmw's reboot restore: print the session the label lookup WOULD resume (or
+  # nothing), so it can deduplicate before launching. Fails when unknowable.
+  PRINT_RESUME_ID=1
+  shift
+fi
 LABEL="${1:-scratch}"
 SOURCE_TAG="pane:${LABEL}"
 
 # Locate hermes on PATH (portable across hosts — no hardcoded venv path).
 HERMES_BIN="$(command -v hermes || true)"
+if [[ -z "$HERMES_BIN" && "$PRINT_RESUME_ID" == 1 ]]; then
+  exit 1
+fi
 if [[ -z "$HERMES_BIN" ]]; then
   echo "hermes-pane: 'hermes' not found on PATH" >&2
   exec "${SHELL:-/bin/bash}"
@@ -104,15 +114,25 @@ PY
   )
 }
 
+if [[ "$PRINT_RESUME_ID" == 1 ]]; then
+  resolve_hermes_internals
+  [[ -x "${HERMES_VENV_PY:-}" && -f "${HERMES_PROOT:-}/hermes_state.py" ]] || exit 1
+  resolve_last_session
+  exit 0
+fi
+
 # hmw's reboot restore passes the exact session this pane held (from Hermes'
 # active-session leases), which beats the label lookup: `--resume` does not
 # retag a session's source, so pane:<label> can name a stale conversation.
+# HMW_RESUME_ID=none: that session is resumed in another pane; start fresh.
 RESUME_ID="${HMW_RESUME_ID:-}"
 unset HMW_RESUME_ID
 case "$RESUME_ID" in
   *[!A-Za-z0-9_.:-]*) RESUME_ID="" ;;
 esac
-if [[ -n "$RESUME_ID" ]]; then
+if [[ "$RESUME_ID" == "none" ]]; then
+  LAST_ID=""
+elif [[ -n "$RESUME_ID" ]]; then
   LAST_ID="$RESUME_ID"
 else
   resolve_hermes_internals

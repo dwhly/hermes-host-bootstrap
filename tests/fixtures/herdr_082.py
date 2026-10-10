@@ -58,7 +58,11 @@ elif cmd == ["pane", "rename"]:
     save()
 elif cmd == ["pane", "run"]:
     pane(args[2]).update(state.get("launched", {}))
-    state.update(state.get("launched_state", {}))
+    launched_state = dict(state.get("launched_state", {}))
+    if "process" in launched_state:
+        # The launch changes only the foreground of the pane it ran in.
+        state.setdefault("process_by_pane", {})[args[2]] = launched_state.pop("process")
+    state.update(launched_state)
     save()
     sys.exit(state.get("run_status", 0))
 elif cmd == ["pane", "get"]:

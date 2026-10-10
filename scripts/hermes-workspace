@@ -809,6 +809,139 @@ except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError, Attribute
 sys.stdout.write(pane_id)'
 }
 
+# Shared Python: is this argv an interactive Hermes chat? Prepended to the
+# readiness check and the pane-memory snapshot, so both agree on "Hermes".
+HMW_PY_HERMES_ARGV='import os, re
+def hermes_launcher_code(code):
+    # Hermes 0.21+ managed launchers exec the store Python as
+    # `python3 -I -c <bootstrap>`. Accept only the published Hermes CLI
+    # entry shapes (hermes_cli/_launchers.py); arbitrary -c code, and
+    # sibling entry points such as hermes-acp, stay rejected.
+    lines = code.strip().splitlines()
+    if not lines:
+        return False
+    if (lines[-1] == "sys.exit(main())" and "import hermes_bootstrap" in lines
+            and "from hermes_cli.main import main" in lines):
+        return True
+    statements = [part.strip() for part in code.strip().split(";")]
+    # (chr(39) is a single quote; this code lives in a single-quoted shell string.)
+    entry = "runpy.run_module({0}hermes_cli.main{0}, run_name={0}__main__{0}, alter_sys=True)"
+    return "import hermes_bootstrap" in statements and statements[-1] == entry.format(chr(39))
+
+def hermes_args(argv):
+    executable = os.path.basename(argv[0])
+    if executable == "hermes":
+        return argv[1:]
+    if not re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?", executable):
+        return None
+    # Parse interpreter options, not arbitrary later tokens that happen
+    # to say hermes. In particular, -c code and other scripts are not it.
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            i += 1
+            break
+        if not arg.startswith("-"):
+            break
+        if arg == "--check-hash-based-pycs":
+            if argv[i + 1:i + 2] not in (["default"], ["always"], ["never"]):
+                return None
+            i += 2
+            continue
+        if arg == "-" or arg.startswith("--"):
+            return None
+        # Python groups short flags and allows attached m/W/X operands.
+        # An operand consumes the rest of this token, never more flags.
+        j = 1
+        while j < len(arg):
+            option = arg[j]
+            if option in "mWX":
+                value = arg[j + 1:]
+                if not value:
+                    i += 1
+                    if i >= len(argv) or not argv[i]:
+                        return None
+                    value = argv[i]
+                if option == "m":
+                    return argv[i + 1:] if value == "hermes_cli.main" else None
+                break
+            if option == "c":
+                value = arg[j + 1:]
+                if not value:
+                    i += 1
+                    if i >= len(argv):
+                        return None
+                    value = argv[i]
+                return argv[i + 1:] if hermes_launcher_code(value) else None
+            # -i keeps Python alive at its REPL after Hermes exits. It
+            # cannot prove live Hermes even when PID/identity are retained.
+            if option not in "bBdEIOPqsSuvx":
+                return None
+            j += 1
+        i += 1
+    if i < len(argv) and os.path.basename(argv[i]) == "hermes":
+        return argv[i + 1:]
+    return None
+
+def interactive_chat(args):
+    if args is None:
+        return False
+    # Bare hermes defaults to chat, as do its profile/resume shortcuts.
+    # Use known option arities, so values like --resume setup are not
+    # confused with subcommands. Unknown modes fail closed. Query/oneshot
+    # invocations are deliberately excluded (behavior varies by version).
+    values = {"--profile", "-p", "--model", "-m", "--provider", "--reasoning",
+              "--toolsets", "-t", "--skills", "-s", "--resume", "-r", "--in"}
+    switches = {"--tui", "--cli", "--dev", "--worktree", "-w", "--yolo",
+                "--pass-session-id", "--ignore-user-config", "--ignore-rules",
+                "--safe-mode", "--accept-hooks", "--no-restore-cwd"}
+    chat_values = {"--source", "--max-turns", "--run-budget"}
+    chat_switches = {"--checkpoints", "--create-if-missing", "--verbose", "-v"}
+    chat = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "chat" and not chat:
+            chat = True
+            i += 1
+            continue
+        # -w can lead a group; -v is safe only after explicit chat.
+        # Peel switches; the first value option owns the remaining suffix.
+        # Profile -p is a launcher shortcut, not a parser group member.
+        group_switches = "wv" if chat else "w"
+        while len(arg) > 2 and arg[0] == "-" and arg[1] in group_switches:
+            if arg[2] not in group_switches + "cmrst":
+                return False
+            arg = "-" + arg[2:]
+        option, equal, value = arg.partition("=")
+        # Only known single-letter value options may consume a suffix.
+        # Do not interpret arbitrary substrings or one-shot -q/-z as chat.
+        if len(arg) > 2 and (arg[:2] in values or arg[:2] == "-c"):
+            option, equal, value = arg[:2], "=", arg[2:]
+            if value.startswith("="):
+                value = value[1:]
+        if option in values or (chat and option in chat_values):
+            if equal:
+                if not value:
+                    return False
+            else:
+                i += 1
+                if i >= len(args) or not args[i] or args[i].startswith("-"):
+                    return False
+        elif option in ("--continue", "-c"):
+            if equal and not value:
+                return False
+            if not equal and i + 1 < len(args) and not args[i + 1].startswith("-"):
+                i += 1
+        elif not equal and (option in switches or (chat and option in chat_switches)):
+            pass
+        else:
+            return False
+        i += 1
+    return True
+'
+
 herdr_agent_pane_ready() {
   local pane_id=$1 label=$2 pane_json visible process_json
 
@@ -818,7 +951,7 @@ herdr_agent_pane_ready() {
   process_json="$("${HERDR[@]}" pane process-info --pane "$pane_id" 2>/dev/null)" || return
   pane_json="$("${HERDR[@]}" pane get "$pane_id" 2>/dev/null)" || return
   printf '%s' "$pane_json" | herdr_pane_matches_slot "$pane_id" "$label" || return
-  HMW_PANE_JSON="$pane_json" HMW_PROCESS_JSON="$process_json" HMW_VISIBLE="$visible" python3 -c 'import json, os, re, sys
+  HMW_PANE_JSON="$pane_json" HMW_PROCESS_JSON="$process_json" HMW_VISIBLE="$visible" python3 -c "$HMW_PY_HERMES_ARGV"'import json, os, re, sys
 try:
     pane = json.loads(os.environ["HMW_PANE_JSON"])["result"]["pane"]
     process = json.loads(os.environ["HMW_PROCESS_JSON"])["result"]["process_info"]
@@ -834,135 +967,6 @@ try:
     jobs = process["foreground_processes"]
     if not pid(shell) or not pid(group) or not isinstance(jobs, list) or not jobs:
         raise ValueError
-    def hermes_launcher_code(code):
-        # Hermes 0.21+ managed launchers exec the store Python as
-        # `python3 -I -c <bootstrap>`. Accept only the published Hermes CLI
-        # entry shapes (hermes_cli/_launchers.py); arbitrary -c code, and
-        # sibling entry points such as hermes-acp, stay rejected.
-        lines = code.strip().splitlines()
-        if not lines:
-            return False
-        if (lines[-1] == "sys.exit(main())" and "import hermes_bootstrap" in lines
-                and "from hermes_cli.main import main" in lines):
-            return True
-        statements = [part.strip() for part in code.strip().split(";")]
-        # (chr(39) is a single quote; this code lives in a single-quoted shell string.)
-        entry = "runpy.run_module({0}hermes_cli.main{0}, run_name={0}__main__{0}, alter_sys=True)"
-        return "import hermes_bootstrap" in statements and statements[-1] == entry.format(chr(39))
-
-    def hermes_args(argv):
-        executable = os.path.basename(argv[0])
-        if executable == "hermes":
-            return argv[1:]
-        if not re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?", executable):
-            return None
-        # Parse interpreter options, not arbitrary later tokens that happen
-        # to say hermes. In particular, -c code and other scripts are not it.
-        i = 1
-        while i < len(argv):
-            arg = argv[i]
-            if arg == "--":
-                i += 1
-                break
-            if not arg.startswith("-"):
-                break
-            if arg == "--check-hash-based-pycs":
-                if argv[i + 1:i + 2] not in (["default"], ["always"], ["never"]):
-                    return None
-                i += 2
-                continue
-            if arg == "-" or arg.startswith("--"):
-                return None
-            # Python groups short flags and allows attached m/W/X operands.
-            # An operand consumes the rest of this token, never more flags.
-            j = 1
-            while j < len(arg):
-                option = arg[j]
-                if option in "mWX":
-                    value = arg[j + 1:]
-                    if not value:
-                        i += 1
-                        if i >= len(argv) or not argv[i]:
-                            return None
-                        value = argv[i]
-                    if option == "m":
-                        return argv[i + 1:] if value == "hermes_cli.main" else None
-                    break
-                if option == "c":
-                    value = arg[j + 1:]
-                    if not value:
-                        i += 1
-                        if i >= len(argv):
-                            return None
-                        value = argv[i]
-                    return argv[i + 1:] if hermes_launcher_code(value) else None
-                # -i keeps Python alive at its REPL after Hermes exits. It
-                # cannot prove live Hermes even when PID/identity are retained.
-                if option not in "bBdEIOPqsSuvx":
-                    return None
-                j += 1
-            i += 1
-        if i < len(argv) and os.path.basename(argv[i]) == "hermes":
-            return argv[i + 1:]
-        return None
-
-    def interactive_chat(args):
-        if args is None:
-            return False
-        # Bare hermes defaults to chat, as do its profile/resume shortcuts.
-        # Use known option arities, so values like --resume setup are not
-        # confused with subcommands. Unknown modes fail closed. Query/oneshot
-        # invocations are deliberately excluded (behavior varies by version).
-        values = {"--profile", "-p", "--model", "-m", "--provider", "--reasoning",
-                  "--toolsets", "-t", "--skills", "-s", "--resume", "-r", "--in"}
-        switches = {"--tui", "--cli", "--dev", "--worktree", "-w", "--yolo",
-                    "--pass-session-id", "--ignore-user-config", "--ignore-rules",
-                    "--safe-mode", "--accept-hooks", "--no-restore-cwd"}
-        chat_values = {"--source", "--max-turns", "--run-budget"}
-        chat_switches = {"--checkpoints", "--create-if-missing", "--verbose", "-v"}
-        chat = False
-        i = 0
-        while i < len(args):
-            arg = args[i]
-            if arg == "chat" and not chat:
-                chat = True
-                i += 1
-                continue
-            # -w can lead a group; -v is safe only after explicit chat.
-            # Peel switches; the first value option owns the remaining suffix.
-            # Profile -p is a launcher shortcut, not a parser group member.
-            group_switches = "wv" if chat else "w"
-            while len(arg) > 2 and arg[0] == "-" and arg[1] in group_switches:
-                if arg[2] not in group_switches + "cmrst":
-                    return False
-                arg = "-" + arg[2:]
-            option, equal, value = arg.partition("=")
-            # Only known single-letter value options may consume a suffix.
-            # Do not interpret arbitrary substrings or one-shot -q/-z as chat.
-            if len(arg) > 2 and (arg[:2] in values or arg[:2] == "-c"):
-                option, equal, value = arg[:2], "=", arg[2:]
-                if value.startswith("="):
-                    value = value[1:]
-            if option in values or (chat and option in chat_values):
-                if equal:
-                    if not value:
-                        return False
-                else:
-                    i += 1
-                    if i >= len(args) or not args[i] or args[i].startswith("-"):
-                        return False
-            elif option in ("--continue", "-c"):
-                if equal and not value:
-                    return False
-                if not equal and i + 1 < len(args) and not args[i + 1].startswith("-"):
-                    i += 1
-            elif not equal and (option in switches or (chat and option in chat_switches)):
-                pass
-            else:
-                return False
-            i += 1
-        return True
-
     live = False
     for job in jobs:
         if not isinstance(job, dict) or not pid(job.get("pid")):
@@ -1062,17 +1066,50 @@ raise SystemExit(0 if any(i.get("pane_id") == os.environ["HMW_TARGET"] and i.get
 # ── Pane memory: which Hermes conversation each pane holds ─────────────
 # Signal: Hermes' own cross-process lease registry,
 # $HERMES_HOME/runtime/active_sessions.json (hermes_cli/active_sessions.py:
-# _state_path L175, _lease_entry L461 writes {session_id, surface, pid}). The
-# CLI claims it at start (cli.py:916 _claim_active_session) and the TUI gateway
-# moves it on /new, resume and compression (tui_gateway/session_lifecycle.py:
-# transfer_active_session L176/L288), so it names the LIVE session. Herdr's
-# own pane agent_session value is not used: it stays on the launch id.
-# A lease belongs to a pane when its pid is a pane foreground process or a
-# descendant (the TUI lease is held by `python -m tui_gateway.entry`, a child
-# of node, a child of the pane's `hermes`).
+# _lease_entry writes {session_id, surface, pid, process_start_time}). The CLI
+# claims it at start and the TUI gateway moves it on /new, resume and
+# compression, so it names the LIVE session. Herdr's own pane agent_session
+# value is not used: it stays on the launch id.
+# A lease belongs to a pane only when its pid is still the process that took
+# it (start time matches, computed as active_sessions._process_start_time
+# does) and its ancestry reaches a FOREGROUND Hermes of that pane (the TUI
+# lease is held by `python -m tui_gateway.entry`, a child of node, a child of
+# the pane's `hermes`). Background Hermes and recycled pids never count.
 HMW_STATE_DIR="${HMW_STATE_DIR:-$HOME/.hermes/hmw}"
 HMW_SNAPSHOT_INTERVAL="${HMW_SNAPSHOT_INTERVAL:-300}"
 HMW_RESTORE_PENDING_SECONDS="${HMW_RESTORE_PENDING_SECONDS:-180}"
+HMW_SNAPSHOT_MAX_AGE="${HMW_SNAPSHOT_MAX_AGE:-1209600}"
+HMW_LOOP_MARKER="--hmw-snapshot-loop"
+
+# psutil.Process(pid).create_time(), as Hermes stamps process_start_time. On
+# Linux that is /proc/<pid>/stat starttime / CLK_TCK + /proc/stat btime (psutil
+# _pslinux); elsewhere psutil itself, or None (fail closed: nothing recorded).
+HMW_PY_START_TIME='import os, sys
+def start_time(pid):
+    try:
+        if sys.platform.startswith("linux"):
+            proc = os.environ.get("HMW_PROC_ROOT") or "/proc"
+            with open("%s/%d/stat" % (proc, pid), "rb") as fh:
+                data = fh.read()
+            ticks = float(data[data.rfind(b")") + 2:].split()[19])
+            with open(proc + "/stat", "rb") as fh:
+                for line in fh:
+                    if line.startswith(b"btime"):
+                        return ticks / os.sysconf("SC_CLK_TCK") + float(line.split()[1])
+            return None
+        import psutil
+        return float(psutil.Process(pid).create_time())
+    except Exception:
+        return None
+'
+
+hmw_proc_start_time() {
+  python3 -c "$HMW_PY_START_TIME"'
+value = start_time(int(sys.argv[1]))
+if value is None:
+    raise SystemExit(1)
+print(repr(value))' "$1"
+}
 
 hmw_snapshot_file() {
   printf '%s/%s.panes.json\n' "$HMW_STATE_DIR" "$SESSION"
@@ -1094,7 +1131,8 @@ for p in json.load(sys.stdin)["result"]["panes"]:
   ps_out="$(ps -A -o pid= -o ppid= 2>/dev/null)" || return 1
   mkdir -p "$HMW_STATE_DIR" 2>/dev/null || return 1
   HMW_PANES="$panes_json" HMW_INFOS="$infos" HMW_PS="$ps_out" HMW_SNAPSHOT_FILE="$file" \
-  HMW_LEASES="${HERMES_HOME:-$HOME/.hermes}/runtime/active_sessions.json" python3 -c 'import json, os, time
+  HMW_LEASES="${HERMES_HOME:-$HOME/.hermes}/runtime/active_sessions.json" \
+  python3 -c "$HMW_PY_HERMES_ARGV$HMW_PY_START_TIME"'import json, time
 file = os.environ["HMW_SNAPSHOT_FILE"]
 try:
     old = json.load(open(file))
@@ -1103,13 +1141,20 @@ try:
         raise SystemExit(0)
 except (OSError, ValueError, AttributeError, TypeError):
     pass
+safe = re.compile(r"[A-Za-z0-9_.:-]+")
 panes = json.loads(os.environ["HMW_PANES"])["result"]["panes"]
-fg = {}
+fg = {}  # pane -> pids of its FOREGROUND interactive Hermes processes
 for line in os.environ["HMW_INFOS"].splitlines():
     try:
         info = json.loads(line)["result"]["process_info"]
-        fg[info["pane_id"]] = {j["pid"] for j in info["foreground_processes"] if type(j.get("pid")) is int}
-    except (ValueError, KeyError, TypeError):
+        hermes = set()
+        for j in info["foreground_processes"]:
+            argv = j.get("argv")
+            if (type(j.get("pid")) is int and isinstance(argv, list) and argv
+                    and all(isinstance(a, str) for a in argv) and interactive_chat(hermes_args(argv))):
+                hermes.add(j["pid"])
+        fg[info["pane_id"]] = hermes
+    except (ValueError, KeyError, TypeError, AttributeError):
         continue
 parent = {}
 for line in os.environ["HMW_PS"].splitlines():
@@ -1122,18 +1167,27 @@ def ancestry(pid):
         seen.add(pid)
         pid = parent[pid]
     return seen
+def live_lease(l):
+    if not isinstance(l, dict) or l.get("surface") not in ("cli", "tui"):
+        return False
+    sid, pid, start = l.get("session_id"), l.get("pid"), l.get("process_start_time")
+    if not isinstance(sid, str) or not safe.fullmatch(sid) or type(pid) is not int or pid <= 1:
+        return False
+    if type(start) not in (int, float):
+        return False
+    now = start_time(pid)
+    return now is not None and abs(now - start) < 0.001
 try:
     leases = json.load(open(os.environ["HMW_LEASES"])).get("entries") or []
 except (OSError, ValueError, AttributeError):
     leases = []
+leases = [l for l in leases if live_lease(l)] if isinstance(leases, list) else []
 out, used = [], set()
 for p in panes:
     pids = fg.get(p.get("pane_id"), set())
-    ids = {str(l.get("session_id")) for l in leases if isinstance(l, dict)
-           and l.get("surface") in ("cli", "tui") and l.get("session_id")
-           and type(l.get("pid")) is int and ancestry(l["pid"]) & pids}
+    ids = {l["session_id"] for l in leases if ancestry(l["pid"]) & pids}
     if len(ids) != 1:
-        continue  # no Hermes here, or ambiguous: never guess
+        continue  # no foreground Hermes here, or ambiguous: never guess
     sid = ids.pop()
     if sid in used:
         continue
@@ -1146,29 +1200,72 @@ with open(tmp, "w") as fh:
 os.replace(tmp, file)'
 }
 
-# Mapped pane_id<TAB>session_id lines for the CURRENT inventory. Herdr keeps
-# public pane/tab numbers across restarts (session.json public_pane_numbers),
-# so an exact pane_id wins; else a unique (tab, pane) number suffix match.
+# Snapshots are written ONLY under the restore lock, taken without waiting: a
+# held lock means an hmw is restoring/attaching, so this snapshot is skipped.
+hmw_snapshot_once() {
+  local lock="$HMW_LOG_DIR/hmw-$SESSION.restore.lock" rc
+
+  mkdir -p "$HMW_LOG_DIR" 2>/dev/null || :
+  mkdir "$lock" 2>/dev/null || return 0
+  HMW_RESTORE_LOCK=$lock
+  trap herdr_restore_lock_release EXIT
+  rc=0
+  if herdr_status_running; then
+    hmw_snapshot_panes || rc=$?
+  fi
+  herdr_restore_lock_release
+  trap - EXIT
+  return "$rc"
+}
+
+# Mapped pane_id<TAB>session_id lines for the CURRENT inventory, or nothing at
+# all (fail closed) when the snapshot is malformed, conflicting or older than
+# HMW_SNAPSHOT_MAX_AGE. Herdr keeps public pane/tab numbers across restarts
+# (session.json public_pane_numbers), so an exact pane_id wins; else a unique
+# (tab, pane) number suffix match.
 hmw_snapshot_resume_map() {
   local file
   file="$(hmw_snapshot_file)"
   [ -f "$file" ] || return 0
-  HMW_SNAPSHOT_FILE="$file" HERDR_PANE_INVENTORY="$HERDR_PANE_INVENTORY" python3 -c 'import json, os, re
+  HMW_SNAPSHOT_FILE="$file" HMW_MAX_AGE="$HMW_SNAPSHOT_MAX_AGE" HERDR_PANE_INVENTORY="$HERDR_PANE_INVENTORY" python3 -c 'import json, os, re, time
+def bad():
+    raise SystemExit(1)
 try:
-    snap = json.load(open(os.environ["HMW_SNAPSHOT_FILE"]))["panes"]
+    doc = json.load(open(os.environ["HMW_SNAPSHOT_FILE"]))
     panes = json.loads(os.environ["HERDR_PANE_INVENTORY"])["result"]["panes"]
+    max_age = float(os.environ["HMW_MAX_AGE"])
 except (OSError, ValueError, KeyError, TypeError):
-    raise SystemExit(0)
+    bad()
 safe = re.compile(r"[A-Za-z0-9_.:-]+")
+now = time.time()
+if not isinstance(doc, dict) or not isinstance(doc.get("panes"), list) or not isinstance(panes, list):
+    bad()
+saved = doc.get("saved_at")
+if type(saved) not in (int, float) or not now - max_age <= saved <= now + 300:
+    bad()
+snap = doc["panes"]
+for s in snap:
+    if not isinstance(s, dict) or not isinstance(s.get("pane_id"), str) or not s["pane_id"]:
+        bad()
+    if not isinstance(s.get("session_id"), str) or not safe.fullmatch(s["session_id"]):
+        bad()
+    if any(s.get(k) is not None and not isinstance(s.get(k), str) for k in ("tab_id", "pane_label")):
+        bad()
+for p in panes:
+    if not isinstance(p, dict) or not isinstance(p.get("pane_id"), str):
+        bad()
+ids = [s["pane_id"] for s in snap]
+sids = [s["session_id"] for s in snap]
+if len(set(ids)) != len(ids) or len(set(sids)) != len(sids):
+    bad()  # conflicting records: trust none of them
 def tail(value):
     return str(value or "").rsplit(":", 1)[-1]
 def key(p):
     return (tail(p.get("tab_id")), tail(p.get("pane_id")))
-snap = [s for s in snap if isinstance(s, dict) and safe.fullmatch(str(s.get("session_id") or ""))]
 by_id = {s["pane_id"]: s for s in snap}
 skeys = [key(s) for s in snap]
 ckeys = [key(p) for p in panes]
-used = set()
+out, used = [], set()
 for p in panes:
     s = by_id.get(p["pane_id"])
     if s is None and ckeys.count(key(p)) == 1 and skeys.count(key(p)) == 1:
@@ -1176,7 +1273,9 @@ for p in panes:
     if s is None or s["session_id"] in used:
         continue
     used.add(s["session_id"])
-    print(p["pane_id"] + "\t" + s["session_id"])'
+    out.append(p["pane_id"] + "\t" + s["session_id"])
+if out:
+    print("\n".join(out))'
 }
 
 hmw_mark_restore_pending() {
@@ -1193,42 +1292,94 @@ with open(tmp, "w") as fh:
 os.replace(tmp, file)' 2>/dev/null || :
 }
 
-# One snapshot now (background) + one refresher loop per session, so the
-# snapshot is fresh before an unplanned reboot. The loop exits when the Herdr
-# server stops; the next hmw restarts it. No service unit needed.
+# A recorded loop is alive only if its pid still has the recorded start time
+# AND still runs the loop (marker on its command line): a recycled pid never
+# suppresses the refresher.
+hmw_snapshot_loop_alive() {
+  local pid start token now
+  read -r pid start token 2>/dev/null < "$1" || return 1
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$start" ] && [ -n "$token" ] || return 1
+  now="$(hmw_proc_start_time "$pid")" || return 1
+  [ "$now" = "$start" ] || return 1
+  ps -o args= -p "$pid" 2>/dev/null | grep -Fq -- "$HMW_LOOP_MARKER"
+}
+
+# Caller holds the restore lock, so check-and-start cannot race another hmw.
+# One refresher per session keeps the snapshot fresh before an unplanned
+# reboot; it exits when the Herdr server stops or a newer loop replaces its
+# token. No service unit needed.
 hmw_snapshot_loop_ensure() {
-  local pidfile pid self
+  local pidfile pid start token
   [ "$HMW_SNAPSHOT_INTERVAL" != "0" ] || return 0
-  self="${BASH_SOURCE[0]}"
+  [ -n "$HMW_RESTORE_LOCK" ] || return 0
   mkdir -p "$HMW_STATE_DIR" 2>/dev/null || return 0
-  HMW_SNAPSHOT=1 HERDR_SESSION="$SESSION" nohup bash "$self" >/dev/null 2>&1 &
   pidfile="$HMW_STATE_DIR/$SESSION.snapshot-loop.pid"
-  pid="$(cat "$pidfile" 2>/dev/null || true)"
-  case "$pid" in ''|*[!0-9]*) pid="" ;; esac
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+  if hmw_snapshot_loop_alive "$pidfile"; then
     return 0
   fi
-  HMW_SNAPSHOT_LOOP=1 HERDR_SESSION="$SESSION" nohup bash "$self" >/dev/null 2>&1 &
-  printf '%s\n' "$!" >"$pidfile" 2>/dev/null || :
+  token="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+  [ -n "$token" ] || token="$$.$RANDOM.$RANDOM"
+  HMW_LOOP_TOKEN="$token" HERDR_SESSION="$SESSION" nohup bash "${BASH_SOURCE[0]}" "$HMW_LOOP_MARKER" >/dev/null 2>&1 &
+  pid=$!
+  start="$(hmw_proc_start_time "$pid")" || start=unknown
+  printf '%s %s %s\n' "$pid" "$start" "$token" >"$pidfile.tmp.$$" 2>/dev/null &&
+    mv -f "$pidfile.tmp.$$" "$pidfile" 2>/dev/null || :
+}
+
+hmw_snapshot_spawn_once() {
+  [ "$HMW_SNAPSHOT_INTERVAL" != "0" ] || return 0
+  HMW_SNAPSHOT=1 HERDR_SESSION="$SESSION" nohup bash "${BASH_SOURCE[0]}" >/dev/null 2>&1 &
 }
 
 hmw_snapshot_loop() {
-  while herdr_status_running; do
+  local pidfile="$HMW_STATE_DIR/$SESSION.snapshot-loop.pid" pid start token
+  while :; do
     sleep "$HMW_SNAPSHOT_INTERVAL" || return 0
     herdr_status_running || return 0
-    hmw_snapshot_panes || :
+    read -r pid start token 2>/dev/null < "$pidfile" || return 0
+    [ "$token" = "${HMW_LOOP_TOKEN:-}" ] || return 0
+    hmw_snapshot_once || :
   done
 }
 
-herdr_relaunch_restored_panes() {
-  local record label target resume_map pane_id sid labelled_ids=""
+# Typing is only safe into a pane whose CURRENT foreground is one idle
+# interactive shell and that Herdr reports no agent for.
+herdr_pane_idle_shell() {
+  local process_json pane_json
+  process_json="$("${HERDR[@]}" pane process-info --pane "$1" 2>/dev/null)" || return 1
+  pane_json="$("${HERDR[@]}" pane get "$1" 2>/dev/null)" || return 1
+  HMW_PROCESS_JSON="$process_json" HMW_PANE_JSON="$pane_json" python3 -c 'import json, os, sys
+try:
+    pane = json.loads(os.environ["HMW_PANE_JSON"])["result"]["pane"]
+    process = json.loads(os.environ["HMW_PROCESS_JSON"])["result"]["process_info"]
+    if pane["pane_id"] != sys.argv[1] or process["pane_id"] != sys.argv[1] or pane.get("agent") is not None:
+        raise ValueError
+    jobs = process["foreground_processes"]
+    if not isinstance(jobs, list) or len(jobs) != 1 or not isinstance(jobs[0], dict):
+        raise ValueError
+    argv = jobs[0].get("argv")
+    name = argv[0] if isinstance(argv, list) and argv and isinstance(argv[0], str) else jobs[0].get("name")
+    base = os.path.basename(name)
+    if base.startswith("-"):
+        base = base[1:]
+    if base not in ("bash", "zsh", "fish", "sh", "dash"):
+        raise ValueError
+except (ValueError, KeyError, TypeError, AttributeError):
+    raise SystemExit(1)' "$1"
+}
 
-  # Only called when this run started the stopped server: Herdr restored these
-  # panes from the saved layout milliseconds ago, so they hold fresh shells and
-  # nothing the user runs can be in them. Resume each pane's snapshotted
-  # conversation; labelled slots without one fall back to hermes-pane's own
-  # label resume. Never close panes: layout persistence is a feature Dan wants.
-  resume_map="$(hmw_snapshot_resume_map)"
+herdr_relaunch_restored_panes() {
+  local record label target resume_map pane_id sid kind plan="" mapped_ids="" labelled_ids="" cmd
+
+  # Only called when this run started the stopped server, under the restore
+  # lock (held through launch and the pause marker, so no snapshot can
+  # interleave). Resume each pane's snapshotted conversation; labelled slots
+  # without one fall back to hermes-pane's own label resume. Never close
+  # panes: layout persistence is a feature Dan wants.
+  resume_map="$(hmw_snapshot_resume_map)" || resume_map=""
+  # 1. Plan: pane<TAB>label (- if none)<TAB>session (~ none, ? unknown)<TAB>
+  # mapped|fallback. No empty fields: read collapses adjacent tabs.
   while IFS= read -r record; do
     [ -n "$record" ] || continue
     label=${record%%$'\t'*}
@@ -1238,13 +1389,15 @@ herdr_relaunch_restored_panes() {
       continue
     fi
     sid="$(printf '%s\n' "$resume_map" | awk -F '\t' -v p="$target" '$1 == p { print $2; exit }')"
-    if [ -n "$sid" ]; then
-      hmw_note "resuming session $sid in restored pane $target ($label)"
-      "${HERDR[@]}" pane run "$target" "env NO_TMUX=1 HMW_RESUME_ID=$sid hermes-pane $label" >/dev/null || return
-    else
-      hmw_note "relaunching Hermes in restored pane $target ($label)"
-      "${HERDR[@]}" pane run "$target" "env NO_TMUX=1 hermes-pane $label" >/dev/null || return
+    kind=mapped
+    if [ -z "$sid" ]; then
+      kind=fallback
+      if ! sid="$(hermes-pane --print-resume-id "$label" 2>/dev/null)"; then
+        sid="?"  # unknown: cannot prove it is not a mapped session
+      fi
+      case "$sid" in '') sid="~" ;; *[!A-Za-z0-9_.:-]*) sid="?" ;; esac
     fi
+    plan+="$target"$'\t'"$label"$'\t'"$sid"$'\t'"$kind"$'\n'
   done <<< "$HERDR_LABEL_TARGETS"
   while IFS= read -r record; do
     [ -n "$record" ] || continue
@@ -1256,9 +1409,33 @@ herdr_relaunch_restored_panes() {
     if herdr_pane_has_hermes "$pane_id"; then
       continue
     fi
-    hmw_note "resuming session $sid in restored pane $pane_id"
-    "${HERDR[@]}" pane run "$pane_id" "env NO_TMUX=1 hermes chat --resume $sid" >/dev/null || return
+    plan+="$pane_id"$'\t-\t'"$sid"$'\tmapped\n'
   done <<< "$resume_map"
+  mapped_ids="$(printf '%s' "$plan" | awk -F '\t' '$4 == "mapped" { print $3 }')"
+  # 2. Launch, deduplicated across the whole plan: a snapshot-mapped pane owns
+  # its session; a labelled fallback that would resume the same one (or
+  # cannot tell) starts a fresh tagged session instead.
+  while IFS=$'\t' read -r target label sid kind; do
+    [ -n "$target" ] || continue
+    if ! herdr_pane_idle_shell "$target"; then
+      hmw_note "skipping restored pane $target: its foreground is not an idle shell"
+      continue
+    fi
+    if [ "$kind" = mapped ] && [ "$label" != - ]; then
+      hmw_note "resuming session $sid in restored pane $target ($label)"
+      cmd="env NO_TMUX=1 HMW_RESUME_ID=$sid hermes-pane $label"
+    elif [ "$kind" = mapped ]; then
+      hmw_note "resuming session $sid in restored pane $target"
+      cmd="env NO_TMUX=1 hermes chat --resume $sid"
+    elif [ -n "$mapped_ids" ] && { [ "$sid" = "?" ] || printf '%s\n' "$mapped_ids" | grep -Fqx -- "$sid"; }; then
+      hmw_note "starting a fresh session in restored pane $target ($label): its last session is resumed elsewhere"
+      cmd="env NO_TMUX=1 HMW_RESUME_ID=none hermes-pane $label"
+    else
+      hmw_note "relaunching Hermes in restored pane $target ($label)"
+      cmd="env NO_TMUX=1 hermes-pane $label"
+    fi
+    "${HERDR[@]}" pane run "$target" "$cmd" >/dev/null || return
+  done <<< "$plan"
   [ -z "$resume_map" ] || hmw_mark_restore_pending
 }
 
@@ -1358,8 +1535,9 @@ ensure_herdr_workspace() {
   # Hold the restore lock until restored panes are ready; a verify run keeps it
   # through its server-stop cleanup (released by the EXIT trap).
   if [ "$VERIFY" != "1" ]; then
-    herdr_restore_lock_release
     hmw_snapshot_loop_ensure
+    herdr_restore_lock_release
+    hmw_snapshot_spawn_once
   fi
 }
 
@@ -1385,13 +1563,13 @@ if [ "$BACKEND" = "herdr" ]; then
   [ -n "$SESSION" ] || usage_error 'HERDR_SESSION must not be empty'
 fi
 
-if [ "$BACKEND" = "herdr" ] && { [ "${HMW_SNAPSHOT:-0}" = "1" ] || [ "${HMW_SNAPSHOT_LOOP:-0}" = "1" ]; }; then
+if [ "$BACKEND" = "herdr" ] && { [ "${HMW_SNAPSHOT:-0}" = "1" ] || [ "${1:-}" = "$HMW_LOOP_MARKER" ]; }; then
   HERDR=(herdr --session "$SESSION")
-  if [ "${HMW_SNAPSHOT_LOOP:-0}" = "1" ]; then
+  if [ "${1:-}" = "$HMW_LOOP_MARKER" ]; then
     hmw_snapshot_loop
     exit 0
   fi
-  hmw_snapshot_panes
+  hmw_snapshot_once
   exit $?
 fi
 
