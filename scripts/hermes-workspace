@@ -1115,9 +1115,13 @@ hmw_snapshot_file() {
   printf '%s/%s.panes.json\n' "$HMW_STATE_DIR" "$SESSION"
 }
 
+# With "print": write nothing and print pane<TAB>session for every pane whose
+# foreground Hermes holds a live lease (restore uses it to reserve sessions
+# that are already running).
 hmw_snapshot_panes() {
-  local panes_json pane_ids pane_id info infos="" ps_out file
+  local panes_json pane_ids pane_id info infos="" ps_out file print_only=0
 
+  [ "${1:-}" = print ] && print_only=1
   file="$(hmw_snapshot_file)"
   panes_json="$("${HERDR[@]}" pane list 2>/dev/null)" || return 1
   pane_ids="$(printf '%s' "$panes_json" | python3 -c 'import json, sys
@@ -1129,12 +1133,15 @@ for p in json.load(sys.stdin)["result"]["panes"]:
     infos+="$info"$'\n'
   done <<< "$pane_ids"
   ps_out="$(ps -A -o pid= -o ppid= 2>/dev/null)" || return 1
-  mkdir -p "$HMW_STATE_DIR" 2>/dev/null || return 1
+  [ "$print_only" -eq 1 ] || mkdir -p "$HMW_STATE_DIR" 2>/dev/null || return 1
   HMW_PANES="$panes_json" HMW_INFOS="$infos" HMW_PS="$ps_out" HMW_SNAPSHOT_FILE="$file" \
-  HMW_LEASES="${HERMES_HOME:-$HOME/.hermes}/runtime/active_sessions.json" \
+  HMW_PRINT_ONLY="$print_only" HMW_LEASES="${HERMES_HOME:-$HOME/.hermes}/runtime/active_sessions.json" \
   python3 -c "$HMW_PY_HERMES_ARGV$HMW_PY_START_TIME"'import json, time
 file = os.environ["HMW_SNAPSHOT_FILE"]
+print_only = os.environ["HMW_PRINT_ONLY"] == "1"
 try:
+    if print_only:
+        raise OSError
     old = json.load(open(file))
     # A restore just typed resume commands; Hermes may not hold its lease yet.
     if float(old.get("restore_pending_until") or 0) > time.time():
@@ -1194,6 +1201,10 @@ for p in panes:
     used.add(sid)
     out.append({"pane_id": p["pane_id"], "workspace_id": p.get("workspace_id"), "tab_id": p.get("tab_id"),
                 "tab_label": p.get("tab_label"), "pane_label": p.get("label") or None, "session_id": sid})
+if print_only:
+    for o in out:
+        print(o["pane_id"] + "\t" + o["session_id"])
+    raise SystemExit(0)
 tmp = "%s.tmp.%d" % (file, os.getpid())
 with open(tmp, "w") as fh:
     json.dump({"saved_at": time.time(), "panes": out}, fh, indent=1)
@@ -1343,98 +1354,121 @@ hmw_snapshot_loop() {
   done
 }
 
-# Typing is only safe into a pane whose CURRENT foreground is one idle
-# interactive shell and that Herdr reports no agent for.
-herdr_pane_idle_shell() {
-  local process_json pane_json
-  process_json="$("${HERDR[@]}" pane process-info --pane "$1" 2>/dev/null)" || return 1
-  pane_json="$("${HERDR[@]}" pane get "$1" 2>/dev/null)" || return 1
-  HMW_PROCESS_JSON="$process_json" HMW_PANE_JSON="$pane_json" python3 -c 'import json, os, sys
-try:
-    pane = json.loads(os.environ["HMW_PANE_JSON"])["result"]["pane"]
-    process = json.loads(os.environ["HMW_PROCESS_JSON"])["result"]["process_info"]
-    if pane["pane_id"] != sys.argv[1] or process["pane_id"] != sys.argv[1] or pane.get("agent") is not None:
-        raise ValueError
-    jobs = process["foreground_processes"]
-    if not isinstance(jobs, list) or len(jobs) != 1 or not isinstance(jobs[0], dict):
-        raise ValueError
-    argv = jobs[0].get("argv")
-    name = argv[0] if isinstance(argv, list) and argv and isinstance(argv[0], str) else jobs[0].get("name")
-    base = os.path.basename(name)
-    if base.startswith("-"):
-        base = base[1:]
-    if base not in ("bash", "zsh", "fish", "sh", "dash"):
-        raise ValueError
-except (ValueError, KeyError, TypeError, AttributeError):
-    raise SystemExit(1)' "$1"
+# Herdr-native restore launch: `agent start` refuses a pane that is not at its
+# interactive shell prompt and succeeds only once Hermes is detected ready in
+# that same terminal, so nothing is ever typed into a pane. It runs in the
+# pane's existing shell (which already carries NO_TMUX from the saved layout),
+# so no `env NO_TMUX=1` wrapper is needed. NAME is Herdr's agent display name
+# ([a-z][a-z0-9_-]{0,31}, unique among live agents); it does not touch the
+# pane label, so labelled slots keep "Hn" and use "hn" as the agent name.
+herdr_restore_agent_start() {
+  local target=$1 label=$2 name timeout_ms
+  shift 2
+  if [ "$label" != - ]; then
+    name="$(printf '%s' "$label" | tr 'A-Z' 'a-z')"
+  else
+    name="hmw-$(printf '%s' "$target" | tr 'A-Z:' 'a-z-')"
+  fi
+  case "$name" in [a-z]*) ;; *) name="hmw-$name" ;; esac
+  case "$name" in *[!a-z0-9_-]*) name="hmw-$(printf '%s' "$target" | tr -c 'a-zA-Z0-9' '-' | tr 'A-Z' 'a-z')" ;; esac
+  name="${name:0:32}"
+  timeout_ms=$(( ${HMW_HERDR_READY_TIMEOUT:-30} * 1000 ))
+  [ "$timeout_ms" -le 300000 ] || timeout_ms=300000
+  [ "$timeout_ms" -ge 1000 ] || timeout_ms=1000
+  "${HERDR[@]}" agent start "$name" --kind hermes --pane "$target" --timeout "$timeout_ms" -- "$@" >/dev/null 2>&1
+}
+
+hmw_id_listed() {
+  [ -n "$2" ] && printf '%s\n' "$2" | grep -Fqx -- "$1"
 }
 
 herdr_relaunch_restored_panes() {
-  local record label target resume_map pane_id sid kind plan="" mapped_ids="" labelled_ids="" cmd
+  local record label target resume_map live_map pane_id sid plan="" fallbacks="" labelled_ids="" reserved="" unknown=0
 
   # Only called when this run started the stopped server, under the restore
   # lock (held through launch and the pause marker, so no snapshot can
   # interleave). Resume each pane's snapshotted conversation; labelled slots
-  # without one fall back to hermes-pane's own label resume. Never close
-  # panes: layout persistence is a feature Dan wants.
+  # without one fall back to their pane:<label> session, pinned here. Never
+  # close panes: layout persistence is a feature Dan wants.
   resume_map="$(hmw_snapshot_resume_map)" || resume_map=""
-  # 1. Plan: pane<TAB>label (- if none)<TAB>session (~ none, ? unknown)<TAB>
-  # mapped|fallback. No empty fields: read collapses adjacent tabs.
+  # Reserved = sessions already running in live panes (fresh lease mapping,
+  # the snapshot's own validated logic) + snapshot ids of live panes + every
+  # id planned so far. Unknowable live state: resume nothing, start fresh.
+  if ! live_map="$(hmw_snapshot_panes print)"; then
+    hmw_note "could not map live panes to sessions; restored panes start fresh"
+    unknown=1
+  fi
+  reserved="$(printf '%s\n' "$live_map" | awk -F '\t' 'NF == 2 { print $2 }')"
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    pane_id=${record%%$'\t'*}
+    if herdr_pane_has_hermes "$pane_id"; then
+      reserved+=$'\n'"${record#*$'\t'}"
+    fi
+  done <<< "$resume_map"
+  # 1. Plan mapped launches first: pane<TAB>label (- if none)<TAB>session
+  # (~ = fresh). No empty fields: read collapses adjacent tabs.
   while IFS= read -r record; do
     [ -n "$record" ] || continue
     label=${record%%$'\t'*}
     target=${record#*$'\t'}
     labelled_ids+="$target"$'\n'
-    if herdr_pane_has_hermes "$target"; then
-      continue
-    fi
+    herdr_pane_has_hermes "$target" && continue
     sid="$(printf '%s\n' "$resume_map" | awk -F '\t' -v p="$target" '$1 == p { print $2; exit }')"
-    kind=mapped
     if [ -z "$sid" ]; then
-      kind=fallback
-      if ! sid="$(hermes-pane --print-resume-id "$label" 2>/dev/null)"; then
-        sid="?"  # unknown: cannot prove it is not a mapped session
-      fi
-      case "$sid" in '') sid="~" ;; *[!A-Za-z0-9_.:-]*) sid="?" ;; esac
+      fallbacks+="$target"$'\t'"$label"$'\n'
+    elif [ "$unknown" -eq 1 ] || hmw_id_listed "$sid" "$reserved"; then
+      hmw_note "starting a fresh session in restored pane $target ($label): session $sid is already running elsewhere"
+      plan+="$target"$'\t'"$label"$'\t~\n'
+    else
+      reserved+=$'\n'"$sid"
+      plan+="$target"$'\t'"$label"$'\t'"$sid"$'\n'
     fi
-    plan+="$target"$'\t'"$label"$'\t'"$sid"$'\t'"$kind"$'\n'
   done <<< "$HERDR_LABEL_TARGETS"
   while IFS= read -r record; do
     [ -n "$record" ] || continue
     pane_id=${record%%$'\t'*}
     sid=${record#*$'\t'}
-    if printf '%s' "$labelled_ids" | grep -Fqx -- "$pane_id"; then
+    printf '%s' "$labelled_ids" | grep -Fqx -- "$pane_id" && continue
+    herdr_pane_has_hermes "$pane_id" && continue
+    if [ "$unknown" -eq 1 ] || hmw_id_listed "$sid" "$reserved"; then
+      hmw_note "skipping restored pane $pane_id: session $sid is already running elsewhere"
       continue
     fi
-    if herdr_pane_has_hermes "$pane_id"; then
-      continue
-    fi
-    plan+="$pane_id"$'\t-\t'"$sid"$'\tmapped\n'
+    reserved+=$'\n'"$sid"
+    plan+="$pane_id"$'\t-\t'"$sid"$'\n'
   done <<< "$resume_map"
-  mapped_ids="$(printf '%s' "$plan" | awk -F '\t' '$4 == "mapped" { print $3 }')"
-  # 2. Launch, deduplicated across the whole plan: a snapshot-mapped pane owns
-  # its session; a labelled fallback that would resume the same one (or
-  # cannot tell) starts a fresh tagged session instead.
-  while IFS=$'\t' read -r target label sid kind; do
+  # 2. Labelled fallbacks: pin the pane:<label> lookup now (no second lookup
+  # at launch). A failed lookup or an id already reserved starts fresh.
+  while IFS=$'\t' read -r target label; do
     [ -n "$target" ] || continue
-    if ! herdr_pane_idle_shell "$target"; then
-      hmw_note "skipping restored pane $target: its foreground is not an idle shell"
-      continue
+    if [ "$unknown" -eq 1 ] || ! sid="$(hermes-pane --print-resume-id "$label" 2>/dev/null)"; then
+      sid="~"
     fi
-    if [ "$kind" = mapped ] && [ "$label" != - ]; then
-      hmw_note "resuming session $sid in restored pane $target ($label)"
-      cmd="env NO_TMUX=1 HMW_RESUME_ID=$sid hermes-pane $label"
-    elif [ "$kind" = mapped ]; then
-      hmw_note "resuming session $sid in restored pane $target"
-      cmd="env NO_TMUX=1 hermes chat --resume $sid"
-    elif [ -n "$mapped_ids" ] && { [ "$sid" = "?" ] || printf '%s\n' "$mapped_ids" | grep -Fqx -- "$sid"; }; then
+    case "$sid" in ''|*[!A-Za-z0-9_.:-]*) sid="~" ;; esac
+    if [ "$sid" != "~" ] && hmw_id_listed "$sid" "$reserved"; then
       hmw_note "starting a fresh session in restored pane $target ($label): its last session is resumed elsewhere"
-      cmd="env NO_TMUX=1 HMW_RESUME_ID=none hermes-pane $label"
-    else
-      hmw_note "relaunching Hermes in restored pane $target ($label)"
-      cmd="env NO_TMUX=1 hermes-pane $label"
+      sid="~"
     fi
-    "${HERDR[@]}" pane run "$target" "$cmd" >/dev/null || return
+    [ "$sid" = "~" ] || reserved+=$'\n'"$sid"
+    plan+="$target"$'\t'"$label"$'\t'"$sid"$'\n'
+  done <<< "$fallbacks"
+  # 3. Launch through Herdr; a pane not at its prompt is skipped, never typed into.
+  while IFS=$'\t' read -r target label sid; do
+    [ -n "$target" ] || continue
+    if [ "$label" = - ]; then
+      set -- chat --resume "$sid"
+      hmw_note "resuming session $sid in restored pane $target"
+    elif [ "$sid" = "~" ]; then
+      set -- chat --source "pane:$label"
+      hmw_note "starting Hermes in restored pane $target ($label)"
+    else
+      set -- chat --source "pane:$label" --resume "$sid"
+      hmw_note "resuming session $sid in restored pane $target ($label)"
+    fi
+    if ! herdr_restore_agent_start "$target" "$label" "$@"; then
+      hmw_note "skipping restored pane $target: Herdr could not start Hermes there (not at its shell prompt, or not ready in time)"
+    fi
   done <<< "$plan"
   [ -z "$resume_map" ] || hmw_mark_restore_pending
 }

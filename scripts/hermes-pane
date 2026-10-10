@@ -50,7 +50,8 @@ set -uo pipefail
 PRINT_RESUME_ID=0
 if [[ "${1:-}" == "--print-resume-id" ]]; then
   # hmw's reboot restore: print the session the label lookup WOULD resume (or
-  # nothing), so it can deduplicate before launching. Fails when unknowable.
+  # nothing), so it can deduplicate and pin it before launching. Exits
+  # nonzero whenever the lookup itself fails.
   PRINT_RESUME_ID=1
   shift
 fi
@@ -94,10 +95,12 @@ resolve_last_session() {
   [[ -x "${HERMES_VENV_PY:-}" && -f "${HERMES_PROOT:-}/hermes_state.py" ]] || return 0
   ( cd "$HERMES_PROOT" && "$HERMES_VENV_PY" - "$SOURCE_TAG" <<'PY' 2>/dev/null
 import sys
+# Exit 3 on ANY lookup error: --print-resume-id must tell "found nothing"
+# (exit 0, empty) apart from "could not look" (nonzero).
 try:
     from hermes_state import SessionDB
 except Exception:
-    sys.exit(0)
+    sys.exit(3)
 src = sys.argv[1]
 try:
     db = SessionDB()
@@ -109,7 +112,7 @@ try:
     except Exception:
         pass
 except Exception:
-    sys.exit(0)
+    sys.exit(3)
 PY
   )
 }
@@ -117,7 +120,9 @@ PY
 if [[ "$PRINT_RESUME_ID" == 1 ]]; then
   resolve_hermes_internals
   [[ -x "${HERMES_VENV_PY:-}" && -f "${HERMES_PROOT:-}/hermes_state.py" ]] || exit 1
-  resolve_last_session
+  # Fail closed: a lookup error exits nonzero; exit 0 + empty only when the
+  # lookup succeeded and this label has no prior session.
+  resolve_last_session || exit 1
   exit 0
 fi
 
