@@ -8,6 +8,7 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,8 +44,13 @@ RUNTIME_COMMAND = ("import os, sys, runpy; os.environ.pop('PYTHONHOME', None); "
                    "os.environ['HERMES_HOME'] = os.environ.get('HERMES_HOME') or '/root/.hermes'; "
                    "import hermes_bootstrap; "
                    "runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)")
-SHELL = {"shell_pid": 10, "foreground_process_group_id": 10,
+# at_prompt: the fixture's `agent start` accepts only a shell at its prompt.
+SHELL = {"shell_pid": 10, "foreground_process_group_id": 10, "at_prompt": True,
          "foreground_processes": [{"pid": 10, "name": "bash", "argv": ["bash"]}]}
+
+
+def start(name, pane, *agent_args):
+    return ["agent", "start", name, "--kind", "hermes", "--pane", pane, "--timeout", "3000", "--"] + list(agent_args)
 
 
 class Herdr082Tests(unittest.TestCase):
@@ -120,7 +126,7 @@ class Herdr082Tests(unittest.TestCase):
         env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
                    HMW_BACKEND="herdr", HMW_REMOTE="1", HMW_VERIFY="1", HERDR_SESSION="review",
                    HMW_HERDR_READY_TIMEOUT="3", HMW_RESTORE_LOCK_WAIT="2",
-                   HERDR_082_STATE=str(self.path), HERDR_082_LOG=str(self.log))
+                   HERMES_HOME=str(self.home / ".hermes"), HERDR_082_STATE=str(self.path), HERDR_082_LOG=str(self.log))
         return subprocess.run(["bash", str(CORE), str(count)], env=env, capture_output=True, text=True, timeout=25)
 
     def assert_failed(self, result):
@@ -140,12 +146,18 @@ class Herdr082Tests(unittest.TestCase):
     def pane_runs(self):
         return [c for c in self.calls() if isinstance(c, list) and c[:2] == ["pane", "run"]]
 
+    def agent_starts(self):
+        # Restore launches only through Herdr's agent start: never pane run/typing.
+        self.assertEqual(self.pane_runs(), [])
+        return [c for c in self.calls() if isinstance(c, list) and c[:2] == ["agent", "start"]
+                and c[2:] != ["--help"]]
+
     def test_reboot_restore_relaunches_hermes_once_per_labelled_pane(self):
         self.restored(stopped=True, launched_state={"visible": COMPOSER, "process": LIVE})
         result = self.run_core(2)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.pane_runs(), [["pane", "run", "w1:p1", "env NO_TMUX=1 hermes-pane H1"],
-                                            ["pane", "run", "w1:p2", "env NO_TMUX=1 hermes-pane H2"]])
+        self.assertEqual(self.agent_starts(), [start("h1", "w1:p1", "chat", "--source", "pane:H1"),
+                                               start("h2", "w1:p2", "chat", "--source", "pane:H2")])
         for call in self.calls():
             if isinstance(call, list):
                 self.assertNotIn(call[:2], [["pane", "split"], ["workspace", "create"], ["pane", "close"]])
@@ -182,6 +194,315 @@ class Herdr082Tests(unittest.TestCase):
         self.assertIn(str(lock), result.stderr)
         # Refused before touching Herdr at all (no calls log is fine).
         self.assertEqual(self.pane_runs() if self.log.exists() else [], [])
+
+    # ── pane memory: snapshot pane -> live Hermes session, resume on reboot ──
+    def fg(self, pid):
+        return {"shell_pid": 10, "foreground_process_group_id": pid,
+                "foreground_processes": [{"pid": pid, "name": "hermes", "argv": ["hermes"]}]}
+
+    @staticmethod
+    def start_of(pid):
+        # What the fake /proc below yields (psutil's Linux create_time formula).
+        return pid * 100 / os.sysconf("SC_CLK_TCK") + 1000.0
+
+    def run_snapshot(self, leases, tree):
+        runtime = self.home / ".hermes/runtime"
+        runtime.mkdir(parents=True, exist_ok=True)
+        leases = [dict(l, process_start_time=l.get("process_start_time", self.start_of(l["pid"])))
+                  for l in leases]
+        (runtime / "active_sessions.json").write_text(json.dumps({"entries": leases}))
+        (self.bin / "ps").write_text("#!/bin/sh\ncat <<'EOF'\n" + "".join(
+            "%d %d\n" % kv for kv in tree.items()) + "EOF\n")
+        (self.bin / "ps").chmod(0o755)
+        proc = self.home / "proc"
+        proc.mkdir(exist_ok=True)
+        (proc / "stat").write_text("cpu 0 0 0\nbtime 1000\n")
+        for pid, ppid in tree.items():
+            (proc / str(pid)).mkdir(exist_ok=True)
+            fields = ["S", str(ppid)] + ["0"] * 17 + [str(pid * 100), "0"]   # field 22 = starttime
+            (proc / str(pid) / "stat").write_text("%d (x y) %s\n" % (pid, " ".join(fields)))
+        env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
+                   HMW_BACKEND="herdr", HMW_SNAPSHOT="1", HERDR_SESSION="review",
+                   HERMES_HOME=str(self.home / ".hermes"), HMW_PROC_ROOT=str(proc),
+                   HERDR_082_STATE=str(self.path), HERDR_082_LOG=str(self.log))
+        return subprocess.run(["bash", str(CORE)], env=env, capture_output=True, text=True, timeout=25)
+
+    def snapshot_path(self):
+        return self.home / ".hermes/hmw/review.panes.json"
+
+    def test_pane_memory_snapshot_maps_lease_descendants_to_panes(self):
+        self.write(panes=[self.pane("H1", agent="hermes"), dict(self.pane("", "w1:p3"), tab_id="w1:t2"),
+                          self.pane("", "w1:p4"), self.pane("", "w1:p5")],
+                   process_by_pane={"w1:p1": self.fg(100), "w1:p3": self.fg(300),
+                                    "w1:p4": SHELL, "w1:p5": self.fg(500)})
+        # TUI: hermes(100) -> node(101) -> tui_gateway(102) holds the lease.
+        tree = {100: 10, 101: 100, 102: 101, 300: 10, 301: 300, 500: 10, 501: 500, 502: 500, 999: 1}
+        leases = [dict(session_id="S_A", surface="tui", pid=102),
+                  dict(session_id="S_GW", surface="gateway", pid=102),   # not a chat surface
+                  dict(session_id="S_B", surface="cli", pid=300),
+                  dict(session_id="S_OTHER", surface="tui", pid=999),    # not under any pane
+                  dict(session_id="S_X", surface="cli", pid=501),        # two sessions in
+                  dict(session_id="S_Y", surface="cli", pid=502)]        # one pane: ambiguous
+        result = self.run_snapshot(leases, tree)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snap = json.loads(self.snapshot_path().read_text())
+        self.assertIn("saved_at", snap)
+        self.assertEqual([(p["pane_id"], p["tab_id"], p["pane_label"], p["session_id"]) for p in snap["panes"]],
+                         [("w1:p1", "w1:t1", "H1", "S_A"), ("w1:p3", "w1:t2", None, "S_B")])
+        self.assertEqual(list(self.snapshot_path().parent.glob("*.tmp.*")), [])
+
+    def test_pane_memory_snapshot_waits_out_a_pending_restore(self):
+        self.write(panes=[self.pane("H1")], process_by_pane={"w1:p1": SHELL})
+        self.snapshot_path().parent.mkdir(parents=True)
+        held = {"saved_at": 1, "restore_pending_until": 4102444800,
+                "panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "session_id": "S_A"}]}
+        self.snapshot_path().write_text(json.dumps(held))
+        self.assertEqual(self.run_snapshot([], {}).returncode, 0)
+        self.assertEqual(json.loads(self.snapshot_path().read_text()), held)
+
+    def test_pane_memory_reboot_resumes_every_pane_once(self):
+        tabbed = lambda label, pid, tab, **kw: dict(self.pane(label, pid, **kw), tab_id=tab)
+        self.write(panes=[self.pane("H1"), self.pane("H2", "w1:p2"), tabbed("", "w1:p3", "w1:t2"),
+                          tabbed("", "w1:p4", "w1:t3"), tabbed("", "w1:p5", "w1:t4", agent="hermes"),
+                          tabbed("", "w1:p6", "w1:t5"), tabbed("", "w1:p7", "w1:t6")],
+                   visible="", process=SHELL, stopped=True,
+                   launched_state={"visible": COMPOSER, "process": LIVE})
+        self.snapshot_path().parent.mkdir(parents=True)
+        self.snapshot_path().write_text(json.dumps({"saved_at": time.time(), "panes": [
+            {"pane_id": "w1:p1", "tab_id": "w1:t1", "pane_label": "H1", "session_id": "S_H1"},
+            {"pane_id": "w9:p3", "tab_id": "w9:t2", "session_id": "S_EMAIL"},   # renumbered workspace
+            {"pane_id": "w1:p5", "tab_id": "w1:t4", "session_id": "S_LIVE"},    # already has Hermes
+        ]}))
+        result = self.run_core(2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.agent_starts(), [
+            start("h1", "w1:p1", "chat", "--source", "pane:H1", "--resume", "S_H1"),
+            start("hmw-w1-p3", "w1:p3", "chat", "--resume", "S_EMAIL"),   # unlabelled tab
+            start("h2", "w1:p2", "chat", "--source", "pane:H2")])         # labelled fallback (fresh)
+        self.assertGreater(json.loads(self.snapshot_path().read_text())["restore_pending_until"], 0)
+
+    def test_pane_memory_running_server_never_retypes_snapshot(self):
+        self.write(panes=[self.pane("H1", agent="hermes"), dict(self.pane("", "w1:p3"), tab_id="w1:t2")])
+        self.snapshot_path().parent.mkdir(parents=True)
+        self.snapshot_path().write_text(json.dumps({"saved_at": time.time(), "panes": [
+            {"pane_id": "w1:p3", "tab_id": "w1:t2", "session_id": "S_EMAIL"}]}))
+        self.assertEqual(self.run_core(1).returncode, 0)
+        self.assertEqual(self.agent_starts(), [])
+
+    # ── review r1 findings ──
+    def reboot_with(self, panes, snapshot, **kw):
+        self.write(panes=panes, visible="", process=SHELL, stopped=True,
+                   launched_state={"visible": COMPOSER, "process": LIVE}, **kw)
+        self.snapshot_path().parent.mkdir(parents=True, exist_ok=True)
+        self.snapshot_path().write_text(json.dumps(snapshot))
+        result = self.run_core(1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.result = result
+        return self.agent_starts()
+
+    def test_pane_memory_f1_restore_skips_pane_not_at_prompt(self):
+        tabbed = lambda label, pid, tab, **kw: dict(self.pane(label, pid, **kw), tab_id=tab)
+        vim = {"shell_pid": 10, "foreground_process_group_id": 30,
+               "foreground_processes": [{"pid": 30, "name": "vim", "argv": ["vim", "notes"]}]}
+        two = {"shell_pid": 10, "foreground_process_group_id": 10, "foreground_processes": [
+            {"pid": 10, "name": "bash", "argv": ["-bash"]}, {"pid": 11, "name": "bash", "argv": ["bash"]}]}
+        runs = self.reboot_with(
+            [self.pane("H1"), tabbed("", "w1:p3", "w1:t2"), tabbed("", "w1:p4", "w1:t3", agent="claude"),
+             tabbed("", "w1:p5", "w1:t4"), tabbed("", "w1:p6", "w1:t5")],
+            {"saved_at": time.time(), "panes": [
+                {"pane_id": "w1:p3", "tab_id": "w1:t2", "session_id": "S_VIM"},
+                {"pane_id": "w1:p4", "tab_id": "w1:t3", "session_id": "S_CLAUDE"},
+                {"pane_id": "w1:p5", "tab_id": "w1:t4", "session_id": "S_TWO"},
+                {"pane_id": "w1:p6", "tab_id": "w1:t5", "session_id": "S_OK"}]},
+            process_by_pane={"w1:p1": dict(SHELL, foreground_processes=[{"pid": 10, "name": "zsh",
+                                                                         "argv": ["-zsh"]}]),
+                             "w1:p3": vim, "w1:p4": SHELL, "w1:p5": two, "w1:p6": SHELL})
+        # Herdr refuses p3 (vim), p4 (claude) and p5 (two jobs); each is skipped, never typed into.
+        self.assertEqual(runs, [start("hmw-w1-p3", "w1:p3", "chat", "--resume", "S_VIM"),
+                                start("hmw-w1-p4", "w1:p4", "chat", "--resume", "S_CLAUDE"),
+                                start("hmw-w1-p5", "w1:p5", "chat", "--resume", "S_TWO"),
+                                start("hmw-w1-p6", "w1:p6", "chat", "--resume", "S_OK"),
+                                start("h1", "w1:p1", "chat", "--source", "pane:H1")])
+        self.assertEqual(self.result.stderr.count("Herdr could not start Hermes there"), 3, self.result.stderr)
+        self.assertEqual(self.state()["process_by_pane"]["w1:p3"]["foreground_processes"][0]["argv"],
+                         ["vim", "notes"])
+
+    def test_pane_memory_f2_fallback_duplicate_of_mapped_resumes_once(self):
+        (self.bin / "hermes-pane").write_text(
+            '#!/bin/sh\n[ "$1" = --print-resume-id ] || exit 0\n'
+            'echo "$2" >> "$HOME/lookups"\n'
+            'case "$2" in H1) echo S_DUP ;; H2) echo S_H2 ;; esac\n')
+        runs = self.reboot_with(
+            [self.pane("H1"), self.pane("H2", "w1:p2"), dict(self.pane("", "w1:p3"), tab_id="w1:t2")],
+            {"saved_at": time.time(), "panes": [{"pane_id": "w1:p3", "tab_id": "w1:t2", "session_id": "S_DUP"}]},
+            process_by_pane={})
+        # Mapped first; H1's fallback duplicates it -> fresh; H2's id is pinned and passed.
+        self.assertEqual(runs, [start("hmw-w1-p3", "w1:p3", "chat", "--resume", "S_DUP"),
+                                start("h1", "w1:p1", "chat", "--source", "pane:H1"),
+                                start("h2", "w1:p2", "chat", "--source", "pane:H2", "--resume", "S_H2")])
+        lookups = (self.home / "lookups").read_text().split()
+        self.assertEqual(sorted(lookups), ["H1", "H2"])   # one lookup per fallback, none at launch
+
+    def test_pane_memory_r2_live_pane_session_is_reserved(self):
+        # r2 F2 repro: live p3 holds S_DUP (snapshot AND live lease); H1's fallback names S_DUP.
+        (self.bin / "hermes-pane").write_text(
+            '#!/bin/sh\n[ "$1" = --print-resume-id ] || exit 0\n'
+            'case "$2" in H1) echo S_DUP ;; H2) echo S_LEASE ;; esac\n')
+        runtime = self.home / ".hermes/runtime"
+        runtime.mkdir(parents=True)
+        (runtime / "active_sessions.json").write_text(json.dumps({"entries": [
+            dict(session_id="S_LEASE", surface="cli", pid=os.getpid(),
+                 process_start_time=self.own_start_time())]}))
+        (self.bin / "ps").write_text("#!/bin/sh\necho '%d 700'\necho '700 1'\n" % os.getpid())
+        (self.bin / "ps").chmod(0o755)
+        live = {"shell_pid": 699, "foreground_process_group_id": 700,
+                "foreground_processes": [{"pid": 700, "name": "hermes", "argv": ["hermes"]}]}
+        runs = self.reboot_with(
+            [self.pane("H1"), self.pane("H2", "w1:p2"),
+             dict(self.pane("", "w1:p3", agent="hermes"), tab_id="w1:t2"),
+             dict(self.pane("", "w1:p4", agent="hermes"), tab_id="w1:t3")],
+            {"saved_at": time.time(), "panes": [{"pane_id": "w1:p3", "tab_id": "w1:t2", "session_id": "S_DUP"}]},
+            process_by_pane={"w1:p4": live})
+        # p3/p4 are live and untouched; S_DUP (live snapshot id) and S_LEASE (live lease) are reserved.
+        self.assertEqual(runs, [start("h1", "w1:p1", "chat", "--source", "pane:H1"),
+                                start("h2", "w1:p2", "chat", "--source", "pane:H2")])
+
+    def test_pane_memory_r3_uncertain_live_map_starts_labelled_fresh(self):
+        # r3 P1 repro: live p4 runs a foreground Hermes holding S_LIVE, H1's fallback names
+        # S_LIVE. If the live map cannot be built reliably, H1 must start fresh (never --resume).
+        (self.bin / "hermes-pane").write_text(
+            '#!/bin/sh\n[ "$1" = --print-resume-id ] || exit 0\n[ "$2" = H1 ] && echo S_LIVE\nexit 0\n')
+        (self.bin / "ps").write_text("#!/bin/sh\necho '%d 700'\necho '700 1'\n" % os.getpid())
+        (self.bin / "ps").chmod(0o755)
+        live = {"shell_pid": 699, "foreground_process_group_id": 700,
+                "foreground_processes": [{"pid": 700, "name": "hermes", "argv": ["hermes"]}]}
+        runtime = self.home / ".hermes/runtime"
+        runtime.mkdir(parents=True, exist_ok=True)
+        good = dict(session_id="S_LIVE", surface="cli", pid=os.getpid(),
+                    process_start_time=self.own_start_time())
+        for name, leases in [("unreadable", "{not json"),
+                             ("missing", None),
+                             ("stale_start", json.dumps({"entries": [dict(good, process_start_time=1.0)]})),
+                             ("ambiguous", json.dumps({"entries": [good, dict(good, session_id="S_OTHER")]}))]:
+            with self.subTest(name):
+                lease_file = runtime / "active_sessions.json"
+                if leases is None:
+                    lease_file.unlink(missing_ok=True)
+                else:
+                    lease_file.write_text(leases)
+                if self.log.exists():
+                    self.log.unlink()
+                runs = self.reboot_with(
+                    [self.pane("H1"), dict(self.pane("", "w1:p4", agent="hermes"), tab_id="w1:t3")],
+                    {"saved_at": time.time(), "panes": []}, process_by_pane={"w1:p4": live})
+                self.assertEqual(runs, [start("h1", "w1:p1", "chat", "--source", "pane:H1")])
+
+    @staticmethod
+    def own_start_time():
+        stat = Path("/proc/%d/stat" % os.getpid()).read_bytes()
+        ticks = float(stat[stat.rfind(b")") + 2:].split()[19])
+        btime = next(float(l.split()[1]) for l in Path("/proc/stat").read_text().splitlines()
+                     if l.startswith("btime"))
+        return ticks / os.sysconf("SC_CLK_TCK") + btime
+
+    def test_hermes_pane_print_resume_id_fails_closed_on_lookup_error(self):
+        venv = self.home / "proj/venv/bin"
+        venv.mkdir(parents=True)
+        (venv / "hermes").write_text("#!/bin/sh\nexit 0\n")
+        (venv / "hermes").chmod(0o755)
+        (venv / "python3").symlink_to(shutil.which("python3"))
+        state = self.home / "proj/hermes_state.py"
+        env = dict(os.environ, HOME=str(self.home), PATH=str(venv) + os.pathsep + os.environ["PATH"])
+        for name, body, rc, out in [
+                ("db error", "raise RuntimeError('locked')", 1, ""),
+                ("no session", "return []", 0, ""),
+                ("found", "return [{'id': 'S_FOUND'}]", 0, "S_FOUND")]:
+            with self.subTest(name):
+                state.write_text("class SessionDB:\n    def search_sessions(self, source, limit):\n"
+                                 "        assert source == 'pane:H1'\n        " + body + "\n")
+                result = subprocess.run(["bash", str(ROOT / "scripts/hermes-pane"), "--print-resume-id", "H1"],
+                                        env=env, capture_output=True, text=True, timeout=25)
+                self.assertEqual((result.returncode, result.stdout.strip()), (rc, out), result.stderr)
+        state.write_text("raise ImportError('broken store')\n")
+        result = subprocess.run(["bash", str(ROOT / "scripts/hermes-pane"), "--print-resume-id", "H1"],
+                                env=env, capture_output=True, text=True, timeout=25)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_pane_memory_r2_lookup_error_starts_fresh(self):
+        (self.bin / "hermes-pane").write_text(
+            '#!/bin/sh\n[ "$1" = --print-resume-id ] || exit 0\necho S_PARTIAL\nexit 1\n')
+        runs = self.reboot_with([self.pane("H1")], {"saved_at": time.time(), "panes": []}, process_by_pane={})
+        self.assertEqual(runs, [start("h1", "w1:p1", "chat", "--source", "pane:H1")])
+
+    def test_pane_memory_f3_stale_start_and_background_hermes_not_recorded(self):
+        bg_shell = {"shell_pid": 40, "foreground_process_group_id": 40,
+                    "foreground_processes": [{"pid": 40, "name": "bash", "argv": ["bash"]}]}
+        vim = {"shell_pid": 10, "foreground_process_group_id": 300,
+               "foreground_processes": [{"pid": 300, "name": "vim", "argv": ["vim"]}]}
+        self.write(panes=[self.pane("H1"), self.pane("H2", "w1:p2"), self.pane("H3", "w1:p3")],
+                   process_by_pane={"w1:p1": self.fg(100), "w1:p2": bg_shell, "w1:p3": vim})
+        tree = {100: 10, 400: 40, 300: 10}
+        leases = [dict(session_id="STALE", surface="cli", pid=100, process_start_time=1),  # recycled pid
+                  dict(session_id="S_BG", surface="cli", pid=400),   # background Hermes under the shell
+                  dict(session_id="S_VIM", surface="cli", pid=300)]  # foreground is not Hermes
+        result = self.run_snapshot(leases, tree)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.snapshot_path().read_text())["panes"], [])
+
+    def test_pane_memory_f4_bad_snapshots_resume_nothing(self):
+        rec = lambda pid, sid: {"pane_id": pid, "tab_id": "w1:t2", "session_id": sid}
+        for name, snap in [
+                ("duplicate", {"saved_at": time.time(), "panes": [rec("w1:p3", "FIRST"), rec("w1:p3", "SECOND")]}),
+                ("partial", {"saved_at": time.time(), "panes": [rec("w1:p3", "FIRST"), rec("w1:p4", 123)]}),
+                ("old", {"saved_at": time.time() - 15 * 86400, "panes": [rec("w1:p3", "FIRST")]})]:
+            with self.subTest(name):
+                if self.log.exists():
+                    self.log.unlink()
+                runs = self.reboot_with([self.pane("H1"), dict(self.pane("", "w1:p3"), tab_id="w1:t2"),
+                                         dict(self.pane("", "w1:p4"), tab_id="w1:t2")], snap, process_by_pane={})
+                self.assertEqual(runs, [start("h1", "w1:p1", "chat", "--source", "pane:H1")])
+
+    def attach(self):
+        env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
+                   HMW_BACKEND="herdr", HMW_REMOTE="1", HMW_VERIFY="0", HERDR_SESSION="review",
+                   HMW_HERDR_READY_TIMEOUT="3", HMW_RESTORE_LOCK_WAIT="2", HMW_SNAPSHOT_INTERVAL="37",
+                   HERDR_082_STATE=str(self.path), HERDR_082_LOG=str(self.log))
+        return subprocess.run(["bash", str(CORE), "1"], env=env, capture_output=True, text=True, timeout=25)
+
+    def test_pane_memory_f5_stale_pidfile_starts_one_loop(self):
+        # Real 37s sleep for the loop only (the fake sleep returns at once).
+        (self.bin / "sleep").write_text('#!/bin/sh\n[ "$1" = 37 ] && exec /bin/sleep 37\nexit 0\n')
+        self.write(panes=[self.pane("H1", agent="hermes")])
+        pidfile = self.home / ".hermes/hmw/review.snapshot-loop.pid"
+        pidfile.parent.mkdir(parents=True)
+        # Unrelated live pid (this test) with its true start time: no loop marker.
+        stat = Path("/proc/%d/stat" % os.getpid()).read_bytes()
+        ticks = float(stat[stat.rfind(b")") + 2:].split()[19])
+        btime = next(float(l.split()[1]) for l in Path("/proc/stat").read_text().splitlines()
+                     if l.startswith("btime"))
+        pidfile.write_text("%d %r stale\n" % (os.getpid(), ticks / os.sysconf("SC_CLK_TCK") + btime))
+        self.attach()
+        first = pidfile.read_text().split()
+        self.addCleanup(lambda: subprocess.run(["kill", first[0]], capture_output=True))
+        self.assertNotEqual(int(first[0]), os.getpid())
+        time.sleep(0.5)   # let the loop exec, so its marker is on its command line
+        self.attach()
+        self.assertEqual(pidfile.read_text().split(), first)
+        loops = subprocess.run(["pgrep", "-f", "--", "hermes-workspace --hmw-snapshot-loop"],
+                               capture_output=True, text=True).stdout.split()
+        self.assertEqual(loops, [first[0]])
+
+    def test_pane_memory_f6_snapshot_skipped_while_lock_held(self):
+        self.write(panes=[self.pane("H1")], process_by_pane={"w1:p1": self.fg(100)})
+        lock = self.home / ".hermes/logs/hmw-review.restore.lock"
+        lock.mkdir(parents=True)
+        result = self.run_snapshot([dict(session_id="S_A", surface="cli", pid=100)], {100: 10})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.snapshot_path().exists())
+        self.assertTrue(lock.is_dir())
+        lock.rmdir()
+        self.assertEqual(self.run_snapshot([dict(session_id="S_A", surface="cli", pid=100)], {100: 10}).returncode, 0)
+        self.assertEqual([p["session_id"] for p in json.loads(self.snapshot_path().read_text())["panes"]], ["S_A"])
 
     def test_reboot_verify_run_stops_server_it_started(self):
         self.restored(stopped=True, launched_state={"visible": COMPOSER, "process": LIVE})

@@ -47,11 +47,22 @@
 
 set -uo pipefail
 
+PRINT_RESUME_ID=0
+if [[ "${1:-}" == "--print-resume-id" ]]; then
+  # hmw's reboot restore: print the session the label lookup WOULD resume (or
+  # nothing), so it can deduplicate and pin it before launching. Exits
+  # nonzero whenever the lookup itself fails.
+  PRINT_RESUME_ID=1
+  shift
+fi
 LABEL="${1:-scratch}"
 SOURCE_TAG="pane:${LABEL}"
 
 # Locate hermes on PATH (portable across hosts — no hardcoded venv path).
 HERMES_BIN="$(command -v hermes || true)"
+if [[ -z "$HERMES_BIN" && "$PRINT_RESUME_ID" == 1 ]]; then
+  exit 1
+fi
 if [[ -z "$HERMES_BIN" ]]; then
   echo "hermes-pane: 'hermes' not found on PATH" >&2
   exec "${SHELL:-/bin/bash}"
@@ -84,10 +95,12 @@ resolve_last_session() {
   [[ -x "${HERMES_VENV_PY:-}" && -f "${HERMES_PROOT:-}/hermes_state.py" ]] || return 0
   ( cd "$HERMES_PROOT" && "$HERMES_VENV_PY" - "$SOURCE_TAG" <<'PY' 2>/dev/null
 import sys
+# Exit 3 on ANY lookup error: --print-resume-id must tell "found nothing"
+# (exit 0, empty) apart from "could not look" (nonzero).
 try:
     from hermes_state import SessionDB
 except Exception:
-    sys.exit(0)
+    sys.exit(3)
 src = sys.argv[1]
 try:
     db = SessionDB()
@@ -99,13 +112,37 @@ try:
     except Exception:
         pass
 except Exception:
-    sys.exit(0)
+    sys.exit(3)
 PY
   )
 }
 
-resolve_hermes_internals
-LAST_ID="$(resolve_last_session)"
+if [[ "$PRINT_RESUME_ID" == 1 ]]; then
+  resolve_hermes_internals
+  [[ -x "${HERMES_VENV_PY:-}" && -f "${HERMES_PROOT:-}/hermes_state.py" ]] || exit 1
+  # Fail closed: a lookup error exits nonzero; exit 0 + empty only when the
+  # lookup succeeded and this label has no prior session.
+  resolve_last_session || exit 1
+  exit 0
+fi
+
+# hmw's reboot restore passes the exact session this pane held (from Hermes'
+# active-session leases), which beats the label lookup: `--resume` does not
+# retag a session's source, so pane:<label> can name a stale conversation.
+# HMW_RESUME_ID=none: that session is resumed in another pane; start fresh.
+RESUME_ID="${HMW_RESUME_ID:-}"
+unset HMW_RESUME_ID
+case "$RESUME_ID" in
+  *[!A-Za-z0-9_.:-]*) RESUME_ID="" ;;
+esac
+if [[ "$RESUME_ID" == "none" ]]; then
+  LAST_ID=""
+elif [[ -n "$RESUME_ID" ]]; then
+  LAST_ID="$RESUME_ID"
+else
+  resolve_hermes_internals
+  LAST_ID="$(resolve_last_session)"
+fi
 
 if [[ -n "${LAST_ID:-}" ]]; then
   echo "hermes-pane[$LABEL]: resuming session $LAST_ID"

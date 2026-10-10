@@ -46,6 +46,31 @@ elif cmd == ["pane", "list"]:
     emit("panes", state["panes"])
 elif cmd == ["agent", "start"] and args[2:] == ["--help"]:
     print("Usage: herdr agent start <NAME> --kind <KIND> --pane <ID>")
+elif cmd == ["agent", "start"]:
+    # 0.8.2: agent start <NAME> --kind K --pane P [--timeout MS] [-- ARGS...].
+    # Succeeds only for a pane whose foreground is its shell at the prompt
+    # (fixture flag at_prompt); then the pane runs the agent.
+    import re
+    rest = args[2:]
+    sep = rest.index("--") if "--" in rest else len(rest)
+    opts, agent_args = rest[:sep], rest[sep + 1:]
+    name = opts[0]
+    flags = dict(zip(opts[1::2], opts[2::2]))
+    assert set(flags) <= {"--kind", "--pane", "--timeout"} and len(opts) % 2 == 1, args
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name):
+        sys.exit(1)
+    target = flags["--pane"]
+    info = state.get("process_by_pane", {}).get(target, state.get("process", {}))
+    jobs = info.get("foreground_processes") or []
+    if pane(target).get("agent") is not None or not (info.get("at_prompt") and len(jobs) == 1 and jobs[0].get("pid") == info.get("shell_pid")):
+        print(json.dumps({"error": {"code": "agent_pane_busy"}}))
+        sys.exit(1)
+    pane(target).update(state.get("launched", {}))
+    launched_state = dict(state.get("launched_state", {}))
+    if "process" in launched_state:
+        state.setdefault("process_by_pane", {})[target] = launched_state.pop("process")
+    state.update(launched_state)
+    save()
 elif cmd in (["workspace", "create"], ["pane", "split"]):
     assert args[-2:] == ["--env", "NO_TMUX=1"]
     pid = "w1:p" + str(len(state["panes"]) + 1)
@@ -58,7 +83,11 @@ elif cmd == ["pane", "rename"]:
     save()
 elif cmd == ["pane", "run"]:
     pane(args[2]).update(state.get("launched", {}))
-    state.update(state.get("launched_state", {}))
+    launched_state = dict(state.get("launched_state", {}))
+    if "process" in launched_state:
+        # The launch changes only the foreground of the pane it ran in.
+        state.setdefault("process_by_pane", {})[args[2]] = launched_state.pop("process")
+    state.update(launched_state)
     save()
     sys.exit(state.get("run_status", 0))
 elif cmd == ["pane", "get"]:
@@ -71,7 +100,8 @@ elif cmd == ["pane", "read"]:
     sys.exit(state.get("read_status", 0))
 elif cmd == ["pane", "process-info"]:
     assert args[2:3] == ["--pane"]
-    emit("process_info", dict(state.get("process", {}), pane_id=args[3]))
+    info = state.get("process_by_pane", {}).get(args[3], state.get("process", {}))
+    emit("process_info", dict(info, pane_id=args[3]))
     sys.exit(state.get("process_status", 0))
 elif cmd == ["agent", "get"]:
     emit("agent", state.get("agent_get", {}).get(args[2]) or

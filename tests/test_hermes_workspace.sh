@@ -14,6 +14,7 @@ HERDR_NAMES_FILE="$TEST_TMP/herdr.names"
 STATUS_COUNT="$TEST_TMP/status.count"
 HERDR_LIST_COUNT="$TEST_TMP/herdr-list.count"
 SLEEP_LOG="$TEST_TMP/sleeps.log"
+export HMW_SNAPSHOT_INTERVAL=0  # no refresher loops leaking across tests (fake sleep returns at once)
 STDOUT_FILE="$TEST_TMP/stdout"
 STDERR_FILE="$TEST_TMP/stderr"
 PASS=0
