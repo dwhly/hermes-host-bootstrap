@@ -15,7 +15,9 @@ with open(os.environ["HERDR_082_LOG"], "a") as log:
 
 
 def save():
-    path.write_text(json.dumps(state))
+    tmp = path.with_suffix(".tmp" + str(os.getpid()))
+    tmp.write_text(json.dumps(state))
+    os.replace(tmp, path)  # the backgrounded `server` races status reads
 
 
 def emit(kind, value):
@@ -28,7 +30,16 @@ def pane(pid):
 
 cmd = args[:2]
 if cmd == ["status", "server"]:
+    if state.get("stopped"):
+        print(json.dumps({"status": "stopped", "running": False}))
+        sys.exit(1)
     print(json.dumps({"status": "running", "running": True, "socket": state["socket"]}))
+elif args == ["server"]:
+    state["stopped"] = False  # restores the saved layout as fresh shells
+    save()
+elif args == ["server", "stop"]:
+    state["stopped"] = True
+    save()
 elif cmd == ["agent", "list"]:
     emit("agents", state.get("agents", []))
 elif cmd == ["pane", "list"]:
@@ -47,6 +58,7 @@ elif cmd == ["pane", "rename"]:
     save()
 elif cmd == ["pane", "run"]:
     pane(args[2]).update(state.get("launched", {}))
+    state.update(state.get("launched_state", {}))
     save()
     sys.exit(state.get("run_status", 0))
 elif cmd == ["pane", "get"]:
