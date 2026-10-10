@@ -489,15 +489,27 @@ raise SystemExit(0 if isinstance(value, dict) and value.get("status") == "runnin
 }
 
 ensure_herdr_server() {
-  local attempt socket
+  local attempt socket launched=0
 
+  # Serialize every hmw for this session through the restore lock BEFORE
+  # looking at server state: no check-then-lock gap exists, so no hmw can
+  # attach or adopt a server while another is restoring or verifying.
+  herdr_restore_lock_acquire || return
   attempt=1
   while [ "$attempt" -le 20 ]; do
     if herdr_status_running; then
+      if [ "$launched" -eq 1 ]; then
+        # Residual (documented): a non-hmw client starting this same session
+        # inside this ~100ms locked window would be taken for ours.
+        HMW_STARTED_SERVER=1
+      fi
       return 0
     fi
     if [ "$attempt" -eq 1 ]; then
-      nohup "${HERDR[@]}" server >/dev/null 2>&1 &
+      # NO_TMUX=1: the server's restored pane shells inherit this env; without
+      # it an SSH-aware rc can auto-attach tmux before hmw relaunches Hermes.
+      NO_TMUX=1 nohup "${HERDR[@]}" server >/dev/null 2>&1 &
+      launched=1
     fi
     if [ "$attempt" -lt 20 ]; then
       sleep 0.1
@@ -973,17 +985,97 @@ except (ValueError, KeyError, TypeError, AttributeError):
 }
 
 herdr_wait_for_agent_pane() {
-  local pane_id=$1 label=$2 attempt
+  local pane_id=$1 label=$2 seconds=${3:-3} attempt limit
 
+  limit=$((seconds * 10))
   attempt=1
-  while [ "$attempt" -le 30 ]; do
+  while [ "$attempt" -le "$limit" ]; do
     if herdr_agent_pane_ready "$pane_id" "$label"; then
       return 0
     fi
-    [ "$attempt" -eq 30 ] || sleep 0.1
+    if [ "$attempt" -eq 1 ] && [ "$seconds" -gt 3 ]; then
+      hmw_note "waiting up to ${seconds}s for Hermes in pane $pane_id ($label)"
+    fi
+    [ "$attempt" -eq "$limit" ] || sleep 0.1
     attempt=$((attempt + 1))
   done
   return 1
+}
+
+# Set only when THIS run found the session stopped and started its server.
+HMW_STARTED_SERVER=0
+HMW_RESTORE_LOCK=""
+
+
+HMW_VERIFY_STOPPED=0
+
+# Verify probes must never leave behind a session they started (labelled panes
+# would be saved without Hermes in them). Runs from the EXIT trap too, so an
+# interrupted verify still stops its server BEFORE the lock is released.
+herdr_verify_stop_owned_server() {
+  if [ "$VERIFY" = "1" ] && [ "$HMW_STARTED_SERVER" -eq 1 ] && [ "$HMW_VERIFY_STOPPED" -eq 0 ]; then
+    HMW_VERIFY_STOPPED=1
+    if ! "${HERDR[@]}" server stop >/dev/null 2>&1; then
+      hmw_errf "hermes-workspace: could not stop Herdr session '%s' started by this verify run\n" "$SESSION"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+herdr_restore_exit() {
+  herdr_verify_stop_owned_server || :
+  herdr_restore_lock_release
+}
+
+herdr_restore_lock_release() {
+  if [ -n "$HMW_RESTORE_LOCK" ]; then
+    rmdir "$HMW_RESTORE_LOCK" 2>/dev/null || :
+    HMW_RESTORE_LOCK=""
+  fi
+}
+
+herdr_restore_lock_acquire() {
+  local lock="$HMW_LOG_DIR/hmw-$SESSION.restore.lock" attempt
+
+  mkdir -p "$HMW_LOG_DIR" 2>/dev/null || :
+  attempt=1
+  while ! mkdir "$lock" 2>/dev/null; do
+    if [ "$attempt" -ge "${HMW_RESTORE_LOCK_WAIT:-60}" ]; then
+      hmw_errf "hermes-workspace: another hmw is restoring Herdr session '%s' (lock %s held for %ss); retry, or remove that directory if no hmw is running\n" "$SESSION" "$lock" "${HMW_RESTORE_LOCK_WAIT:-60}"
+      return 1
+    fi
+    sleep 1
+    attempt=$((attempt + 1))
+  done
+  HMW_RESTORE_LOCK=$lock
+  trap herdr_restore_exit EXIT
+}
+
+herdr_pane_has_hermes() {
+  HMW_TARGET="$1" HERDR_AGENT_INVENTORY="$HERDR_INVENTORY" HERDR_PANE_INVENTORY="$HERDR_PANE_INVENTORY" python3 -c 'import json, os
+items = json.loads(os.environ["HERDR_AGENT_INVENTORY"])["result"]["agents"]
+items += json.loads(os.environ["HERDR_PANE_INVENTORY"])["result"]["panes"]
+raise SystemExit(0 if any(i.get("pane_id") == os.environ["HMW_TARGET"] and i.get("agent") == "hermes" for i in items) else 1)'
+}
+
+herdr_relaunch_restored_panes() {
+  local record label target
+
+  # Only called when this run started the stopped server: Herdr restored these
+  # panes from the saved layout milliseconds ago, so they hold fresh shells and
+  # nothing the user runs can be in them. Relaunch Hermes once per labelled
+  # slot. Never close panes: layout persistence is a feature Dan wants.
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    label=${record%%$'\t'*}
+    target=${record#*$'\t'}
+    if herdr_pane_has_hermes "$target"; then
+      continue
+    fi
+    hmw_note "relaunching Hermes in restored pane $target ($label)"
+    "${HERDR[@]}" pane run "$target" "env NO_TMUX=1 hermes-pane $label" >/dev/null || return
+  done <<< "$HERDR_LABEL_TARGETS"
 }
 
 start_herdr_agent_in_new_pane() {
@@ -1034,6 +1126,9 @@ ensure_herdr_workspace() {
   HERDR=(herdr --session "$SESSION")
   ensure_herdr_server || return
   herdr_slot_inventory || return
+  if [ "$HMW_STARTED_SERVER" -eq 1 ]; then
+    herdr_relaunch_restored_panes || return
+  fi
   legacy_start=1
   if herdr_uses_existing_pane_start; then
     legacy_start=0
@@ -1069,13 +1164,18 @@ ensure_herdr_workspace() {
   while [ "$number" -le "$REQUEST_COUNT" ]; do
     label="$(label_for "$number")"
     target="$(herdr_target_for_label "$label")" || return
-    if ! herdr_wait_for_agent_pane "$target" "$label"; then
+    if ! herdr_wait_for_agent_pane "$target" "$label" "${HMW_HERDR_READY_TIMEOUT:-30}"; then
       hmw_errf "hermes-workspace: Hermes is not ready in existing pane %s for %s in session '%s'; inspect the pane and relaunch Hermes there (no duplicate was created)\n" "$target" "$label" "$SESSION"
       return 1
     fi
     number=$((number + 1))
   done
   herdr_focus_label H1 || return
+  # Hold the restore lock until restored panes are ready; a verify run keeps it
+  # through its server-stop cleanup (released by the EXIT trap).
+  if [ "$VERIFY" != "1" ]; then
+    herdr_restore_lock_release
+  fi
 }
 
 verify_herdr_workspace() {
@@ -1124,10 +1224,13 @@ case "$BACKEND" in
     fi
     ;;
   herdr)
-    ensure_herdr_workspace || exit $?
     if [ "$VERIFY" = "1" ]; then
-      verify_herdr_workspace || exit $?
+      ensure_herdr_workspace && verify_herdr_workspace
+      rc=$?
+      herdr_verify_stop_owned_server || rc=1
+      exit "$rc"
     else
+      ensure_herdr_workspace || exit $?
       attach_herdr_workspace
     fi
     ;;
