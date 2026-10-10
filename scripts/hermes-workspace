@@ -1007,6 +1007,27 @@ HMW_STARTED_SERVER=0
 HMW_RESTORE_LOCK=""
 
 
+HMW_VERIFY_STOPPED=0
+
+# Verify probes must never leave behind a session they started (labelled panes
+# would be saved without Hermes in them). Runs from the EXIT trap too, so an
+# interrupted verify still stops its server BEFORE the lock is released.
+herdr_verify_stop_owned_server() {
+  if [ "$VERIFY" = "1" ] && [ "$HMW_STARTED_SERVER" -eq 1 ] && [ "$HMW_VERIFY_STOPPED" -eq 0 ]; then
+    HMW_VERIFY_STOPPED=1
+    if ! "${HERDR[@]}" server stop >/dev/null 2>&1; then
+      hmw_errf "hermes-workspace: could not stop Herdr session '%s' started by this verify run\n" "$SESSION"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+herdr_restore_exit() {
+  herdr_verify_stop_owned_server || :
+  herdr_restore_lock_release
+}
+
 herdr_restore_lock_release() {
   if [ -n "$HMW_RESTORE_LOCK" ]; then
     rmdir "$HMW_RESTORE_LOCK" 2>/dev/null || :
@@ -1028,7 +1049,7 @@ herdr_restore_lock_acquire() {
     attempt=$((attempt + 1))
   done
   HMW_RESTORE_LOCK=$lock
-  trap herdr_restore_lock_release EXIT
+  trap herdr_restore_exit EXIT
 }
 
 herdr_pane_has_hermes() {
@@ -1206,14 +1227,7 @@ case "$BACKEND" in
     if [ "$VERIFY" = "1" ]; then
       ensure_herdr_workspace && verify_herdr_workspace
       rc=$?
-      # A probe must never leave behind a session it started (labelled panes
-      # would be saved without Hermes in them).
-      if [ "$HMW_STARTED_SERVER" -eq 1 ]; then
-        if ! "${HERDR[@]}" server stop >/dev/null 2>&1; then
-          hmw_errf "hermes-workspace: could not stop Herdr session '%s' started by this verify run\n" "$SESSION"
-          rc=1
-        fi
-      fi
+      herdr_verify_stop_owned_server || rc=1
       exit "$rc"
     else
       ensure_herdr_workspace || exit $?
