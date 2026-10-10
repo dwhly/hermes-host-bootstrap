@@ -1119,7 +1119,7 @@ hmw_snapshot_file() {
 # foreground Hermes holds a live lease (restore uses it to reserve sessions
 # that are already running).
 hmw_snapshot_panes() {
-  local panes_json pane_ids pane_id info infos="" ps_out file print_only=0
+  local panes_json pane_ids pane_id info infos="" ps_out file print_only=0 info_fail=0
 
   [ "${1:-}" = print ] && print_only=1
   file="$(hmw_snapshot_file)"
@@ -1129,16 +1129,19 @@ for p in json.load(sys.stdin)["result"]["panes"]:
     print(p["pane_id"])')" || return 1
   while IFS= read -r pane_id; do
     [ -n "$pane_id" ] || continue
-    info="$("${HERDR[@]}" pane process-info --pane "$pane_id" 2>/dev/null | tr -d '\n')" || continue
+    info="$("${HERDR[@]}" pane process-info --pane "$pane_id" 2>/dev/null | tr -d '\n')" || { info_fail=1; continue; }
     infos+="$info"$'\n'
   done <<< "$pane_ids"
   ps_out="$(ps -A -o pid= -o ppid= 2>/dev/null)" || return 1
   [ "$print_only" -eq 1 ] || mkdir -p "$HMW_STATE_DIR" 2>/dev/null || return 1
   HMW_PANES="$panes_json" HMW_INFOS="$infos" HMW_PS="$ps_out" HMW_SNAPSHOT_FILE="$file" \
-  HMW_PRINT_ONLY="$print_only" HMW_LEASES="${HERMES_HOME:-$HOME/.hermes}/runtime/active_sessions.json" \
+  HMW_PRINT_ONLY="$print_only" HMW_INFO_FAIL="$info_fail" HMW_LEASES="${HERMES_HOME:-$HOME/.hermes}/runtime/active_sessions.json" \
   python3 -c "$HMW_PY_HERMES_ARGV$HMW_PY_START_TIME"'import json, time
 file = os.environ["HMW_SNAPSHOT_FILE"]
 print_only = os.environ["HMW_PRINT_ONLY"] == "1"
+# print mode feeds the restore "already live" reservation: any doubt about a
+# pane that might hold Hermes must fail (exit 3) so restore starts fresh.
+uncertain = os.environ.get("HMW_INFO_FAIL") == "1"
 try:
     if print_only:
         raise OSError
@@ -1162,6 +1165,7 @@ for line in os.environ["HMW_INFOS"].splitlines():
                 hermes.add(j["pid"])
         fg[info["pane_id"]] = hermes
     except (ValueError, KeyError, TypeError, AttributeError):
+        uncertain = True
         continue
 parent = {}
 for line in os.environ["HMW_PS"].splitlines():
@@ -1186,22 +1190,33 @@ def live_lease(l):
     return now is not None and abs(now - start) < 0.001
 try:
     leases = json.load(open(os.environ["HMW_LEASES"])).get("entries") or []
-except (OSError, ValueError, AttributeError):
+except FileNotFoundError:
     leases = []
-leases = [l for l in leases if live_lease(l)] if isinstance(leases, list) else []
+    if any(fg.values()):
+        uncertain = True
+except (OSError, ValueError, AttributeError):
+    leases, uncertain = [], True
+if not isinstance(leases, list):
+    leases, uncertain = [], True
+leases = [l for l in leases if live_lease(l)]
 out, used = [], set()
 for p in panes:
     pids = fg.get(p.get("pane_id"), set())
     ids = {l["session_id"] for l in leases if ancestry(l["pid"]) & pids}
     if len(ids) != 1:
+        if pids:
+            uncertain = True  # foreground Hermes we cannot map uniquely
         continue  # no foreground Hermes here, or ambiguous: never guess
     sid = ids.pop()
     if sid in used:
+        uncertain = True
         continue
     used.add(sid)
     out.append({"pane_id": p["pane_id"], "workspace_id": p.get("workspace_id"), "tab_id": p.get("tab_id"),
                 "tab_label": p.get("tab_label"), "pane_label": p.get("label") or None, "session_id": sid})
 if print_only:
+    if uncertain:
+        raise SystemExit(3)
     for o in out:
         print(o["pane_id"] + "\t" + o["session_id"])
     raise SystemExit(0)

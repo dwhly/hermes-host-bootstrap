@@ -367,6 +367,36 @@ class Herdr082Tests(unittest.TestCase):
         self.assertEqual(runs, [start("h1", "w1:p1", "chat", "--source", "pane:H1"),
                                 start("h2", "w1:p2", "chat", "--source", "pane:H2")])
 
+    def test_pane_memory_r3_uncertain_live_map_starts_labelled_fresh(self):
+        # r3 P1 repro: live p4 runs a foreground Hermes holding S_LIVE, H1's fallback names
+        # S_LIVE. If the live map cannot be built reliably, H1 must start fresh (never --resume).
+        (self.bin / "hermes-pane").write_text(
+            '#!/bin/sh\n[ "$1" = --print-resume-id ] || exit 0\n[ "$2" = H1 ] && echo S_LIVE\nexit 0\n')
+        (self.bin / "ps").write_text("#!/bin/sh\necho '%d 700'\necho '700 1'\n" % os.getpid())
+        (self.bin / "ps").chmod(0o755)
+        live = {"shell_pid": 699, "foreground_process_group_id": 700,
+                "foreground_processes": [{"pid": 700, "name": "hermes", "argv": ["hermes"]}]}
+        runtime = self.home / ".hermes/runtime"
+        runtime.mkdir(parents=True, exist_ok=True)
+        good = dict(session_id="S_LIVE", surface="cli", pid=os.getpid(),
+                    process_start_time=self.own_start_time())
+        for name, leases in [("unreadable", "{not json"),
+                             ("missing", None),
+                             ("stale_start", json.dumps({"entries": [dict(good, process_start_time=1.0)]})),
+                             ("ambiguous", json.dumps({"entries": [good, dict(good, session_id="S_OTHER")]}))]:
+            with self.subTest(name):
+                lease_file = runtime / "active_sessions.json"
+                if leases is None:
+                    lease_file.unlink(missing_ok=True)
+                else:
+                    lease_file.write_text(leases)
+                if self.log.exists():
+                    self.log.unlink()
+                runs = self.reboot_with(
+                    [self.pane("H1"), dict(self.pane("", "w1:p4", agent="hermes"), tab_id="w1:t3")],
+                    {"saved_at": time.time(), "panes": []}, process_by_pane={"w1:p4": live})
+                self.assertEqual(runs, [start("h1", "w1:p1", "chat", "--source", "pane:H1")])
+
     @staticmethod
     def own_start_time():
         stat = Path("/proc/%d/stat" % os.getpid()).read_bytes()
