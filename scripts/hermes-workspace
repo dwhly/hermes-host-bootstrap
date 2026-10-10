@@ -491,14 +491,14 @@ raise SystemExit(0 if isinstance(value, dict) and value.get("status") == "runnin
 ensure_herdr_server() {
   local attempt socket launched=0
 
-  # Never proceed (attach or relaunch) while another hmw holds the restore
-  # lock: it may still be typing into restored panes or cleaning up a verify.
-  herdr_restore_lock_wait_clear || return
+  # Serialize every hmw for this session through the restore lock BEFORE
+  # looking at server state: no check-then-lock gap exists, so no hmw can
+  # attach or adopt a server while another is restoring or verifying.
+  herdr_restore_lock_acquire || return
   attempt=1
   while [ "$attempt" -le 20 ]; do
     if herdr_status_running; then
       if [ "$launched" -eq 1 ]; then
-        # Ownership is decided only by our own launch, under the lock.
         # Residual (documented): a non-hmw client starting this same session
         # inside this ~100ms locked window would be taken for ours.
         HMW_STARTED_SERVER=1
@@ -506,10 +506,6 @@ ensure_herdr_server() {
       return 0
     fi
     if [ "$attempt" -eq 1 ]; then
-      herdr_restore_lock_acquire || return
-      if [ "$HMW_LOCK_WAITED" -eq 1 ] && herdr_status_running; then
-        return 0
-      fi
       # NO_TMUX=1: the server's restored pane shells inherit this env; without
       # it an SSH-aware rc can auto-attach tmux before hmw relaunches Hermes.
       NO_TMUX=1 nohup "${HERDR[@]}" server >/dev/null 2>&1 &
@@ -1009,20 +1005,7 @@ herdr_wait_for_agent_pane() {
 # Set only when THIS run found the session stopped and started its server.
 HMW_STARTED_SERVER=0
 HMW_RESTORE_LOCK=""
-HMW_LOCK_WAITED=0
 
-herdr_restore_lock_wait_clear() {
-  local lock="$HMW_LOG_DIR/hmw-$SESSION.restore.lock" attempt=1
-
-  while [ -d "$lock" ] && [ "$lock" != "$HMW_RESTORE_LOCK" ]; do
-    if [ "$attempt" -gt "${HMW_RESTORE_LOCK_WAIT:-60}" ]; then
-      hmw_errf "hermes-workspace: another hmw is restoring Herdr session '%s' (lock %s held for %ss); retry, or remove that directory if no hmw is running\n" "$SESSION" "$lock" "${HMW_RESTORE_LOCK_WAIT:-60}"
-      return 1
-    fi
-    sleep 1
-    attempt=$((attempt + 1))
-  done
-}
 
 herdr_restore_lock_release() {
   if [ -n "$HMW_RESTORE_LOCK" ]; then
@@ -1037,13 +1020,12 @@ herdr_restore_lock_acquire() {
   mkdir -p "$HMW_LOG_DIR" 2>/dev/null || :
   attempt=1
   while ! mkdir "$lock" 2>/dev/null; do
-    if [ "$attempt" -ge 30 ]; then
-      hmw_errf "hermes-workspace: another hmw is restoring Herdr session '%s' (lock %s held for 30s); retry, or remove that directory if no hmw is running\n" "$SESSION" "$lock"
+    if [ "$attempt" -ge "${HMW_RESTORE_LOCK_WAIT:-60}" ]; then
+      hmw_errf "hermes-workspace: another hmw is restoring Herdr session '%s' (lock %s held for %ss); retry, or remove that directory if no hmw is running\n" "$SESSION" "$lock" "${HMW_RESTORE_LOCK_WAIT:-60}"
       return 1
     fi
     sleep 1
     attempt=$((attempt + 1))
-    HMW_LOCK_WAITED=1
   done
   HMW_RESTORE_LOCK=$lock
   trap herdr_restore_lock_release EXIT
