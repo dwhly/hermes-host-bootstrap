@@ -119,7 +119,7 @@ class Herdr082Tests(unittest.TestCase):
     def run_core(self, count=1):
         env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
                    HMW_BACKEND="herdr", HMW_REMOTE="1", HMW_VERIFY="1", HERDR_SESSION="review",
-                   HMW_HERDR_READY_TIMEOUT="3",
+                   HMW_HERDR_READY_TIMEOUT="3", HMW_RESTORE_LOCK_WAIT="2",
                    HERDR_082_STATE=str(self.path), HERDR_082_LOG=str(self.log))
         return subprocess.run(["bash", str(CORE), str(count)], env=env, capture_output=True, text=True, timeout=25)
 
@@ -167,8 +167,21 @@ class Herdr082Tests(unittest.TestCase):
         result = self.run_core(2)
         self.assert_failed(result)
         self.assertIn(str(lock), result.stderr)
-        self.assertEqual(self.pane_runs(), [])
+        # Refused before touching Herdr at all (no calls log is fine).
+        self.assertEqual(self.pane_runs() if self.log.exists() else [], [])
         self.assertTrue(lock.is_dir())
+
+    def test_running_session_waits_while_another_hmw_restores(self):
+        # Overlapping client: a held restore lock blocks attach even when the
+        # server is already running (another hmw may still be relaunching).
+        self.write(panes=[self.pane("H1", agent="hermes")])
+        lock = self.home / ".hermes/logs/hmw-review.restore.lock"
+        lock.mkdir(parents=True)
+        result = self.run_core(1)
+        self.assert_failed(result)
+        self.assertIn(str(lock), result.stderr)
+        # Refused before touching Herdr at all (no calls log is fine).
+        self.assertEqual(self.pane_runs() if self.log.exists() else [], [])
 
     def test_reboot_verify_run_stops_server_it_started(self):
         self.restored(stopped=True, launched_state={"visible": COMPOSER, "process": LIVE})
