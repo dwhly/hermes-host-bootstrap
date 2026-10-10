@@ -497,7 +497,9 @@ ensure_herdr_server() {
       return 0
     fi
     if [ "$attempt" -eq 1 ]; then
-      nohup "${HERDR[@]}" server >/dev/null 2>&1 &
+      # NO_TMUX=1: the server's restored pane shells inherit this env; without
+      # it an SSH-aware rc can auto-attach tmux before hmw relaunches Hermes.
+      NO_TMUX=1 nohup "${HERDR[@]}" server >/dev/null 2>&1 &
     fi
     if [ "$attempt" -lt 20 ]; then
       sleep 0.1
