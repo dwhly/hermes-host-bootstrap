@@ -491,9 +491,21 @@ raise SystemExit(0 if isinstance(value, dict) and value.get("status") == "runnin
 ensure_herdr_server() {
   local attempt socket
 
+  if herdr_status_running; then
+    return 0
+  fi
+  # Every server-start path takes the restore lock, then rechecks under it, so
+  # ownership (HMW_STARTED_SERVER) is decided only by an actual launch here.
+  herdr_restore_lock_acquire || return
+  if herdr_status_running; then
+    return 0
+  fi
   attempt=1
   while [ "$attempt" -le 20 ]; do
-    if herdr_status_running; then
+    if [ "$attempt" -gt 1 ] && herdr_status_running; then
+      # Residual (documented): a non-hmw client starting this same session
+      # inside this ~100ms locked window would be taken for ours.
+      HMW_STARTED_SERVER=1
       return 0
     fi
     if [ "$attempt" -eq 1 ]; then
@@ -1092,12 +1104,6 @@ ensure_herdr_workspace() {
   fi
 
   HERDR=(herdr --session "$SESSION")
-  if ! herdr_status_running; then
-    herdr_restore_lock_acquire || return
-    if ! herdr_status_running; then
-      HMW_STARTED_SERVER=1
-    fi
-  fi
   ensure_herdr_server || return
   herdr_slot_inventory || return
   if [ "$HMW_STARTED_SERVER" -eq 1 ]; then
@@ -1200,7 +1206,10 @@ case "$BACKEND" in
       # A probe must never leave behind a session it started (labelled panes
       # would be saved without Hermes in them).
       if [ "$HMW_STARTED_SERVER" -eq 1 ]; then
-        "${HERDR[@]}" server stop >/dev/null 2>&1 || hmw_errf "hermes-workspace: could not stop Herdr session '%s' started by this verify run\n" "$SESSION"
+        if ! "${HERDR[@]}" server stop >/dev/null 2>&1; then
+          hmw_errf "hermes-workspace: could not stop Herdr session '%s' started by this verify run\n" "$SESSION"
+          rc=1
+        fi
       fi
       exit "$rc"
     else
