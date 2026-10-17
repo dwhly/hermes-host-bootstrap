@@ -27,6 +27,20 @@ case "$1 $2" in
 esac
 SH
 chmod +x "$HOME/.local/bin/hermes"
+REAL_GIT="$(command -v git)"
+cat >"$HOME/.local/bin/git" <<SH
+#!/bin/bash
+# Test wrapper: on the job's merge (it alone passes --no-overwrite-ignore), run hooks.
+case " \$* " in
+  *" --no-overwrite-ignore "*)
+    [ -n "\${BEFORE_MERGE:-}" ] && eval "\$BEFORE_MERGE"
+    "$REAL_GIT" "\$@"; rc=\$?
+    [ -n "\${AFTER_MERGE:-}" ] && eval "\$AFTER_MERGE"
+    exit \$rc ;;
+esac
+exec "$REAL_GIT" "\$@"
+SH
+chmod +x "$HOME/.local/bin/git"
 strategy() { grep '^updates.parked_branch_strategy=' "$HERMES_HOME/fake-config" 2>/dev/null | cut -d= -f2-; }
 MARKER="$HERMES_HOME/.hermes-update-in-progress"
 
@@ -73,6 +87,16 @@ run; expect 3 merge_refused
 [[ "$(branch_of)" == main ]] || fail "ignored-file refusal changed branch"
 rm "$REPO/apps/desktop/switcher.txt"; sed -i.bak '/switcher.txt/d' "$REPO/.git/info/exclude"; rm -f "$REPO/.git/info/exclude.bak"
 
+# 1d. Adoption merge refused, and the branch is switched (same commit) before recovery:
+#     the job must not check out main; it stops and leaves the state alone.
+echo mine > "$REPO/apps/desktop/switcher.txt"
+export AFTER_MERGE='git -C "$HERMES_HOME/hermes-agent" branch elsewhere && git -C "$HERMES_HOME/hermes-agent" symbolic-ref HEAD refs/heads/elsewhere'
+run; unset AFTER_MERGE
+expect 1 state_changed_during_merge
+[[ "$(git -C "$REPO" symbolic-ref HEAD)" == refs/heads/elsewhere ]] || fail "rollback ran despite branch change"
+git -C "$REPO" symbolic-ref HEAD refs/heads/main; git -C "$REPO" branch -q -D carry/desktop-switcher elsewhere
+rm "$REPO/apps/desktop/switcher.txt"
+
 # 1c. Branch switched by someone else between decision and change: held, no adoption.
 "$HOME/.local/bin/hermes" config set updates.parked_branch_strategy switch   # so the job sets it (shim side effect fires)
 export SNEAK_BRANCH=sneaky; run; unset SNEAK_BRANCH
@@ -106,12 +130,14 @@ run; expect 0 up_to_date; [[ "$(head_of)" == "$h1" ]] || fail "clean upstream ca
 
 # 5. New carry commit, fleet base already in HEAD: taken, even with hostile merge config
 #    (mergeOptions=--no-commit, merge.ff=only) that would leave a merge half-done.
+echo note > "$REPO/local-note.txt"; git -C "$REPO" add local-note.txt; git -C "$REPO" commit -qm "local: note"
 git -C "$REPO" config branch.carry/desktop-switcher.mergeOptions --no-commit
 git -C "$REPO" config merge.ff only
 fleet_do sh -c 'echo v2 >> apps/desktop/switcher.txt && git commit -qam "fix: switcher v2"'
 run; expect 0 merged_new_carry_rebuild_pending
 grep -q v2 "$REPO/apps/desktop/switcher.txt" || fail "new carry not merged"
 [[ -e "$REPO/.git/MERGE_HEAD" ]] && fail "hostile config left the merge in progress"
+[[ "$(git -C "$REPO" rev-list --parents -n1 HEAD | wc -w)" -eq 3 ]] || fail "scenario 5 was not a real merge commit"
 git -C "$REPO" config --unset branch.carry/desktop-switcher.mergeOptions; git -C "$REPO" config --unset merge.ff
 
 # 6. Fleet merged NEWER upstream plus a new carry commit; HEAD lacks that upstream: update_first.
@@ -162,6 +188,20 @@ grep -q keep-me "$REPO/other.txt" || fail "abort lost the unrelated edit"
 [[ -e "$REPO/.git/MERGE_HEAD" ]] && fail "merge left in progress"
 git -C "$REPO" checkout -q -- other.txt; git -C "$REPO" reset -q --hard HEAD~1
 
+# 10c. Another updater takes the marker while our merge conflicts: we stop without aborting.
+printf 'x\n' > "$REPO/apps/desktop/switcher.txt"; git -C "$REPO" commit -q -am "local: conflicting again"
+fleet_do sh -c 'printf "z\n" > apps/desktop/switcher.txt && git commit -qam "fix: switcher v5"'
+sleep 300 & SLEEPER=$!
+export AFTER_MERGE='printf "%s\n%s\n" "$SLEEPER" "$(date +%s)" > "$HERMES_HOME/.hermes-update-in-progress"'
+export SLEEPER
+run; unset AFTER_MERGE
+[[ "$rc" == 1 ]] || fail "marker loss: rc=$rc: $out"
+grep -q "^reason=marker_lost_during_merge$" "$HERMES_HOME/desktop-carry/last" || fail "marker loss not reported: $out"
+[[ -e "$REPO/.git/MERGE_HEAD" ]] || fail "job touched the merge after losing the marker"
+[[ "$(head -n1 "$MARKER")" == "$SLEEPER" ]] || fail "job removed the other updater's marker"
+kill "$SLEEPER"; wait "$SLEEPER" 2>/dev/null || true; SLEEPER=""; rm -f "$MARKER"
+git -C "$REPO" merge --abort; git -C "$REPO" reset -q --hard HEAD~1
+
 # 11. Switched back to main by an update (strategy reset): stale carry branch with nothing
 #     unique is dropped and the host re-adopts. With a unique commit it holds.
 client_update
@@ -190,4 +230,4 @@ run; expect 0 retired; [[ "$(strategy)" == switch ]] || fail "un-retired after u
 git -C "$REPO" checkout -q main; "$HOME/.local/bin/hermes" config set updates.parked_branch_strategy update_in_place
 run; expect 0 retired_strategy_switch; [[ "$(strategy)" == switch ]] || fail "main host strategy not reset"
 
-echo "PASS test_desktop_switcher_carry (19 scenarios)"
+echo "PASS test_desktop_switcher_carry (21 scenarios)"

@@ -244,6 +244,10 @@ guarded_merge() {
     g merge-base --is-ancestor "$fleet_sha" HEAD || finish error merge_incomplete 1
     return 0
   fi
+  # Recovery touches the checkout too: only while we still own the marker and nothing
+  # else moved. Otherwise stop and leave everything exactly as it is for a human.
+  own_marker || finish error marker_lost_during_merge 1
+  [ "$(current_branch)" = "$2" ] || finish error state_changed_during_merge 1
   mh="$(head -n 1 "$GITDIR/MERGE_HEAD" 2>/dev/null)"
   if [ "$mh" = "$fleet_sha" ]; then
     g merge --abort >/dev/null 2>&1 || finish error merge_abort_failed 1
@@ -288,6 +292,10 @@ if [ "$branch" = main ]; then
   fi
   g checkout --quiet -b "$LOCAL_BRANCH" || finish error checkout_failed 1
   if ! guarded_merge adopt_merge_conflict "$LOCAL_BRANCH" "$START_HEAD"; then
+    # Roll back only what we created, and only if it is still exactly as we left it.
+    own_marker || finish error marker_lost_before_rollback 1
+    [ "$(current_branch)" = "$LOCAL_BRANCH" ] || finish error state_changed_before_rollback 1
+    [ "$(g rev-parse HEAD)" = "$START_HEAD" ] || finish error state_changed_before_rollback 1
     g checkout --quiet main || finish error adopt_rollback_failed 1
     g branch -D "$LOCAL_BRANCH" >/dev/null 2>&1 || finish error adopt_rollback_failed 1
     finish held "$MERGE_FAIL" 3
