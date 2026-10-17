@@ -202,6 +202,16 @@ grep -q "^reason=marker_lost_during_merge$" "$HERMES_HOME/desktop-carry/last" ||
 kill "$SLEEPER"; wait "$SLEEPER" 2>/dev/null || true; SLEEPER=""; rm -f "$MARKER"
 git -C "$REPO" merge --abort; git -C "$REPO" reset -q --hard HEAD~1
 
+# 10d. HEAD moved on the same branch while our merge conflicts: no abort, merge left alone.
+printf 'x\n' > "$REPO/apps/desktop/switcher.txt"; git -C "$REPO" commit -q -am "local: conflicting once more"
+h5="$(head_of)"
+export AFTER_MERGE='git -C "$HERMES_HOME/hermes-agent" update-ref refs/heads/carry/desktop-switcher HEAD~1'
+run; unset AFTER_MERGE
+[[ "$rc" == 1 ]] || fail "moved HEAD: rc=$rc: $out"
+grep -q "^reason=state_changed_during_merge$" "$HERMES_HOME/desktop-carry/last" || fail "moved HEAD not reported: $out"
+[[ -e "$REPO/.git/MERGE_HEAD" ]] || fail "job aborted the merge after HEAD moved"
+git -C "$REPO" update-ref refs/heads/carry/desktop-switcher "$h5"; git -C "$REPO" merge --abort; git -C "$REPO" reset -q --hard HEAD~1
+
 # 11. Switched back to main by an update (strategy reset): stale carry branch with nothing
 #     unique is dropped and the host re-adopts. With a unique commit it holds.
 client_update
@@ -230,4 +240,4 @@ run; expect 0 retired; [[ "$(strategy)" == switch ]] || fail "un-retired after u
 git -C "$REPO" checkout -q main; "$HOME/.local/bin/hermes" config set updates.parked_branch_strategy update_in_place
 run; expect 0 retired_strategy_switch; [[ "$(strategy)" == switch ]] || fail "main host strategy not reset"
 
-echo "PASS test_desktop_switcher_carry (21 scenarios)"
+echo "PASS test_desktop_switcher_carry (22 scenarios)"

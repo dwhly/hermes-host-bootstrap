@@ -248,6 +248,7 @@ guarded_merge() {
   # else moved. Otherwise stop and leave everything exactly as it is for a human.
   own_marker || finish error marker_lost_during_merge 1
   [ "$(current_branch)" = "$2" ] || finish error state_changed_during_merge 1
+  [ "$(g rev-parse HEAD)" = "$pre" ] || finish error state_changed_during_merge 1
   mh="$(head -n 1 "$GITDIR/MERGE_HEAD" 2>/dev/null)"
   if [ "$mh" = "$fleet_sha" ]; then
     g merge --abort >/dev/null 2>&1 || finish error merge_abort_failed 1
