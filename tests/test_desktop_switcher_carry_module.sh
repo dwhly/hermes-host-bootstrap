@@ -55,6 +55,14 @@ grep -q 'StartCalendarInterval' "$PLIST" || fail "listed: schedule"
 grep -q '<key>HERMES_HOME</key><string>'"$H"'/.hermes</string>' "$PLIST" || fail "listed: HERMES_HOME not pinned"
 grep -q 'launchctl bootstrap' "$LOG" || fail "listed: not bootstrapped"
 
+# 1b. A HERMES_HOME with XML metacharacters still yields a well-formed plist.
+run_case amp h-air2 "HERMES_HOME=$WORK/amp/A & <B>/.hermes"
+python3 -c 'import sys,xml.dom.minidom as m; m.parse(sys.argv[1])' "$PLIST" || fail "amp: plist not well-formed XML"
+grep -q 'A &amp; &lt;B&gt;/.hermes</string>' "$PLIST" || fail "amp: HERMES_HOME not escaped"
+
+# 1 again (later cases rely on the plain listed case's state).
+run_case listed h-air2
+
 # 2. Rerun unchanged: no bootout/bootstrap churn.
 : >"$LOG"; OUT="$(env -i PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$H" HERMES_HOSTNAME=h-air2 \
   FAKE_LOG="$LOG" FAKE_LOADED="$H/loaded" bash "$WORK/r/lib/M7-desktop-switcher-carry.sh" 2>&1)"

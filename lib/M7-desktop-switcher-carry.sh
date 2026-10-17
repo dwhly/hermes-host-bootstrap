@@ -80,6 +80,9 @@ if ! cmp -s "$source_script" "$target"; then
   return 1 2>/dev/null || exit 1
 fi
 
+# XML-escape every interpolated path (a HERMES_HOME may contain & < >).
+xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+x_target="$(xml "$target")"; x_home="$(xml "$hermes_home")"; x_state="$(xml "$state_dir")"
 cat >"$plist.tmp" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -87,7 +90,7 @@ cat >"$plist.tmp" <<PLIST
 <dict>
   <key>Label</key><string>$label</string>
   <key>ProgramArguments</key>
-  <array><string>/bin/bash</string><string>$target</string></array>
+  <array><string>/bin/bash</string><string>$x_target</string></array>
   <key>RunAtLoad</key><true/>
   <key>StartCalendarInterval</key>
   <array>
@@ -101,11 +104,11 @@ cat >"$plist.tmp" <<PLIST
     <dict><key>Hour</key><integer>21</integer><key>Minute</key><integer>17</integer></dict>
   </array>
   <key>EnvironmentVariables</key>
-  <dict><key>HERMES_HOME</key><string>$hermes_home</string></dict>
+  <dict><key>HERMES_HOME</key><string>$x_home</string></dict>
   <key>ProcessType</key><string>Background</string>
   <key>LowPriorityIO</key><true/>
-  <key>StandardOutPath</key><string>$state_dir/agent.out</string>
-  <key>StandardErrorPath</key><string>$state_dir/agent.out</string>
+  <key>StandardOutPath</key><string>$x_state/agent.out</string>
+  <key>StandardErrorPath</key><string>$x_state/agent.out</string>
 </dict>
 </plist>
 PLIST

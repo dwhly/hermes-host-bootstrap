@@ -35,7 +35,8 @@
 # Never touches: a merge/rebase/cherry-pick/revert/bisect in progress, a branch other
 # than main/carry, a detached HEAD, a non-official origin or any `upstream` remote
 # (Hermes fork mode). Local edits in files the merge doesn't touch are left alone; git
-# refuses a merge that would overwrite one, and that is reported as merge_refused.
+# refuses a merge that would overwrite one (ignored files included), and that is reported
+# as merge_refused. A leftover carry branch is renamed, never deleted.
 # Every run writes one line to $STATE/sync.log and key=value lines to $STATE/last.
 # Exit 0 = ok/nothing to do, 3 = held (checkout content unchanged), 1 = error.
 # bash 3.2-safe (macOS /bin/bash).
@@ -71,6 +72,7 @@ release_marker() {
   if [ "$OWN_MARKER" = 1 ] && [ "$(head -n 1 "$MARKER" 2>/dev/null)" = "$$" ]; then
     rm -f "$MARKER"
   fi
+  rm -f "$MARKER.claim.$$"
   OWN_MARKER=0
 }
 
@@ -96,24 +98,45 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 trap 'release_marker; rmdir "$LOCK" 2>/dev/null' EXIT
 
-update_live() { # another live updater holds Hermes's update marker
+# marker_live <content>: content (one read of the marker) names another live updater.
+marker_live() {
   local pid started now
-  [ -f "$MARKER" ] || return 1
-  pid="$(sed -n 1p "$MARKER" 2>/dev/null | tr -d '[:space:]')"
-  started="$(sed -n 2p "$MARKER" 2>/dev/null | tr -d '[:space:]')"
+  pid="$(printf '%s\n' "$1" | sed -n 1p | tr -d '[:space:]')"
+  started="$(printf '%s\n' "$1" | sed -n 2p | tr -d '[:space:]')"
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   case "$started" in ''|*[!0-9]*) return 1 ;; esac
   [ "$pid" = "$$" ] && return 1
   now="$(date +%s)"
   [ $((now - started)) -le "$MARKER_MAX_AGE" ] && kill -0 "$pid" 2>/dev/null
 }
+update_live() { [ -f "$MARKER" ] && marker_live "$(cat "$MARKER" 2>/dev/null)"; }
+own_marker() { [ "$(head -n 1 "$MARKER" 2>/dev/null)" = "$$" ]; }
 
-claim_marker() { # take the update marker for this process, or hold. Idempotent.
-  [ "$OWN_MARKER" = 1 ] && return 0
-  update_live && finish held update_running 3
-  rm -f "$MARKER"
-  (set -C; printf '%s\n%s\n' "$$" "$(date +%s)" >"$MARKER") 2>/dev/null || finish held update_running 3
-  [ "$(head -n 1 "$MARKER" 2>/dev/null)" = "$$" ] || finish held update_running 3
+# claim_marker: take Hermes's update marker for this process, or hold. Idempotent.
+# Never deletes a marker it hasn't proven stale: a stale one is moved aside atomically
+# and compared with what was judged; a mismatch (someone replaced it meanwhile) is put
+# back. Our own marker is created with ln, which fails rather than clobbers. Hermes's
+# own updaters check-then-write, so a residual window exists on their side;
+# own_marker is re-checked right before every checkout change.
+claim_marker() {
+  local tmp seen
+  [ "$OWN_MARKER" = 1 ] && own_marker && return 0
+  OWN_MARKER=0
+  tmp="$MARKER.claim.$$"
+  printf '%s\n%s\n' "$$" "$(date +%s)" >"$tmp" || finish error marker_write_failed 1
+  if [ -e "$MARKER" ]; then
+    seen="$(cat "$MARKER" 2>/dev/null)"
+    if marker_live "$seen"; then rm -f "$tmp"; finish held update_running 3; fi
+    if ! mv "$MARKER" "$MARKER.stale.$$" 2>/dev/null; then rm -f "$tmp"; finish held update_running 3; fi
+    if [ "$(cat "$MARKER.stale.$$" 2>/dev/null)" != "$seen" ]; then
+      ln "$MARKER.stale.$$" "$MARKER" 2>/dev/null
+      rm -f "$MARKER.stale.$$" "$tmp"
+      finish held update_running 3
+    fi
+    rm -f "$MARKER.stale.$$"
+  fi
+  if ! ln "$tmp" "$MARKER" 2>/dev/null; then rm -f "$tmp"; finish held update_running 3; fi
+  rm -f "$tmp"
   OWN_MARKER=1
 }
 
@@ -130,18 +153,36 @@ GITDIR="$(g rev-parse --absolute-git-dir 2>/dev/null)" || finish held no_checkou
 git_busy && finish held "git_busy_$BUSY" 3
 update_live && finish held update_running 3
 
-# Raw configured URL (not insteadOf-rewritten): what hermes update itself classifies.
-origin_url="$(g config --get remote.origin.url 2>/dev/null || true)"
-printf '%s\n' "$origin_url" | grep -Eq "$OFFICIAL_RE" || finish held origin_not_official 3
-# Fork-mode hazard: an `upstream` remote makes hermes update push to origin. Never on clients.
-g config --get remote.upstream.url >/dev/null 2>&1 && finish held upstream_remote_present 3
+check_policy() {
+  # Raw configured URL (not insteadOf-rewritten): what hermes update itself classifies.
+  local origin_url
+  origin_url="$(g config --get remote.origin.url 2>/dev/null || true)"
+  printf '%s\n' "$origin_url" | grep -Eq "$OFFICIAL_RE" || finish held origin_not_official 3
+  # Fork-mode hazard: an `upstream` remote makes hermes update push to origin. Never on clients.
+  g config --get remote.upstream.url >/dev/null 2>&1 && finish held upstream_remote_present 3
+  return 0
+}
+current_branch() { g symbolic-ref --short -q HEAD || true; }
+check_policy
 
-branch="$(g symbolic-ref --short -q HEAD || true)"
+branch="$(current_branch)"
 case "$branch" in
   main|"$LOCAL_BRANCH") ;;
   "") finish held detached_head 3 ;;
   *) finish held foreign_branch 3 ;;
 esac
+START_HEAD="$(g rev-parse HEAD)"
+
+# revalidate <branch> <head>: under the marker, right before changing the checkout,
+# confirm nothing moved since we decided (a user or another tool may have acted during
+# the fetch): same branch, same HEAD, same remote policy, no git op, still our marker.
+revalidate() {
+  own_marker || finish held update_running 3
+  git_busy && finish held "git_busy_$BUSY" 3
+  check_policy
+  [ "$(current_branch)" = "$1" ] || finish held branch_changed 3
+  [ "$(g rev-parse HEAD)" = "$2" ] || finish held head_changed 3
+}
 
 gfetch origin main || finish held fetch_origin_failed 3
 gfetch "$FLEET_URL" "+refs/heads/$FLEET_BRANCH:$FLEET_REF" || finish held fetch_fleet_failed 3
@@ -185,15 +226,22 @@ deps_change() {
 
 # guarded_merge <reason-on-conflict>: merge the fleet ref under the update marker. On
 # failure, restores exactly the state it created, sets MERGE_FAIL and returns 1.
+# guarded_merge <reason-on-conflict> <branch> <head>
 guarded_merge() {
   local fleet_sha pre mh
   claim_marker
-  git_busy && finish held "git_busy_$BUSY" 3
+  revalidate "$2" "$3"
   fleet_sha="$(g rev-parse "$FLEET_REF")"
-  pre="$(g rev-parse HEAD)"
+  pre="$3"
+  # Explicit flags beat inherited config (branch.*.mergeOptions, merge.ff=only,
+  # merge.autoStash, commit.gpgSign, hooks); never overwrite ignored local files.
   if GIT_AUTHOR_NAME="Hermes fleet carry" GIT_AUTHOR_EMAIL=fleet-carry@hermes.local \
      GIT_COMMITTER_NAME="Hermes fleet carry" GIT_COMMITTER_EMAIL=fleet-carry@hermes.local \
-     g merge --no-edit --quiet "$FLEET_REF" >/dev/null 2>&1; then
+     g -c merge.autoStash=false -c commit.gpgSign=false \
+       merge --commit --ff --no-squash --no-autostash --no-overwrite-ignore --no-verify \
+       --no-edit --quiet "$FLEET_REF" >/dev/null 2>&1; then
+    [ -e "$GITDIR/MERGE_HEAD" ] && finish error merge_left_in_progress 1
+    g merge-base --is-ancestor "$fleet_sha" HEAD || finish error merge_incomplete 1
     return 0
   fi
   mh="$(head -n 1 "$GITDIR/MERGE_HEAD" 2>/dev/null)"
@@ -228,18 +276,18 @@ fi
 if [ "$branch" = main ]; then
   # Adoption. Strategy first: harmless on main, and a later failure can't strand the branch.
   strategy_is_in_place || set_strategy update_in_place
-  if g show-ref --verify --quiet "refs/heads/$LOCAL_BRANCH"; then
-    # Left over (e.g. an update switched back to main). Drop it only if nothing unique is on it.
-    if [ -n "$(g rev-list --no-merges "refs/heads/$LOCAL_BRANCH" ^origin/main "^$FLEET_REF" 2>/dev/null)" ]; then
-      finish held carry_branch_has_unique_commits 3
-    fi
-    g branch -D "$LOCAL_BRANCH" >/dev/null 2>&1 || finish error stale_carry_branch_delete_failed 1
-  fi
   base_in_head || finish held update_first 3
   claim_marker
-  git_busy && finish held "git_busy_$BUSY" 3
+  revalidate main "$START_HEAD"
+  if g show-ref --verify --quiet "refs/heads/$LOCAL_BRANCH"; then
+    # Left over (e.g. an update switched back to main). Never deleted: it may hold local
+    # work, including hand-made conflict resolutions. Kept under a timestamped name.
+    stale="$LOCAL_BRANCH-stale-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    g branch -m "$LOCAL_BRANCH" "$stale" >/dev/null 2>&1 || finish error stale_carry_branch_rename_failed 1
+    printf '%s kept leftover branch as %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$stale" >>"$STATE/sync.log"
+  fi
   g checkout --quiet -b "$LOCAL_BRANCH" || finish error checkout_failed 1
-  if ! guarded_merge adopt_merge_conflict; then
+  if ! guarded_merge adopt_merge_conflict "$LOCAL_BRANCH" "$START_HEAD"; then
     g checkout --quiet main || finish error adopt_rollback_failed 1
     g branch -D "$LOCAL_BRANCH" >/dev/null 2>&1 || finish error adopt_rollback_failed 1
     finish held "$MERGE_FAIL" 3
@@ -256,12 +304,12 @@ if g merge-base --is-ancestor "$FLEET_REF" HEAD; then
 fi
 new_carry="$(g rev-list --no-merges --count HEAD.."$FLEET_REF" ^origin/main 2>/dev/null || echo 0)"
 if [ "${new_carry:-0}" -gt 0 ] && base_in_head; then
-  guarded_merge merge_conflict || finish held "$MERGE_FAIL" 3
+  guarded_merge merge_conflict "$LOCAL_BRANCH" "$START_HEAD" || finish held "$MERGE_FAIL" 3
   finish ok merged_new_carry_rebuild_pending 0
 fi
 if upstream_conflicts; then
   deps_change && finish held needs_full_update 3
-  guarded_merge merge_conflict || finish held "$MERGE_FAIL" 3
+  guarded_merge merge_conflict "$LOCAL_BRANCH" "$START_HEAD" || finish held "$MERGE_FAIL" 3
   finish ok merged_conflict_resolution_rebuild_pending 0
 fi
 [ "${new_carry:-0}" -gt 0 ] && finish held update_first 3

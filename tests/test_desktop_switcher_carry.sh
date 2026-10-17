@@ -8,7 +8,7 @@ SYNC="$ROOT/scripts/hermes-desktop-carry-sync"
 bash -n "$SYNC"
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
-W="$(mktemp -d)"; trap 'kill "${SLEEPER:-0}" 2>/dev/null || true; rm -rf "$W"' EXIT
+W="$(mktemp -d)"; trap 'if [ -n "${SLEEPER:-}" ]; then kill "$SLEEPER" 2>/dev/null || true; fi; rm -rf "$W"' EXIT
 export HOME="$W/home"; mkdir -p "$HOME/.local/bin"
 export HERMES_HOME="$HOME/.hermes"; mkdir -p "$HERMES_HOME"
 export GIT_CONFIG_GLOBAL="$W/gitconfig" GIT_CONFIG_NOSYSTEM=1
@@ -22,7 +22,8 @@ cat >"$HOME/.local/bin/hermes" <<'SH'
 f="$HERMES_HOME/fake-config"; touch "$f"
 case "$1 $2" in
   "config get") grep "^$3=" "$f" | cut -d= -f2- ;;
-  "config set") grep -v "^$3=" "$f" > "$f.n" || true; echo "$3=$4" >> "$f.n"; mv "$f.n" "$f" ;;
+  "config set") grep -v "^$3=" "$f" > "$f.n" || true; echo "$3=$4" >> "$f.n"; mv "$f.n" "$f"
+                if [ -n "${SNEAK_BRANCH:-}" ]; then git -C "$HERMES_HOME/hermes-agent" checkout -q -b "$SNEAK_BRANCH"; fi ;;
 esac
 SH
 chmod +x "$HOME/.local/bin/hermes"
@@ -64,6 +65,23 @@ if git -C "$REPO" show-ref --quiet refs/heads/carry/desktop-switcher; then fail 
 [[ "$(cat "$REPO/apps/desktop/switcher.txt")" == mine ]] || fail "user file touched"
 rm "$REPO/apps/desktop/switcher.txt"
 
+# 1b. Same, but the local file is IGNORED: git would silently overwrite it by default.
+echo "apps/desktop/switcher.txt" >> "$REPO/.git/info/exclude"
+echo precious > "$REPO/apps/desktop/switcher.txt"
+run; expect 3 merge_refused
+[[ "$(cat "$REPO/apps/desktop/switcher.txt")" == precious ]] || fail "ignored local file overwritten"
+[[ "$(branch_of)" == main ]] || fail "ignored-file refusal changed branch"
+rm "$REPO/apps/desktop/switcher.txt"; sed -i.bak '/switcher.txt/d' "$REPO/.git/info/exclude"; rm -f "$REPO/.git/info/exclude.bak"
+
+# 1c. Branch switched by someone else between decision and change: held, no adoption.
+"$HOME/.local/bin/hermes" config set updates.parked_branch_strategy switch   # so the job sets it (shim side effect fires)
+export SNEAK_BRANCH=sneaky; run; unset SNEAK_BRANCH
+expect 3 branch_changed
+[[ "$(branch_of)" == sneaky ]] || fail "sneak: job moved the user's branch"
+if git -C "$REPO" show-ref --quiet refs/heads/carry/desktop-switcher; then fail "sneak: carry branch created"; fi
+git -C "$REPO" checkout -q main; git -C "$REPO" branch -q -D sneaky
+"$HOME/.local/bin/hermes" config set updates.parked_branch_strategy switch
+
 # 2. Live updater holds the marker: held, nothing changed. Stale marker: ignored, removed.
 sleep 300 & SLEEPER=$!
 printf '%s\n%s\n' "$SLEEPER" "$(date +%s)" > "$MARKER"
@@ -86,10 +104,15 @@ h1="$(head_of)"; run; expect 0 up_to_date; [[ "$(head_of)" == "$h1" ]] || fail "
 up_commit sh -c 'echo more >> other.txt'
 run; expect 0 up_to_date; [[ "$(head_of)" == "$h1" ]] || fail "clean upstream caused a merge"
 
-# 5. New carry commit, fleet base already in HEAD: taken.
+# 5. New carry commit, fleet base already in HEAD: taken, even with hostile merge config
+#    (mergeOptions=--no-commit, merge.ff=only) that would leave a merge half-done.
+git -C "$REPO" config branch.carry/desktop-switcher.mergeOptions --no-commit
+git -C "$REPO" config merge.ff only
 fleet_do sh -c 'echo v2 >> apps/desktop/switcher.txt && git commit -qam "fix: switcher v2"'
 run; expect 0 merged_new_carry_rebuild_pending
 grep -q v2 "$REPO/apps/desktop/switcher.txt" || fail "new carry not merged"
+[[ -e "$REPO/.git/MERGE_HEAD" ]] && fail "hostile config left the merge in progress"
+git -C "$REPO" config --unset branch.carry/desktop-switcher.mergeOptions; git -C "$REPO" config --unset merge.ff
 
 # 6. Fleet merged NEWER upstream plus a new carry commit; HEAD lacks that upstream: update_first.
 up_commit sh -c 'echo newer >> other.txt'
@@ -146,10 +169,12 @@ git -C "$REPO" checkout -q main; git -C "$REPO" merge -q --ff-only origin/main
 "$HOME/.local/bin/hermes" config set updates.parked_branch_strategy switch
 [[ "$(strategy)" == switch ]] || fail "shim reset"
 run; expect 0 adopted_rebuild_pending; [[ "$(strategy)" == update_in_place ]] || fail "re-adopt strategy"
-git -C "$REPO" commit -q --allow-empty -m "local only"
+git -C "$REPO" commit -q --allow-empty -m "local only"; local_only="$(head_of)"
 git -C "$REPO" checkout -q main
-run; expect 3 carry_branch_has_unique_commits
-git -C "$REPO" checkout -q carry/desktop-switcher
+run; expect 0 adopted_rebuild_pending
+stale="$(git -C "$REPO" for-each-ref --contains "$local_only" --format='%(refname:short)' 'refs/heads/carry/desktop-switcher-stale-*' | head -1)"
+[[ -n "$stale" ]] || fail "local-only commit lost (no kept branch contains it)"
+grep -q "kept leftover branch as $stale" "$HERMES_HOME/desktop-carry/sync.log" || fail "rename not logged"
 
 # 12. Retirement by squash merge: upstream gets the same apps/desktop content, no ancestry.
 git checkout -q main; git checkout -q fleet/desktop-switcher -- apps/desktop; git commit -qm "squash: switcher"; git push -q origin main
@@ -165,4 +190,4 @@ run; expect 0 retired; [[ "$(strategy)" == switch ]] || fail "un-retired after u
 git -C "$REPO" checkout -q main; "$HOME/.local/bin/hermes" config set updates.parked_branch_strategy update_in_place
 run; expect 0 retired_strategy_switch; [[ "$(strategy)" == switch ]] || fail "main host strategy not reset"
 
-echo "PASS test_desktop_switcher_carry (16 scenarios)"
+echo "PASS test_desktop_switcher_carry (19 scenarios)"
