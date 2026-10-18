@@ -1,0 +1,7 @@
+name                 status   directory                                        socket
+default              running  /root/.config/herdr                              /root/.config/herdr/herdr.sock
+hmw-restore-guard-probe-20260923 stopped  /root/.config/herdr/sessions/hmw-restore-guard-probe-20260923 /root/.config/herdr/sessions/hmw-restore-guard-probe-20260923/herdr.sock
+hmwprobe1311772      stopped  /root/.config/herdr/sessions/hmwprobe1311772     /root/.config/herdr/sessions/hmwprobe1311772/herdr.sock
+hmwprobe2            stopped  /root/.config/herdr/sessions/hmwprobe2           /root/.config/herdr/sessions/hmwprobe2/herdr.sock
+testfresh            stopped  /root/.config/herdr/sessions/testfresh           /root/.config/herdr/sessions/testfresh/herdr.sock
+ws                   running  /root/.config/herdr/sessions/ws                  /root/.config/herdr/sessions/ws/herdr.sock

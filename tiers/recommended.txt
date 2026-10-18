@@ -49,6 +49,8 @@ AGENT
     Upgrades defer while any Herdr session/process is running (including named
     sessions), or activity cannot be determined. Use `herdr update --handoff` in
     an operator window, or stop sessions and re-run `bootstrap.sh --only=42-herdr`.
+    Hosts whose installed Herdr lacks `session list` (older than 0.8.x, unverified)
+    defer and need the manual step above.
     This interim floor runs only with bootstrap; it adds no background updater.
   + Hermes native Bot API defaults (authenticated OpenAI-compatible native gateway API
     on the host's Tailscale IPv4 only; preserves existing API_SERVER_KEY, writes

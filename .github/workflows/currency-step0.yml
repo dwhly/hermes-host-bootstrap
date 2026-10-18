@@ -26,8 +26,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Herdr floor on macOS Bash 3.2 (offline stubs)
         run: |
-          /bin/bash -n lib/42-herdr.sh lib/common.sh
-          # Bash parses only the first filename; check common.sh separately too.
+          /bin/bash -n lib/42-herdr.sh
           /bin/bash -n lib/common.sh
           /bin/bash tests/test_herdr_floor.sh
       - run: |

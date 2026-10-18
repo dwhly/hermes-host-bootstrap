@@ -8,7 +8,7 @@ export HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/home/.config"
 export REPO_ROOT="$TMP/repo" HERDR_TEST_ROOT="$ROOT"
 export HERDR_TEST_LOG="$TMP/commands.log" HERDR_TEST_PAYLOAD="$TMP/payload"
 export HERDR_TEST_OS=Linux HERDR_TEST_ARCH=x86_64
-export HERDR_TEST_SESSIONS=stopped HERDR_TEST_PGREP=1 HERDR_TEST_POST_FAIL=0
+export HERDR_TEST_SESSIONS=real-0.8.2-none-running HERDR_TEST_PGREP=1 HERDR_TEST_POST_FAIL=0
 export HERDR_TEST_DOWNLOAD_FAIL=0 HERDR_TEST_START_DURING_DOWNLOAD=0
 export TIER=recommended
 unset SKIP_KEYS
@@ -51,15 +51,24 @@ STUB
 cat > "$TMP/stubs/pgrep" <<'STUB'
 #!/bin/bash
 printf 'pgrep %s\n' "$*" >> "$HERDR_TEST_LOG"
-[[ "$*" == "-u $(id -u) -x herdr" ]] || exit 2
+if [[ "$HERDR_TEST_PGREP" == other_user ]]; then
+  # Model the old uid filter missing another user's process for the mutation test.
+  case "$*" in
+    '-x herdr') exit 0 ;;
+    "-u $(id -u) -x herdr") exit 1 ;;
+    *) exit 2 ;;
+  esac
+fi
+[[ "$*" == '-x herdr' ]] || exit 2
 exit "$HERDR_TEST_PGREP"
 STUB
 cat > "$TMP/stubs/curl" <<'STUB'
 #!/bin/bash
 printf 'curl %s\n' "$*" >> "$HERDR_TEST_LOG"
-[[ "$1" == -fsSL && "$3" == -o ]] || exit 2
+[[ "$1" == -fsSL && "$2" == --connect-timeout && "$3" == 20 &&
+   "$4" == --max-time && "$5" == 300 && "$7" == -o ]] || exit 2
 [[ "$HERDR_TEST_DOWNLOAD_FAIL" == 0 ]] || exit 22
-cp "$HERDR_TEST_PAYLOAD" "$4"
+cp "$HERDR_TEST_PAYLOAD" "$8"
 if [[ "$HERDR_TEST_START_DURING_DOWNLOAD" == 1 ]]; then
   touch "$HOME/session-started"
 fi
@@ -87,12 +96,14 @@ case "$*" in
     if [[ "$HERDR_TEST_POST_FAIL" == 1 && "$FIXTURE_VERSION" == 0.9.3 && "$0" == "$HOME/.local/bin/herdr" ]]; then
       exit 1
     fi
-    printf 'herdr %s\n' "$FIXTURE_VERSION"
+    version_fixture="$HERDR_TEST_ROOT/tests/fixtures/herdr-real/version-$FIXTURE_VERSION.txt"
+    if [[ -f "$version_fixture" ]]; then cat "$version_fixture"
+    else printf 'herdr %s\n' "$FIXTURE_VERSION"; fi
     ;;
   'session list')
     if [[ -f "$HOME/session-started" ]]; then printf 'ws running\n'; exit 0; fi
     case "$HERDR_TEST_SESSIONS" in
-      stopped) printf 'NAME STATUS\ndefault stopped\n' ;;
+      real-*) cat "$HERDR_TEST_ROOT/tests/fixtures/herdr-real/session-list-${HERDR_TEST_SESSIONS#real-}.txt" ;;
       none) printf 'No sessions found.\n' ;;
       default) printf 'NAME STATUS\ndefault running\n' ;;
       named) printf 'NAME STATUS\ndefault stopped\nws running\n' ;;
@@ -119,7 +130,7 @@ reset_case() {
   mkdir -p "$HOME/.local/bin"
   : > "$HERDR_TEST_LOG"
   : > "$TMP/output"
-  HERDR_TEST_SESSIONS=stopped HERDR_TEST_PGREP=1 HERDR_TEST_POST_FAIL=0
+  HERDR_TEST_SESSIONS=real-0.8.2-none-running HERDR_TEST_PGREP=1 HERDR_TEST_POST_FAIL=0
   HERDR_TEST_DOWNLOAD_FAIL=0 HERDR_TEST_START_DURING_DOWNLOAD=0
   HERDR_TEST_OS=Linux HERDR_TEST_ARCH=x86_64
   HERDR_TEST_PATH="$TMP/stubs:$HOME/.local/bin:$TMP/tools"
@@ -156,13 +167,56 @@ for row in '0.7.1 0.9.3 0' '0.9.3 0.9.3 1' '0.10.0 0.9.3 1' '1.0 1.0.1 0' \
 done
 pass 'version_lt numeric dotted comparison table'
 
-reset_case 0.7.1
+# Keep this before other module cases so the uid-filter mutation reaches it.
+reset_case 0.8.2
+HERDR_TEST_PGREP=other_user
+run_module
+[[ "$(sha256_of "$HOME/.local/bin/herdr")" == "$BEFORE" ]] || fail 'other-user process did not defer: installed binary changed'
+no_download; contains 'installed 0.8.2, floor 0.9.3'; contains 'upgrade deferred'
+grep -Fxq 'pgrep -x herdr' "$HERDR_TEST_LOG" || fail 'other-user process probe missing'
+pass 'other-user process with no running sessions defers without download or replacement'
+
+reset_case 0.8.2
 printf 'older backup\n' > "$HOME/.local/bin/herdr.prev"
 run_module
 [[ "$("$HOME/.local/bin/herdr" --version)" == 'herdr 0.9.3' ]] || fail 'upgrade version'
 [[ "$(sha256_of "$HOME/.local/bin/herdr.prev")" == "$BEFORE" ]] || fail '.prev differs from old binary'
 grep -Fq 'https://github.com/ogulcancelik/herdr/releases/download/v0.9.3/herdr-linux-x86_64' "$HERDR_TEST_LOG" || fail 'wrong URL'
 pass 'below floor upgrades exact release with verified digest; .prev overwrites older backup'
+
+for version in 0.8.2 0.9.3; do
+  for sessions in live-ws-and-default none-running; do
+    reset_case "$version"
+    # Probe a PATH-only 0.9.3 copy: a fleet copy at the floor needs no upgrade.
+    if [[ "$version" == 0.9.3 ]]; then
+      mkdir -p "$TMP/shadow"
+      mv "$HOME/.local/bin/herdr" "$TMP/shadow/herdr"
+      HERDR_TEST_PATH="$TMP/shadow:$HERDR_TEST_PATH"
+    fi
+    HERDR_TEST_SESSIONS="real-$version-$sessions"
+    run_module
+    grep -Fq "herdr $version session list" "$HERDR_TEST_LOG" || fail 'real session fixture not probed'
+    if [[ "$version" == 0.9.3 ]]; then
+      [[ "$(sha256_of "$TMP/shadow/herdr")" == "$BEFORE" ]] || fail 'real-fixture shadow modified'
+    fi
+    if [[ "$sessions" == live-ws-and-default ]]; then
+      no_download; contains 'upgrade deferred'
+      if [[ "$version" == 0.8.2 ]]; then unchanged
+      else [[ ! -e "$HOME/.local/bin/herdr" ]] || fail 'installed beside live real-fixture shadow'; fi
+      pass "real $version version/session output with live ws and default defers"
+    else
+      [[ "$("$HOME/.local/bin/herdr" --version)" == "$(cat "$ROOT/tests/fixtures/herdr-real/version-0.9.3.txt")" ]] || fail 'real-fixture upgrade version'
+      grep -q '^curl ' "$HERDR_TEST_LOG" || fail 'real idle fixture did not allow install'
+      pass "real $version version/session output with none running allows install"
+    fi
+  done
+done
+
+reset_case 0.8.2
+HERDR_TEST_SESSIONS=none
+run_module
+[[ "$("$HOME/.local/bin/herdr" --version)" == 'herdr 0.9.3' ]] || fail 'no-sessions upgrade version'
+pass 'No sessions found response allows upgrade when pgrep finds nothing'
 
 for version in 0.9.3 0.10.0; do
   reset_case "$version"
@@ -221,8 +275,17 @@ reset_case absent
 run_module
 [[ "$("$HOME/.local/bin/herdr" --version)" == 'herdr 0.9.3' ]] || fail 'fresh install version'
 [[ ! -e "$HOME/.local/bin/herdr.prev" ]] || fail 'fresh install created backup'
-if grep -q '^pgrep ' "$HERDR_TEST_LOG"; then fail 'fresh install activity probe'; fi
-pass 'absent binary installs from record without activity probes'
+[[ "$(grep -Fxc 'pgrep -x herdr' "$HERDR_TEST_LOG")" == 2 ]] || fail 'fresh install needs both process probes'
+if grep -q 'session list' "$HERDR_TEST_LOG"; then fail 'fresh install session probe without a binary'; fi
+pass 'absent binary installs from record after both process probes find nothing'
+
+reset_case absent
+HERDR_TEST_PGREP=0
+run_module
+[[ ! -e "$HOME/.local/bin/herdr" ]] || fail 'installed alongside process with no binary on PATH'
+no_download; contains 'installed none, floor 0.9.3'; contains 'upgrade deferred'
+grep -Fxq 'pgrep -x herdr' "$HERDR_TEST_LOG" || fail 'absent binary skipped process probe'
+pass 'absent binary with running Herdr process defers without download or install'
 
 reset_case absent
 rm "$REPO_ROOT/packages/herdr.yaml"
@@ -257,6 +320,8 @@ HERDR_TEST_PATH="$TMP/shadow:$HERDR_TEST_PATH"
 run_module
 contains "PATH shadow: $TMP/shadow/herdr (0.10.0)"
 contains "fleet destination $HOME/.local/bin/herdr (0.8.2)"
+contains 'shadows the fleet binary for tools that put Homebrew first'
+contains "consider 'brew uninstall herdr'"
 [[ "$(sha256_of "$TMP/shadow/herdr")" == "$SHADOW_BEFORE" ]] || fail 'shadow modified'
 [[ "$("$HOME/.local/bin/herdr" --version)" == 'herdr 0.9.3' ]] || fail 'version decision used shadow'
 pass 'PATH shadow warning includes both paths/versions; destination alone determines upgrade'
@@ -268,7 +333,7 @@ HERDR_TEST_PATH="$TMP/shadow:$HERDR_TEST_PATH"
 HERDR_TEST_SESSIONS=named
 run_module
 [[ ! -e "$HOME/.local/bin/herdr" ]] || fail 'fresh destination installed alongside running shadow'
-no_download; contains 'upgrade deferred'
+no_download; contains 'installed none, floor 0.9.3'; contains 'upgrade deferred'
 pass 'running shadow copy defers even when fleet destination is absent'
 
 for previous in 0.8.2 absent; do

@@ -1,0 +1,2 @@
+name                 status   directory                                        socket
+default              stopped  /root/.hermes/cache/scratch/herdr093/iso/.config/herdr /root/.hermes/cache/scratch/herdr093/iso/.config/herdr/herdr.sock

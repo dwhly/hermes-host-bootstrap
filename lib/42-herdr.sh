@@ -43,16 +43,31 @@ install_dir="$HOME/.local/bin"
 
 herdr_version() {
   local output
-  output="$("$1" --version 2>/dev/null)" || return 1
+  output="$("$1" --version </dev/null 2>/dev/null)" || return 1
   [[ "$output" =~ ^herdr[[:space:]]+([0-9]+(\.[0-9]+)*)[[:space:]]*$ ]] || return 1
   printf '%s\n' "${BASH_REMATCH[1]}"
 }
 
-# Both probes must establish idleness. Unsupported session-list commands and
-# unfamiliar output fail closed; pgrep covers named servers and other clients.
+# A process owned by any user defers, even if no binary is currently on PATH.
+herdr_processes_idle() {
+  local process_status
+  if pgrep -x herdr >/dev/null 2>&1; then
+    return 1
+  else
+    process_status=$?
+    [[ "$process_status" -eq 1 ]]
+  fi
+}
+
+# Both probes must establish idleness when a binary is available. Unsupported
+# session-list commands and unfamiliar output fail closed.
 herdr_idle() {
-  local binary="$1" sessions idle=1 process_status uid
-  if sessions="$("$binary" session list 2>/dev/null)"; then
+  local binary="$1" sessions idle=1
+  if [[ -z "$binary" ]]; then
+    herdr_processes_idle
+    return
+  fi
+  if sessions="$("$binary" session list </dev/null 2>/dev/null)"; then
     if printf '%s\n' "$sessions" | awk '
       BEGIN { known=0; unsafe=0; status_col=2 }
       {
@@ -76,13 +91,7 @@ herdr_idle() {
       idle=0
     fi
   fi
-  uid="$(id -u)" || return 1
-  if pgrep -u "$uid" -x herdr >/dev/null 2>&1; then
-    idle=1
-  else
-    process_status=$?
-    [[ "$process_status" -eq 1 ]] || idle=1
-  fi
+  herdr_processes_idle || idle=1
   return "$idle"
 }
 
@@ -93,7 +102,7 @@ herdr_defer() {
 # Failure/deferral returns nonzero; existing installs retain their usual setup below.
 herdr_ensure_floor() {
   local target="$install_dir/herdr" floor source destination verify record_id
-  local installed=absent path_binary path_version activity_binary=""
+  local installed=none path_binary path_version activity_binary=""
   local os_tag arch_tag asset digest actual url staged
   # The destination is a literal scalar in the record; do not expand its tilde.
   # shellcheck disable=SC2088
@@ -113,14 +122,14 @@ herdr_ensure_floor() {
   path_binary="$(command -v herdr || true)"
   if [[ -n "$path_binary" && "$path_binary" != "$target" ]]; then
     path_version="$(herdr_version "$path_binary")" || path_version=unknown
-    warn "herdr: PATH shadow: $path_binary ($path_version); fleet destination $target ($installed). Adjust PATH to use the fleet binary."
+    warn "herdr: PATH shadow: $path_binary ($path_version); fleet destination $target ($installed). A copy at $path_binary shadows the fleet binary for tools that put Homebrew first; if stale, consider 'brew uninstall herdr'."
     [[ -n "$activity_binary" ]] || activity_binary="$path_binary"
   fi
   if [[ "$installed" == unknown ]]; then
     warn "herdr: unparsable installed version at $target (floor $floor) — leaving binary untouched"
     return 1
   fi
-  if [[ "$installed" != absent ]] && ! version_lt "$installed" "$floor"; then
+  if [[ "$installed" != none ]] && ! version_lt "$installed" "$floor"; then
     skip "herdr $installed meets floor $floor"
     return 0
   fi
@@ -144,7 +153,7 @@ herdr_ensure_floor() {
     warn "herdr: missing/invalid asset or digest for $os_tag/$arch_tag — leaving binaries untouched"
     return 1
   fi
-  if [[ -n "$activity_binary" ]] && ! herdr_idle "$activity_binary"; then
+  if ! herdr_idle "$activity_binary"; then
     herdr_defer "$installed" "$floor"
     return 1
   fi
@@ -155,7 +164,7 @@ herdr_ensure_floor() {
     warn "herdr: cannot stage in $install_dir — leaving binary untouched"
     return 1
   fi
-  if ! curl -fsSL "$url" -o "$staged" || [[ ! -s "$staged" ]]; then
+  if ! curl -fsSL --connect-timeout 20 --max-time 300 "$url" -o "$staged" || [[ ! -s "$staged" ]]; then
     rm -f "$staged"
     warn "herdr: download failed ($url) — leaving binary untouched"
     return 1
@@ -171,12 +180,12 @@ herdr_ensure_floor() {
     return 1
   fi
   # Recheck after the download so a newly started session also causes deferral.
-  if [[ -n "$activity_binary" ]] && ! herdr_idle "$activity_binary"; then
+  if ! herdr_idle "$activity_binary"; then
     rm -f "$staged"
     herdr_defer "$installed" "$floor"
     return 1
   fi
-  if [[ "$installed" != absent ]]; then
+  if [[ "$installed" != none ]]; then
     if ! cp -p "$target" "$staged.prev" || ! mv -f "$staged.prev" "$target.prev"; then
       rm -f "$staged" "$staged.prev"
       warn "herdr: could not save $target.prev — leaving binary untouched"
@@ -190,7 +199,7 @@ herdr_ensure_floor() {
   fi
   if ! actual="$(herdr_version "$target")" || [[ "$actual" != "$floor" ]]; then
     warn "herdr: post-install --version failed — restoring previous binary"
-    if [[ "$installed" != absent ]]; then
+    if [[ "$installed" != none ]]; then
       mv -f "$target.prev" "$target" || warn "herdr: restore failed; restore $target.prev manually"
     else
       rm -f "$target" || warn "herdr: could not remove failed fresh install at $target"
