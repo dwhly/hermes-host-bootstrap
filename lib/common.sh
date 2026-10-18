@@ -29,6 +29,8 @@ detect_os() {
 }
 
 OS="$(detect_os)"
+# Used by the modules that source this file.
+# shellcheck disable=SC2034
 ARCH="$(uname -m)"
 
 # macOS noninteractive shells (ssh host 'cmd', launchd, bootstrap reruns) often
@@ -101,6 +103,51 @@ role_includes() {
 # ── Idempotency primitives ──────────────────────────────────────────
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Flat package records: one unquoted scalar per key; reject missing/duplicate keys.
+pkg_field() {
+  local id="$1" key="$2" root value
+  [[ "$id" =~ ^[a-z0-9_-]+$ && "$key" =~ ^[a-z0-9_]+$ ]] || return 1
+  root="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  [[ -r "$root/packages/$id.yaml" ]] || return 1
+  [[ "$(grep -c "^${key}:" "$root/packages/$id.yaml")" == 1 ]] || return 1
+  value="$(sed -n "s/^${key}:[[:space:]]*//p" "$root/packages/$id.yaml" |
+    sed 's/[[:space:]]#.*$//; s/[[:space:]]*$//')" || return 1
+  [[ -n "$value" && "$value" != *$'\n'* ]] || return 1
+  printf '%s\n' "$value"
+}
+
+version_valid() { [[ "$1" =~ ^[0-9]+(\.[0-9]+)*$ ]]; }
+
+# Numeric dotted comparison; missing components are zero. Invalid input returns 2.
+# Compare component lengths/text to avoid integer overflow and octal interpretation.
+version_lt() {
+  version_valid "$1" && version_valid "$2" || return 2
+  local -a left right
+  local IFS=. i a b LC_ALL=C
+  read -r -a left <<< "$1"
+  read -r -a right <<< "$2"
+  for ((i=0; i<${#left[@]} || i<${#right[@]}; i++)); do
+    a="${left[i]:-0}"; b="${right[i]:-0}"
+    while [[ ${#a} -gt 1 && "$a" == 0* ]]; do a="${a#0}"; done
+    while [[ ${#b} -gt 1 && "$b" == 0* ]]; do b="${b#0}"; done
+    [[ ${#a} -lt ${#b} ]] && return 0
+    [[ ${#a} -gt ${#b} ]] && return 1
+    [[ "$a" < "$b" ]] && return 0
+    [[ "$a" > "$b" ]] && return 1
+  done
+  return 1
+}
+
+sha256_of() {
+  local digest
+  if [[ "$OS" == macos ]]; then
+    digest="$(shasum -a 256 "$1")" || return 1
+  else
+    digest="$(sha256sum "$1")" || return 1
+  fi
+  printf '%s\n' "${digest%% *}"
+}
+
 # apt_install — install only packages that aren't already installed
 apt_install() {
   local missing=()
@@ -144,7 +191,8 @@ ensure_line() {
 backup_once() {
   local f="$1"
   [[ -f "$f" ]] || return 0
-  local bak="${f}.bak.$(date +%Y%m%d)"
+  local bak
+  bak="${f}.bak.$(date +%Y%m%d)"
   if [[ ! -f "$bak" ]]; then
     sudo cp -a "$f" "$bak"
     ok "backed up $f → $bak"

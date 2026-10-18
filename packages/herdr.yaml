@@ -1,0 +1,17 @@
+# Interim currency record; release-convergence manifest adapters (order 8) will consume it.
+# Move the fleet target by bumping minimum_version (+ digests) in a reviewed commit.
+id: herdr
+tier: R
+skip_key: herdr
+minimum_version: 0.9.3
+source: github-release ogulcancelik/herdr
+destination: ~/.local/bin/herdr
+verify: --version
+asset_linux_aarch64: herdr-linux-aarch64
+sha256_linux_aarch64: 4de7aa3e25678812e92960de64f7c2aaa1bca1f0f80a3c5e559837e231e1f5c0
+asset_linux_x86_64: herdr-linux-x86_64
+sha256_linux_x86_64: 18a8dc65f1c2fa485884344356dea1cfd911c6f06cf46fa78e193f4087f4dba7
+asset_macos_aarch64: herdr-macos-aarch64
+sha256_macos_aarch64: 5173a3e0ae42d5d1ab7ebfa5d5e6329f7c3d23f8e1a3677c7ce3231da2884157
+asset_macos_x86_64: herdr-macos-x86_64
+sha256_macos_x86_64: db62d548ff3e832b087a96b1894a08d26be3905f1830309cd556783f215d4054

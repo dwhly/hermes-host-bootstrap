@@ -44,6 +44,12 @@ AGENT
     release-binary installer → ~/.local/bin; run `fabric --setup` per host for keys)
   + Herdr agent multiplexer (ogulcancelik/herdr; "tmux for AI agents"; per-host
     release binary → ~/.local/bin; also symlinks the experimental hmw-herdr launcher)
+    Bootstrap enforces the reviewed minimum_version in packages/herdr.yaml using
+    an exact release and verified digest; newer installed versions stay in place.
+    Upgrades defer while any Herdr session/process is running (including named
+    sessions), or activity cannot be determined. Use `herdr update --handoff` in
+    an operator window, or stop sessions and re-run `bootstrap.sh --only=42-herdr`.
+    This interim floor runs only with bootstrap; it adds no background updater.
   + Hermes native Bot API defaults (authenticated OpenAI-compatible native gateway API
     on the host's Tailscale IPv4 only; preserves existing API_SERVER_KEY, writes
     restart-pending evidence when config changes, and restarts only through explicit

@@ -11,6 +11,8 @@ jobs:
         with:
           python-version: '3.9'
       - run: python -m pip install 'pytest<9'
+      - name: Herdr floor (offline stubs)
+        run: bash tests/test_herdr_floor.sh
       # The Step 0 trust checks correctly refuse non-root-owned paths, and the converger/closure run as root on real hosts,
       # so run the suite as root, exactly like production. No test-only trust bypass exists or should be added.
       # "$(command -v python)" pins the setup-python 3.9 interpreter under sudo.
@@ -22,6 +24,12 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Herdr floor on macOS Bash 3.2 (offline stubs)
+        run: |
+          /bin/bash -n lib/42-herdr.sh lib/common.sh
+          # Bash parses only the first filename; check common.sh separately too.
+          /bin/bash -n lib/common.sh
+          /bin/bash tests/test_herdr_floor.sh
       - run: |
           /bin/sh --version | head -1
           fail=0
