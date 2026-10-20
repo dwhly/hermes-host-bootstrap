@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# hermes-llm — start/stop the host-local llama.cpp server that Hermes uses as
+# its LAST fallback provider (offline / cloud-outage resilience).
+#
+# Symlinked to ~/.local/bin/hermes-llm by lib/99-register-host.sh.
+# Aliased to `llm-on` / `llm-off` in dotfiles/aliases.sh.
+#
+# The server is a launchd job (macOS) defined by a host-local plist, by
+# default ~/models/launchd/local.llama-server.plist (model path + flags live
+# there because they are sized to this host's RAM). Hermes reaches it at
+# http://127.0.0.1:8080/v1 via the `custom` entry at the end of
+# fallback_providers and the `local` model alias (/model local).
+#
+# Usage:
+#   hermes-llm on              start (or keep) the server, wait until healthy
+#   hermes-llm off             stop it and free its memory
+#   hermes-llm restart         reload the plist (apply flag edits) and start
+#   hermes-llm status          health, pid, wired memory, autostart, flags
+#   hermes-llm autostart on    also start it at every login (always ready,
+#                              always costs its RAM)
+#   hermes-llm autostart off   back to on-demand only
+#
+# Env overrides: HERMES_LLM_PLIST, HERMES_LLM_URL (default http://127.0.0.1:8080)
+#
+# Must be run from your own shell: Hermes' gateway deliberately refuses
+# `launchctl bootstrap` from inside an agent session.
+
+set -euo pipefail
+
+PLIST="${HERMES_LLM_PLIST:-$HOME/models/launchd/local.llama-server.plist}"
+URL="${HERMES_LLM_URL:-http://127.0.0.1:8080}"
+LABEL="local.llama-server"
+AGENT_PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+DOMAIN="gui/$(id -u)"
+
+die() { echo "hermes-llm: $*" >&2; exit 1; }
+
+[[ "$(uname -s)" == "Darwin" ]] || die "macOS (launchd) only on this version."
+[[ -f "$PLIST" ]] || die "no server plist at $PLIST (set HERMES_LLM_PLIST)."
+
+wired_gb() { vm_stat | awk '/Pages wired down/{printf "%.1f", $NF*16384/1e9}'; }
+healthy()  { curl -s -m 2 "$URL/health" 2>/dev/null | grep -q '"ok"'; }
+loaded()   { launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; }
+running_pid() { launchctl print "$DOMAIN/$LABEL" 2>/dev/null | awk '/^\tpid = /{print $3; exit}'; }
+
+# The plist launchd should load: the LaunchAgents copy when autostart is on.
+active_plist() { [[ -f "$AGENT_PLIST" ]] && echo "$AGENT_PLIST" || echo "$PLIST"; }
+
+sync_agent_copy() {
+  # Keep the login copy identical to the source plist so flag edits apply.
+  if [[ -f "$AGENT_PLIST" ]] && ! cmp -s "$PLIST" "$AGENT_PLIST"; then
+    cp "$PLIST" "$AGENT_PLIST"
+  fi
+}
+
+wait_healthy() {
+  for _ in $(seq 1 90); do
+    healthy && return 0
+    loaded || die "server exited during load — see ~/Library/Logs/llama-server.log"
+    sleep 2
+  done
+  die "not healthy after 180 s — see ~/Library/Logs/llama-server.log"
+}
+
+cmd_on() {
+  sync_agent_copy
+  if healthy; then echo "already running (pid $(running_pid))."; return 0; fi
+  local before; before=$(wired_gb)
+  if loaded; then
+    launchctl kickstart "$DOMAIN/$LABEL"
+  else
+    launchctl bootstrap "$DOMAIN" "$(active_plist)"
+  fi
+  echo -n "loading model…"
+  wait_healthy
+  echo " ok. pid $(running_pid); wired memory ${before} → $(wired_gb) GB."
+  echo "Hermes fallback: $URL/v1   manual: /model local"
+}
+
+cmd_off() {
+  if loaded; then launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true; fi
+  for _ in 1 2 3 4 5; do healthy || break; sleep 1; done
+  healthy && die "still answering on $URL — another llama-server is bound there."
+  echo "stopped. wired memory now $(wired_gb) GB."
+}
+
+cmd_status() {
+  if healthy; then echo "server:    UP ($URL, pid $(running_pid))"; else echo "server:    down"; fi
+  if loaded; then echo "launchd:   loaded"; else echo "launchd:   not loaded"; fi
+  if [[ -f "$AGENT_PLIST" ]]; then echo "autostart: on (login)"; else echo "autostart: off (on-demand)"; fi
+  echo "wired mem: $(wired_gb) GB"
+  echo "plist:     $PLIST"
+  /usr/bin/plutil -extract ProgramArguments json -o - "$PLIST" 2>/dev/null \
+    | tr -d '[]"' | tr ',' ' ' | sed 's/^/flags:     /'
+  echo
+}
+
+cmd_autostart() {
+  case "${1:-}" in
+    on)
+      mkdir -p "$HOME/Library/LaunchAgents"
+      cp "$PLIST" "$AGENT_PLIST"
+      echo "autostart on: $AGENT_PLIST (starts at every login)."
+      ;;
+    off)
+      rm -f "$AGENT_PLIST"
+      echo "autostart off: starts only with 'hermes-llm on' (llm-on)."
+      ;;
+    *) die "usage: hermes-llm autostart on|off" ;;
+  esac
+}
+
+case "${1:-status}" in
+  on|start)      cmd_on ;;
+  off|stop)      cmd_off ;;
+  restart)       cmd_off; cmd_on ;;
+  status)        cmd_status ;;
+  autostart)     shift; cmd_autostart "${1:-}" ;;
+  -h|--help|help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command '$1' (try --help)" ;;
+esac

@@ -328,6 +328,19 @@ if [[ -f "$REPO_ROOT/scripts/hermes-wiki" ]]; then
   ok "hermes-wiki → $TARGET_LINK"
 fi
 
+# ── Install hermes-llm on PATH ─────────────────────────────────────────
+# Starts/stops the host-local llama.cpp server Hermes uses as its last
+# fallback provider (offline resilience). Aliased to `llm-on` / `llm-off`.
+if [[ -f "$REPO_ROOT/scripts/hermes-llm" ]]; then
+  mkdir -p "$HOME/.local/bin"
+  TARGET_LINK="$HOME/.local/bin/hermes-llm"
+  if [[ -L "$TARGET_LINK" || -f "$TARGET_LINK" ]]; then
+    rm -f "$TARGET_LINK"
+  fi
+  ln -s "$REPO_ROOT/scripts/hermes-llm" "$TARGET_LINK"
+  ok "hermes-llm → $TARGET_LINK"
+fi
+
 # ── Install hermes-tui-theme-patch on PATH ─────────────────────────────
 # Restores the legible (bright-fg, no pale fill) diff colors in the Hermes
 # Ink TUI and rebuilds the bundle. Re-run after every `hermes update` (which

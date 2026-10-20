@@ -27,6 +27,9 @@ alias hmw='hermes-workspace'
 alias hmwiki='hermes-wiki'
 alias hmreset='hermes-terminal-reset'
 alias hmx='hermes-exit'
+# Local fallback LLM (llama.cpp via launchd) — see `hermes-llm --help`.
+alias llm-on='hermes-llm on'
+alias llm-off='hermes-llm off'
 # ── END hermes ──
 
 # ── BEGIN git ──
