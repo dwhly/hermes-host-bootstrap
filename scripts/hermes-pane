@@ -68,14 +68,45 @@ if [[ -z "$HERMES_BIN" ]]; then
   exec "${SHELL:-/bin/bash}"
 fi
 
-# Find the hermes venv interpreter + project root so we can import the session
-# store. The `hermes` on PATH is usually a tiny launcher shim that execs the
-# real venv binary (e.g. /usr/local/bin/hermes -> .../hermes-agent/venv/bin/hermes,
-# or ~/.local/bin/hermes on the Macs). Parse the shim to locate the venv, then
-# derive the project root (where hermes_state.py lives). Falls back gracefully.
+# Find the hermes interpreter + project root so we can import the session store.
+#
+# Hermes 0.21+ installs a MANAGED launcher: `hermes` on PATH is a one-line shim
+# (`exec <root>/.hermes/bin/hermes "$@"`) whose target execs a bundled store
+# Python with `-I -c <bootstrap>`. That Python has no site-packages of its own;
+# the bootstrap (`import hermes_bootstrap`) wires them up. Such launchers answer
+# `--print-runtime-command` with a JSON argv: [<python>, "-I", "-c", "...
+# sys.path.insert(0, '<root>') ..."]. Ask the launcher instead of parsing it.
+# Only ask a launcher that names the flag: an older `hermes` would treat it as
+# an ordinary CLI argument and could start a chat.
+#
+# Older installs: the shim execs a venv binary (e.g. /usr/local/bin/hermes ->
+# .../hermes-agent/venv/bin/hermes). Parse the shim to locate the venv, then
+# derive the project root (where hermes_state.py lives).
+HERMES_MANAGED=0
+launcher_supports_runtime_command() {
+  local shim="$1" target
+  grep -q -- '--print-runtime-command' "$shim" 2>/dev/null && return 0
+  target="$(sed -nE 's/^exec "?([^" ]+)"? .*/\1/p' "$shim" 2>/dev/null | head -1)"
+  [[ -n "$target" && -f "$target" ]] && grep -q -- '--print-runtime-command' "$target" 2>/dev/null
+}
+
 resolve_hermes_internals() {
-  local shim real venv_hermes
+  local shim real venv_hermes runtime py root
   shim="$HERMES_BIN"
+  HERMES_VENV_PY=""
+  HERMES_PROOT=""
+  HERMES_MANAGED=0
+  if launcher_supports_runtime_command "$shim"; then
+    runtime="$("$HERMES_BIN" --print-runtime-command </dev/null 2>/dev/null)"
+    py="$(printf '%s' "$runtime" | sed -nE 's/^\["([^"]+)".*/\1/p')"
+    root="$(printf '%s' "$runtime" | sed -nE "s/.*sys\.path\.insert\(0, '([^']+)'\).*/\1/p")"
+    if [[ -x "$py" && -f "$root/hermes_state.py" ]]; then
+      HERMES_VENV_PY="$py"
+      HERMES_PROOT="$root"
+      HERMES_MANAGED=1
+      return 0
+    fi
+  fi
   # Follow a one-line `exec "<path>/venv/bin/hermes"` shim if present.
   venv_hermes="$(grep -oE '"[^"]*venv/bin/hermes"' "$shim" 2>/dev/null | head -1 | tr -d '"')"
   if [[ -z "$venv_hermes" ]]; then
@@ -91,8 +122,40 @@ resolve_hermes_internals() {
 # Resolve this pane's most-recent session id via the session store. We query
 # the DB directly (SessionDB.search_sessions is ordered most-recent-first);
 # the `sessions list` TABLE is NOT reliably recency-ordered, so don't parse it.
+# Exit status: 0 = the lookup ran (id printed, or nothing for a new label);
+# nonzero = the lookup could not run. Callers must not read a failed lookup as
+# "no prior session".
 resolve_last_session() {
-  [[ -x "${HERMES_VENV_PY:-}" && -f "${HERMES_PROOT:-}/hermes_state.py" ]] || return 0
+  [[ -x "${HERMES_VENV_PY:-}" && -f "${HERMES_PROOT:-}/hermes_state.py" ]] || return 2
+  if [[ "$HERMES_MANAGED" == 1 ]]; then
+    # Managed store Python: isolated mode, then the same bootstrap the launcher
+    # runs so Hermes' dependencies are importable.
+    "$HERMES_VENV_PY" -I - "$SOURCE_TAG" "$HERMES_PROOT" <<'PY' 2>/dev/null
+import os, sys
+src, root = sys.argv[1], sys.argv[2]
+try:
+    sys.path.insert(0, root)
+    if not os.environ.get("HERMES_HOME"):
+        from hermes_constants import get_default_hermes_root
+        os.environ["HERMES_HOME"] = str(get_default_hermes_root())
+    import hermes_bootstrap  # noqa: F401  (wires up Hermes' site-packages)
+    from hermes_state import SessionDB
+except Exception:
+    sys.exit(3)
+try:
+    db = SessionDB()
+    rows = db.search_sessions(source=src, limit=1)
+    if rows:
+        print(rows[0]["id"])
+    try:
+        db.close()
+    except Exception:
+        pass
+except Exception:
+    sys.exit(3)
+PY
+    return
+  fi
   ( cd "$HERMES_PROOT" && "$HERMES_VENV_PY" - "$SOURCE_TAG" <<'PY' 2>/dev/null
 import sys
 # Exit 3 on ANY lookup error: --print-resume-id must tell "found nothing"
@@ -142,11 +205,20 @@ elif [[ -n "$RESUME_ID" ]]; then
 else
   resolve_hermes_internals
   LAST_ID="$(resolve_last_session)"
+  LOOKUP_RC=$?
+  if [[ "$LOOKUP_RC" != 0 ]]; then
+    LAST_ID=""
+    echo "hermes-pane[$LABEL]: WARNING could not look up this pane's previous session (lookup exit $LOOKUP_RC)." >&2
+    echo "  Starting fresh. Your earlier conversation is still in the session store; resume it with" >&2
+    echo "  HMW_RESUME_ID=<session id> hermes-pane $LABEL" >&2
+  fi
 fi
 
 if [[ -n "${LAST_ID:-}" ]]; then
   echo "hermes-pane[$LABEL]: resuming session $LAST_ID"
   "$HERMES_BIN" chat --source "$SOURCE_TAG" --resume "$LAST_ID"
+elif [[ "${LOOKUP_RC:-0}" != 0 ]]; then
+  "$HERMES_BIN" chat --source "$SOURCE_TAG"
 else
   echo "hermes-pane[$LABEL]: no prior session for source '$SOURCE_TAG' — starting fresh"
   "$HERMES_BIN" chat --source "$SOURCE_TAG"
