@@ -79,6 +79,10 @@ cmd_on() {
 
 cmd_off() {
   if loaded; then launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true; fi
+  # bootout is asynchronous: the label stays registered while the job tears
+  # down. Wait for it to vanish, or a following `on` would kickstart a dying job.
+  for _ in $(seq 1 20); do loaded || break; sleep 0.5; done
+  loaded && die "launchd job $LABEL still loaded after 10 s."
   for _ in 1 2 3 4 5; do healthy || break; sleep 1; done
   healthy && die "still answering on $URL — another llama-server is bound there."
   echo "stopped. wired memory now $(wired_gb) GB."
