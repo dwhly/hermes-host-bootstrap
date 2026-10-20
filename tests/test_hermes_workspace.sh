@@ -132,6 +132,29 @@ cat >"$FAKE_BIN/ssh" <<'EOF'
 printf 'ssh' >>"$HMW_STUB_LOG"
 for arg in "$@"; do printf '\t%s' "$arg" >>"$HMW_STUB_LOG"; done
 printf '\n' >>"$HMW_STUB_LOG"
+# Scripted link behaviour for the reconnect tests. SSH_SEQ_FILE: one line per
+# interactive (-t) session, "<exit status> [seconds to stay connected]".
+# SSH_PROBE_FAILS_FILE: how many reconnect probes fail before one succeeds.
+if [ -n "${SSH_SEQ_FILE:-}" ]; then
+  case " $* " in
+    *" ConnectionAttempts=1 "*)
+      n=$(cat "$SSH_PROBE_FAILS_FILE" 2>/dev/null || echo 0)
+      if [ "${n:-0}" -gt 0 ]; then
+        printf '%s\n' "$((n - 1))" >"$SSH_PROBE_FAILS_FILE"
+        exit 255
+      fi
+      exit 0 ;;
+    *" -t "*)
+      line=$(head -n 1 "$SSH_SEQ_FILE")
+      tail -n +2 "$SSH_SEQ_FILE" >"$SSH_SEQ_FILE.next"
+      mv "$SSH_SEQ_FILE.next" "$SSH_SEQ_FILE"
+      [ -n "$line" ] || exit 0
+      # shellcheck disable=SC2086
+      set -- $line
+      [ -z "${2:-}" ] || /bin/sleep "$2"
+      exit "$1" ;;
+  esac
+fi
 if [ "${SSH_EXECUTE:-0}" = 1 ]; then
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -432,7 +455,7 @@ test_remote_dispatch_and_reentry() {
     *) fail 'remote command explicitly invokes sh -c'; return 1 ;;
   esac
   assert_not_contains "$LOG" $'\t-t\t' 'verify mode omits ssh -t' || return 1
-  assert_contains "$LOG" $'ssh\t-o\tServerAliveInterval=60\t-o\tServerAliveCountMax=3\t' 'remote dispatch enables application keepalives' || return 1
+  assert_contains "$LOG" $'ssh\t-o\tServerAliveInterval=15\t-o\tServerAliveCountMax=16\t' 'remote dispatch enables application keepalives (~4 min outage tolerance)' || return 1
 
   reset_state
   printf 'H1\n' >"$HERDR_NAMES_FILE"
@@ -943,6 +966,89 @@ test_failure_explanations() {
   pass 'failures explain why (registry, auth, timeout, remote launcher)'
 }
 
+test_drop_reattach() {
+  local status seq="$TEST_TMP/ssh.seq" fails="$TEST_TMP/probe.fails"
+
+  # A long session that drops (255) is reattached once SSH answers again.
+  reset_state
+  printf '255\n0\n' >"$seq"; printf '1\n' >"$fails"
+  set +e
+  run_core env HMW_BACKEND=herdr STUB_HOSTNAME=origin HMW_DROP_SECONDS=0 \
+    SSH_SEQ_FILE="$seq" SSH_PROBE_FAILS_FILE="$fails" "$CORE" remote 1
+  status=$?
+  set -e
+  assert_eq 0 "$status" 'reattached session exits with the final session status' || return 1
+  assert_line_count 2 "$LOG" $'\t-t\t' 'drop then reattach opens two interactive sessions' || return 1
+  assert_line_count 2 "$LOG" 'ConnectionAttempts=1' 'waits with bounded probes until SSH answers' || return 1
+  assert_contains "$SLEEP_LOG" '2' 'backs off between failed probes' || return 1
+  assert_contains "$STDERR_FILE" 'dropped after' 'drop is announced' || return 1
+  assert_contains "$STDERR_FILE" 'reattaching to remote' 'reattach is announced' || return 1
+  assert_not_contains "$STDERR_FILE" 'could not open the workspace' 'a reattached drop is not reported as a failure' || return 1
+
+  # A quick 255 on the FIRST attempt is a connect/auth failure: explain, no loop.
+  reset_state
+  printf '255\n0\n' >"$seq"; printf '0\n' >"$fails"
+  set +e
+  run_core env HMW_BACKEND=herdr STUB_HOSTNAME=origin \
+    SSH_SEQ_FILE="$seq" SSH_PROBE_FAILS_FILE="$fails" "$CORE" remote 1
+  status=$?
+  set -e
+  assert_eq 255 "$status" 'first-attempt failure keeps ssh status' || return 1
+  assert_line_count 1 "$LOG" $'\t-t\t' 'first-attempt failure is not retried' || return 1
+  assert_contains "$STDERR_FILE" 'could not open the workspace on remote' 'first-attempt failure is explained' || return 1
+
+  # HMW_RECONNECT=0 restores the old behaviour: report the drop and stop.
+  reset_state
+  printf '255\n0\n' >"$seq"; printf '0\n' >"$fails"
+  set +e
+  run_core env HMW_BACKEND=herdr STUB_HOSTNAME=origin HMW_DROP_SECONDS=0 HMW_RECONNECT=0 \
+    SSH_SEQ_FILE="$seq" SSH_PROBE_FAILS_FILE="$fails" "$CORE" remote 1
+  status=$?
+  set -e
+  assert_eq 255 "$status" 'opt-out keeps the drop status' || return 1
+  assert_line_count 1 "$LOG" $'\t-t\t' 'opt-out does not reattach' || return 1
+  assert_contains "$STDERR_FILE" 'rerun hmw to reattach' 'opt-out tells the user how to reattach' || return 1
+
+  # A link that keeps failing right after reattach stops after 3 quick drops.
+  reset_state
+  printf '255 1\n255\n255\n255\n0\n' >"$seq"; printf '0\n' >"$fails"
+  set +e
+  run_core env HMW_BACKEND=herdr STUB_HOSTNAME=origin HMW_DROP_SECONDS=1 \
+    SSH_SEQ_FILE="$seq" SSH_PROBE_FAILS_FILE="$fails" "$CORE" remote 1
+  status=$?
+  set -e
+  assert_eq 255 "$status" 'flapping link ends with the ssh status' || return 1
+  assert_line_count 4 "$LOG" $'\t-t\t' 'one long drop plus three quick drops, then stop' || return 1
+  assert_contains "$STDERR_FILE" 'could not open the workspace on remote' 'flapping link is explained' || return 1
+
+  # HMW_RECONNECT_MAX_WAIT bounds the wait for a host that never comes back.
+  reset_state
+  printf '255\n0\n' >"$seq"; printf '99\n' >"$fails"
+  set +e
+  run_core env HMW_BACKEND=herdr STUB_HOSTNAME=origin HMW_DROP_SECONDS=0 HMW_RECONNECT_MAX_WAIT=5 \
+    SSH_SEQ_FILE="$seq" SSH_PROBE_FAILS_FILE="$fails" "$CORE" remote 1
+  status=$?
+  set -e
+  assert_eq 255 "$status" 'giving up keeps the drop status' || return 1
+  assert_line_count 1 "$LOG" $'\t-t\t' 'never reattaches to an unreachable host' || return 1
+  assert_contains "$STDERR_FILE" 'gave up waiting for remote after 5s' 'give-up is announced' || return 1
+  assert_eq $'2\n4' "$(cat "$SLEEP_LOG")" 'back-off doubles until the wait budget is spent' || return 1
+  pass 'dropped sessions reattach automatically (bounded, opt-out, flap-safe)'
+}
+
+test_terminal_reset_sends_no_queries() {
+  local out="$TEST_TMP/reset.out"
+  TERM=dumb bash "$ROOT/scripts/hermes-terminal-reset" --no-clear >"$out" 2>/dev/null </dev/null
+  # CSI ... c (Device Attributes), CSI 5n/6n (status/cursor reports) all make
+  # the terminal answer into the user's shell.
+  if LC_ALL=C grep -aqE $'\033\\[[0-9;>=]*c|\033\\[[56]n' "$out"; then
+    fail 'terminal reset must not send terminal queries'
+    return 1
+  fi
+  assert_contains "$out" $'\033[<u' 'terminal reset still pops Kitty keyboard mode' || return 1
+  pass 'terminal reset sends no terminal queries (no stray 62;22;52c)'
+}
+
 main() {
   local test
   set -e
@@ -959,7 +1065,9 @@ main() {
     test_herdr_add_only_json_and_verify \
     test_herdr_concurrent_start_reconciliation \
     test_wrapper_forwarding \
-    test_failure_explanations; do
+    test_failure_explanations \
+    test_drop_reattach \
+    test_terminal_reset_sends_no_queries; do
     if ! "$test"; then
       printf 'FAILED: %s\n' "$test" >&2
       exit 1

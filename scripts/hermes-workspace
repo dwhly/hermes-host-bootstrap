@@ -174,7 +174,7 @@ report_failure() {
   EXPLAIN_REASON=""; EXPLAIN_FIX=""; EXPLAIN_PROBE=""
   if [ "$status" -eq 255 ]; then
     if [ "$VERIFY" != "1" ] && [ "$elapsed" -ge "${HMW_DROP_SECONDS:-30}" ]; then
-      hmw_note "connection to ${REQUEST_HOST} dropped after ${elapsed}s (network change or sleep). The workspace is still running there — rerun hmw to reattach."
+      hmw_note "connection to ${REQUEST_HOST} dropped after ${elapsed}s (network change or sleep). The workspace is still running there — rerun hmw to reattach (HMW_RECONNECT=0 disables automatic reattach)."
       return 0
     fi
     explain_ssh_failure
@@ -217,9 +217,84 @@ shell_quote() {
   printf "'%s'" "$value"
 }
 
+# Run a command with a hard wall-clock cap. ssh's ConnectTimeout bounds only the
+# TCP connect; a Tailscale SSH browser check can block indefinitely after that.
+hmw_bounded() {
+  local seconds=$1
+  shift
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'alarm shift; exec @ARGV or exit 127' "$seconds" "$@"
+  else
+    "$@"
+  fi
+}
+
+# Discard bytes the local terminal sent after the remote end stopped reading:
+# replies to terminal queries that were in flight when the link died. Without
+# this they reach the user's shell as typed input (e.g. "62;22;52c").
+hmw_drain_tty_input() {
+  local saved
+  [ -t 0 ] || return 0
+  saved="$(stty -g 2>/dev/null)" || return 0
+  # min 0 time 2: a read returns after 0.2s with no input, which dd treats as EOF.
+  stty -echo -icanon min 0 time 2 2>/dev/null || return 0
+  # Never leave the user's terminal without echo if Ctrl-C lands mid-drain.
+  # shellcheck disable=SC2064
+  trap "stty '$saved' 2>/dev/null; exit 130" INT TERM
+  dd bs=4096 count=16 of=/dev/null 2>/dev/null
+  trap - INT TERM
+  stty "$saved" 2>/dev/null || stty sane 2>/dev/null || :
+}
+
+# After a dropped session, poll until a non-interactive SSH round trip works.
+# Returns 1 only when HMW_RECONNECT_MAX_WAIT (seconds of back-off, 0 = no limit)
+# is used up. Ctrl-C stops hmw.
+hmw_wait_for_target() {
+  local delay=2 waited=0 limit="${HMW_RECONNECT_MAX_WAIT:-0}" probe hinted=0
+  case "$limit" in ''|*[!0-9]*) limit=0 ;; esac
+  while :; do
+    probe="$(hmw_bounded "${HMW_PROBE_TIMEOUT:-15}" ssh -o BatchMode=yes -o ConnectTimeout=8 -o ConnectionAttempts=1 \
+        "$SSH_TARGET" true </dev/null 2>&1)" && return 0
+    # A Tailscale SSH policy check waits for a browser approval that no probe
+    # can give; say so once instead of retrying silently.
+    case "$probe" in
+      *login.tailscale.com*)
+        if [ "$hinted" -eq 0 ]; then
+          hmw_note "Tailscale SSH on ${REQUEST_HOST} wants a browser re-approval; open the link from: ssh $SSH_TARGET true"
+          hinted=1
+        fi ;;
+    esac
+    if [ "$limit" -gt 0 ] && [ "$waited" -ge "$limit" ]; then
+      return 1
+    fi
+    sleep "$delay"
+    waited=$((waited + delay))
+    delay=$((delay * 2))
+    [ "$delay" -le 10 ] || delay=10
+  done
+}
+
+# Undo terminal modes the remote TUI left on the OUTER local terminal.
+hmw_heal_local_terminal() {
+  hmw_drain_tty_input
+  # Herdr/Hermes enable Kitty keyboard + modifyOtherKeys on the OUTER local
+  # terminal. A Broken pipe/SIGHUP skips their normal teardown, leaving the
+  # local shell to receive raw CSI-u key reports. Heal locally after every
+  # interactive Herdr SSH return while preserving ssh's real exit status.
+  if [ "$BACKEND" = "herdr" ]; then
+    if command -v hermes-terminal-reset >/dev/null 2>&1; then
+      hermes-terminal-reset --no-clear
+    else
+      printf '\033[?1016l\033[?1015l\033[?1006l\033[?1003l\033[?1002l\033[?1000l\033[?9l\033[?1004l\033[<u\033[>4m\033[0m\033[?25h'
+      stty sane 2>/dev/null || true
+    fi
+  fi
+}
+
 dispatch_remote() {
-  local payload remote_command ssh_status ssh_started
+  local payload remote_command ssh_status ssh_started elapsed
   local ssh_keepalive_interval ssh_keepalive_count
+  local reconnect reconnecting=0 quick_drops=0 drop_seconds
 
   # shellcheck disable=SC2016
   payload='PATH="$HOME/.local/bin:$PATH"'
@@ -231,10 +306,16 @@ dispatch_remote() {
   fi
   payload+=" hermes-workspace $(shell_quote "$REQUEST_COUNT")"
   remote_command="sh -c $(shell_quote "$payload")"
-  ssh_keepalive_interval="${HMW_SERVER_ALIVE_INTERVAL:-60}"
-  ssh_keepalive_count="${HMW_SERVER_ALIVE_COUNT_MAX:-3}"
+  # Keepalive: probe every 15s, give up after 16 misses (~4 min). Over Tailscale
+  # the peer address survives Wi-Fi changes, so a short outage resumes the same
+  # session instead of dropping it; a dead link is still noticed in minutes.
+  ssh_keepalive_interval="${HMW_SERVER_ALIVE_INTERVAL:-15}"
+  ssh_keepalive_count="${HMW_SERVER_ALIVE_COUNT_MAX:-16}"
   case "$ssh_keepalive_interval" in ''|*[!0-9]*) usage_error 'HMW_SERVER_ALIVE_INTERVAL must be a non-negative decimal' ;; esac
   case "$ssh_keepalive_count" in ''|*[!0-9]*) usage_error 'HMW_SERVER_ALIVE_COUNT_MAX must be a non-negative decimal' ;; esac
+  reconnect="${HMW_RECONNECT:-1}"
+  drop_seconds="${HMW_DROP_SECONDS:-30}"
+  case "$drop_seconds" in ''|*[!0-9]*) drop_seconds=30 ;; esac
 
   if [ "$VERIFY" = "1" ]; then
     ssh -o "ServerAliveInterval=$ssh_keepalive_interval" -o "ServerAliveCountMax=$ssh_keepalive_count" "$SSH_TARGET" "$remote_command"
@@ -242,23 +323,36 @@ dispatch_remote() {
     [ "$ssh_status" -eq 0 ] || report_failure "$ssh_status" 0
     return "$ssh_status"
   else
-    ssh_started=$SECONDS
-    ssh -o "ServerAliveInterval=$ssh_keepalive_interval" -o "ServerAliveCountMax=$ssh_keepalive_count" -t "$SSH_TARGET" "$remote_command"
-    ssh_status=$?
-    # Herdr/Hermes enable Kitty keyboard + modifyOtherKeys on the OUTER local
-    # terminal. A Broken pipe/SIGHUP skips their normal teardown, leaving the
-    # local shell to receive raw CSI-u key reports. Heal locally after every
-    # interactive Herdr SSH return while preserving ssh's real exit status.
-    if [ "$BACKEND" = "herdr" ]; then
-      if command -v hermes-terminal-reset >/dev/null 2>&1; then
-        hermes-terminal-reset --no-clear
+    while :; do
+      ssh_started=$SECONDS
+      ssh -o "ServerAliveInterval=$ssh_keepalive_interval" -o "ServerAliveCountMax=$ssh_keepalive_count" -t "$SSH_TARGET" "$remote_command"
+      ssh_status=$?
+      elapsed=$((SECONDS - ssh_started))
+      hmw_heal_local_terminal
+      # 255 = ssh's own failure (the link), not the remote launcher's status.
+      # The workspace keeps running on the host, so a dropped link (network
+      # change, sleep) is reattached automatically. A quick 255 on the FIRST
+      # attempt is a connect/auth failure and is explained instead; quick drops
+      # after a reattach are retried at most twice in a row.
+      [ "$ssh_status" -eq 255 ] && [ "$reconnect" = "1" ] || break
+      if [ "$elapsed" -lt "$drop_seconds" ]; then
+        [ "$reconnecting" -eq 1 ] || break
+        quick_drops=$((quick_drops + 1))
+        [ "$quick_drops" -lt 3 ] || break
       else
-        printf '\033[?1016l\033[?1015l\033[?1006l\033[?1003l\033[?1002l\033[?1000l\033[?9l\033[?1004l\033[<u\033[>4m\033[0m\033[?25h'
-        stty sane 2>/dev/null || true
+        quick_drops=0
       fi
-    fi
+      reconnecting=1
+      hmw_note "connection to ${REQUEST_HOST} dropped after ${elapsed}s (network change or sleep); reconnecting — Ctrl-C to stop."
+      if ! hmw_wait_for_target; then
+        hmw_note "gave up waiting for ${REQUEST_HOST} after ${HMW_RECONNECT_MAX_WAIT}s."
+        elapsed=0
+        break
+      fi
+      hmw_note "reattaching to ${REQUEST_HOST}."
+    done
     # Explain AFTER the terminal reset so the message survives on screen.
-    [ "$ssh_status" -eq 0 ] || report_failure "$ssh_status" "$((SECONDS - ssh_started))"
+    [ "$ssh_status" -eq 0 ] || report_failure "$ssh_status" "$elapsed"
     return "$ssh_status"
   fi
 }
