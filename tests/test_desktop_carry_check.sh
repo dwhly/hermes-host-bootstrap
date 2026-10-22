@@ -21,7 +21,7 @@ CAND="$(git -C "$U" rev-parse HEAD)"
 git -C "$U" push -q "$FORKB" cand:refs/heads/fleet/desktop-switcher-candidate
 
 export HOME="$W/home"; mkdir -p "$HOME/.local/bin"
-export HERMES_CARRY_CI_DIR="$HOME/build/switcher-ci"
+export HERMES_CARRY_CI_DIR="$HOME/build/switcher-ci" CAND_ID="$CAND"
 ln -s "$NODE" "$HOME/.local/bin/node"
 cat >"$HOME/.local/bin/npm" <<'SH'
 #!/bin/bash
@@ -43,10 +43,15 @@ for m in ${mode//,/ }; do
     runner) rc=1 ;;
     unhandled) echo "Unhandled Error: boom"; rc=1 ;;
     nojson) out="" ; rc=1 ;;
+    undercount) rc=1 ;;
+    hang) exec -a "fake-hang-$CAND_ID" sleep 60 ;;
   esac
 done
 echo " Test Files  1 passed"
-[ -n "$out" ] && echo "{\"testResults\":[${results}]}" >"$out"
+n=$(( $(echo "$results" | grep -o '"assertionResults"' | wc -l) ))
+[ "$mode" = undercount ] && n=$((n + 1))
+[ -n "$results" ] || results='{"name":"'"$PWD"'/src/ok.test.ts","status":"passed","assertionResults":[]}'
+[ -n "$out" ] && echo "{\"numFailedTests\":$n,\"testResults\":[${results}]}" >"$out"
 exit "$rc"
 SH
 chmod +x "$HOME/.local/bin/npm" "$HOME/.local/bin/npx"
@@ -59,7 +64,8 @@ FAKE_VT_CAND=fail:x FAKE_VT_BASE=fail:x run; want "CHECK=pass" "2 shared failure
 FAKE_VT_CAND=fail:x,fail:y FAKE_VT_BASE=fail:x run; want "CHECK=fail reason=tests n=1" "3 candidate-only failure"
 FAKE_VT_CAND=runner run; want "CHECK=fail reason=runner_error" "4 runner error, nothing to compare"
 FAKE_VT_CAND=fail:x,unhandled FAKE_VT_BASE=fail:x run; want "CHECK=fail reason=unhandled_error" "5 candidate-only unhandled error"
-FAKE_VT_CAND=fail:x,unhandled FAKE_VT_BASE=fail:x,unhandled run; want "CHECK=pass" "5b unhandled on both"
+FAKE_VT_CAND=fail:x,unhandled FAKE_VT_BASE=fail:x,unhandled run; want "CHECK=fail reason=unhandled_error" "5b candidate unhandled always blocks"
+FAKE_VT_CAND=undercount run; want "CHECK=fail reason=runner_error" "5c runner count exceeds named failures"
 FAKE_VT_CAND=fail:x FAKE_VT_BASE=nojson run; want "CHECK=error reason=base_vitest_no_results" "6 baseline incomplete"
 FAKE_VT_CAND=nojson run; want "CHECK=error reason=vitest_no_results" "6b candidate incomplete"
 FAKE_TC_RC=2 run; want "CHECK=fail reason=typecheck" "7 typecheck"
@@ -74,6 +80,22 @@ kill "$SLEEPER"; wait "$SLEEPER" 2>/dev/null
 run; want "CHECK=pass" "8b stale lock reclaimed"
 [ -e "$HERMES_CARRY_CI_DIR.lock" ] && fail "8c lock left behind"
 
+# 8d. Stale lock, but a process still works inside the checkout: never reclaimed.
+mkdir "$HERMES_CARRY_CI_DIR.lock"; echo 999999 >"$HERMES_CARRY_CI_DIR.lock/pid"
+( cd "$HERMES_CARRY_CI_DIR/apps/desktop" && exec sleep 30 ) & SLEEPER=$!
+sleep 0.5
+if command -v lsof >/dev/null; then run; want "CHECK=error reason=busy" "8d stale lock with live worker"; fi
+kill "$SLEEPER" 2>/dev/null; wait "$SLEEPER" 2>/dev/null
+run; want "CHECK=pass" "8e reclaimed once idle"
+# 8f. Descendants do not outlive the run: a vitest that hangs is killed when the check is.
+FAKE_VT_CAND=hang bash "$CHECK" "$CAND" "$BASE" "$FORKB" "$UPB" >/dev/null 2>&1 & CP=$!
+for _ in $(seq 1 50); do pgrep -f "fake-hang-$CAND" >/dev/null && break; sleep 0.2; done
+pgrep -f "fake-hang-$CAND" >/dev/null || fail "8f hang never started"
+t0=$SECONDS; kill -HUP "$CP"; wait "$CP" 2>/dev/null; sleep 0.5
+[ $((SECONDS - t0)) -lt 10 ] || fail "8f cleanup waited for the hung step ($((SECONDS - t0))s)"
+pgrep -f "fake-hang-$CAND" >/dev/null && fail "8f descendant survived"
+[ -e "$HERMES_CARRY_CI_DIR.lock" ] && fail "8f lock left behind"
+
 # 9. The reused baseline worktree is cleaned before use.
 echo junk >"$HERMES_CARRY_CI_DIR-base/apps/desktop/stale.generated.ts"
 FAKE_VT_CAND=fail:x FAKE_VT_BASE=fail:x run; want "CHECK=pass" "9 run"
@@ -82,4 +104,4 @@ FAKE_VT_CAND=fail:x FAKE_VT_BASE=fail:x run; want "CHECK=pass" "9 run"
 # 10. Unknown candidate.
 run 0000000000000000000000000000000000000001; want "CHECK=error reason=candidate_missing" "10 missing candidate"
 
-echo "PASS test_desktop_carry_check (17 checks)"
+echo "PASS test_desktop_carry_check (21 checks)"

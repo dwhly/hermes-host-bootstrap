@@ -19,16 +19,36 @@ say() { echo "$(date -u +%H:%M:%S) $*" >&2; }
 
 command -v node >/dev/null && command -v npm >/dev/null || out "error reason=no_node"
 # One check at a time on this Mac: an SSH timeout can leave a run going while the
-# control plane retries. mkdir is atomic; a lock whose pid is gone is reclaimed.
+# control plane retries. The lock is a directory renamed into place with our pid
+# already inside (atomic, never half-written). A stale lock (pid gone) is reclaimed
+# by rename + re-read, and only when no process still works inside the checkouts.
 LOCK="$W.lock"
 mkdir -p "$(dirname "$W")"
-if ! mkdir "$LOCK" 2>/dev/null; then
+busy_tree() { lsof -t +d "$W/apps/desktop" +d "$W-base/apps/desktop" 2>/dev/null | grep -q .; }
+take_lock() {
+  local tmp="$W.lock.new.$$"
+  rm -rf "$tmp"; mkdir "$tmp" && echo $$ >"$tmp/pid" || return 1
+  mv "$tmp" "$LOCK" 2>/dev/null && [ "$(cat "$LOCK/pid" 2>/dev/null)" = $$ ] && return 0
+  rm -rf "$tmp"; return 1
+}
+if ! take_lock; then
   lp="$(cat "$LOCK/pid" 2>/dev/null)"
-  if [ -n "$lp" ] && kill -0 "$lp" 2>/dev/null; then out "error reason=busy"; fi
-  rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null || out "error reason=busy"
+  { [ -n "$lp" ] && kill -0 "$lp" 2>/dev/null; } && out "error reason=busy"
+  busy_tree && out "error reason=busy"
+  mv "$LOCK" "$LOCK.stale.$$" 2>/dev/null || out "error reason=busy"
+  if [ "$(cat "$LOCK.stale.$$/pid" 2>/dev/null)" != "$lp" ]; then
+    mv "$LOCK.stale.$$" "$LOCK" 2>/dev/null; out "error reason=busy"   # not the lock we judged
+  fi
+  rm -rf "$LOCK.stale.$$"
+  take_lock || out "error reason=busy"
 fi
-echo $$ >"$LOCK/pid"
-trap 'rm -rf "$LOCK"' EXIT
+kill_tree() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$c"; done; [ "$1" = $$ ] || kill "$1" 2>/dev/null; }
+# On any exit (incl. SIGHUP when SSH drops) stop every descendant before releasing.
+trap 'kill_tree $$; rm -rf "$LOCK"' EXIT
+trap 'exit 129' HUP INT TERM
+# Long steps run in the background and are waited on: bash defers traps until a
+# foreground command ends, but `wait` is interrupted at once, so SIGHUP stops a hung step.
+bg() { "$@" & wait $!; }
 if [ ! -d "$W/.git" ]; then
   ref=""; [ -d "$HOME/.hermes/hermes-agent/.git" ] && ref="--reference-if-able $HOME/.hermes/hermes-agent --dissociate"
   # shellcheck disable=SC2086
@@ -42,14 +62,14 @@ git -C "$W" checkout -q --detach --force "$CAND" >&2 || out "error reason=checko
 git -C "$W" clean -q -fdx -e node_modules -e '**/node_modules' >&2 || out "error reason=clean_failed"
 
 install() {  # npm ci in $1; the repo's engines field excludes some npm releases
-  ( cd "$1" && { npm ci --no-audit --no-fund >"$LOG.npm" 2>&1 || npx -y npm@11 ci --no-audit --no-fund >"$LOG.npm" 2>&1; } )
+  bg sh -c 'cd "$1" && { npm ci --no-audit --no-fund || npx -y npm@11 ci --no-audit --no-fund; } >"$2" 2>&1' sh "$1" "$LOG.npm"
 }
 say "install"; install "$W" || out "error reason=npm_ci_failed"
 D="$W/apps/desktop"
-say "typecheck"; ( cd "$D" && npm run -s typecheck >"$LOG.tc" 2>&1 ) || out "fail reason=typecheck"
+say "typecheck"; bg sh -c 'cd "$1" && npm run -s typecheck >"$2" 2>&1' sh "$D" "$LOG.tc" || out "fail reason=typecheck"
 files="$(git -C "$W" diff --name-only --diff-filter=AM "$BASE" "$CAND" -- apps/desktop | grep -E '\.(ts|tsx)$' | sed 's#^apps/desktop/##')"
 if [ -n "$files" ]; then
-  say "eslint"; ( cd "$D" && echo "$files" | xargs npx eslint --max-warnings=0 >"$LOG.lint" 2>&1 ) || out "fail reason=eslint"
+  say "eslint"; bg sh -c 'cd "$1" && echo "$3" | xargs npx eslint --max-warnings=0 >"$2" 2>&1' sh "$D" "$LOG.lint" "$files" || out "fail reason=eslint"
 fi
 
 # failures <json> <root> -> one id per failing suite or test, from vitest's JSON
@@ -59,14 +79,18 @@ failures() {
   node - "$1" "$2" <<'JS'
 const fs = require('fs'); const [json, root] = process.argv.slice(2)
 let r; try { r = JSON.parse(fs.readFileSync(json, 'utf8')) } catch { process.exit(1) }
-if (!Array.isArray(r.testResults)) process.exit(1)
+if (!Array.isArray(r.testResults) || r.testResults.length === 0 || typeof r.numFailedTests !== 'number') process.exit(1)
 const ids = new Set()
+let failedTests = 0
 for (const f of r.testResults) {
   const file = String(f.name || '').split(root + '/').pop()
   const failed = (f.assertionResults || []).filter(a => a.status === 'failed')
   if (f.status === 'failed' && failed.length === 0) ids.add(`suite ${file}`)
   for (const a of failed) ids.add(`test ${file} :: ${a.fullName || a.title}`)
+  failedTests += failed.length
 }
+// The runner's own count must match what we can name, or something failed unexplained.
+if (r.numFailedTests !== failedTests) ids.add(`unexplained numFailedTests=${r.numFailedTests} named=${failedTests}`)
 if (ids.size) console.log([...ids].sort().join('\n'))
 JS
 }
@@ -74,9 +98,12 @@ unhandled() { sed -E 's/\x1b\[[0-9;]*m//g' "$1" | grep -cE 'Unhandled (Error|Rej
 say "vitest (switcher areas)"
 rm -f "$LOG.vt.json" "$LOG.vt-base.json"   # never read a previous run's results
 # shellcheck disable=SC2086
-( cd "$D" && npx vitest run $AREAS --reporter=default --reporter=json --outputFile.json="$LOG.vt.json" >"$LOG.vt" 2>&1 ); vrc=$?
-[ "$vrc" = 0 ] && [ "$(unhandled "$LOG.vt")" = 0 ] && out "pass"
+bg sh -c 'cd "$1" && shift && "$@"' sh "$D" npx vitest run $AREAS --reporter=default --reporter=json --outputFile.json="$LOG.vt.json" >"$LOG.vt" 2>&1; vrc=$?
+# Any unhandled error on the candidate blocks (identities can't be compared reliably).
+[ "$(unhandled "$LOG.vt")" = 0 ] || out "fail reason=unhandled_error"
 failures "$LOG.vt.json" "$D" >"$LOG.fail-cand" || out "error reason=vitest_no_results"
+grep -q '^unexplained' "$LOG.fail-cand" && out "fail reason=runner_error"
+[ "$vrc" = 0 ] && [ ! -s "$LOG.fail-cand" ] && out "pass"
 [ -s "$LOG.fail-cand" ] || out "fail reason=runner_error"   # nonzero exit / unhandled error, no failing test to compare
 ffiles="$(sed -E 's/^(suite|test) //; s/ :: .*$//' "$LOG.fail-cand" | sort -u)"
 
@@ -86,10 +113,8 @@ if [ ! -d "$B" ]; then git -C "$W" worktree add -q --detach "$B" "$BASE" >&2 || 
 git -C "$B" checkout -q --detach --force "$BASE" >&2 || out "error reason=base_checkout_failed"
 git -C "$B" clean -q -fdx -e node_modules -e '**/node_modules' >&2 || out "error reason=base_clean_failed"
 install "$B" || out "error reason=base_npm_ci_failed"
-( cd "$B/apps/desktop" && echo "$ffiles" | xargs npx vitest run --reporter=default --reporter=json --outputFile.json="$LOG.vt-base.json" >"$LOG.vt-base" 2>&1 )
+bg sh -c 'cd "$1" && echo "$3" | xargs npx vitest run --reporter=default --reporter=json --outputFile.json="$2.json" >"$2" 2>&1' sh "$B/apps/desktop" "$LOG.vt-base" "$ffiles"
 failures "$LOG.vt-base.json" "$B/apps/desktop" >"$LOG.fail-base" || out "error reason=base_vitest_no_results"
-# An unhandled error on the candidate that the clean base does not also show blocks.
-[ "$(unhandled "$LOG.vt")" -gt "$(unhandled "$LOG.vt-base")" ] && out "fail reason=unhandled_error"
 only="$(comm -13 "$LOG.fail-base" "$LOG.fail-cand")"
 if [ -n "$only" ]; then
   echo "$only" | head -5 >&2
