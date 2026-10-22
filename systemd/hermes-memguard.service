@@ -1,0 +1,11 @@
+[Unit]
+Description=h-do1 memory guard (interim): OOM priorities + end idle >12h sessions under pressure
+Documentation=https://github.com/dwhly/chief-docs/blob/145a7df/edd/PROPOSAL-h-do1-memory-guard.md
+
+[Service]
+Type=oneshot
+Environment=QUIET=1 HOME=/root XDG_RUNTIME_DIR=/run/user/0 PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+ExecStart=/bin/bash /root/work/memguard/apply-now.sh
+OOMScoreAdjust=-900
+Nice=5
+TimeoutStartSec=120
