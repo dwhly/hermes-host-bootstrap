@@ -44,7 +44,9 @@ for m in ${mode//,/ }; do
     unhandled) echo "Unhandled Error: boom"; rc=1 ;;
     nojson) out="" ; rc=1 ;;
     undercount) rc=1 ;;
-    hang) exec -a "fake-hang-$CAND_ID" sleep 60 ;;
+    hangterm) exec bash -c 'trap "" TERM; exec -a "fake-hang-$0" sleep 60' "$CAND_ID" ;;
+    slow) sleep 2 ;;
+    killed) killed=1 ;;
   esac
 done
 echo " Test Files  1 passed"
@@ -52,6 +54,7 @@ n=$(( $(echo "$results" | grep -o '"assertionResults"' | wc -l) ))
 [ "$mode" = undercount ] && n=$((n + 1))
 [ -n "$results" ] || results='{"name":"'"$PWD"'/src/ok.test.ts","status":"passed","assertionResults":[]}'
 [ -n "$out" ] && echo "{\"numFailedTests\":$n,\"testResults\":[${results}]}" >"$out"
+[ -n "${killed:-}" ] && exit 137
 exit "$rc"
 SH
 chmod +x "$HOME/.local/bin/npm" "$HOME/.local/bin/npx"
@@ -72,29 +75,25 @@ FAKE_TC_RC=2 run; want "CHECK=fail reason=typecheck" "7 typecheck"
 FAKE_LINT_RC=1 run; want "CHECK=fail reason=eslint" "7b eslint"
 FAKE_NPM_RC=1 run; want "CHECK=error reason=npm_ci_failed" "7c install"
 
-# 8. Lock: a live holder blocks; a dead holder's lock is reclaimed.
-sleep 30 & SLEEPER=$!
-mkdir "$HERMES_CARRY_CI_DIR.lock"; echo "$SLEEPER" >"$HERMES_CARRY_CI_DIR.lock/pid"
-run; want "CHECK=error reason=busy" "8 live lock"
+# 8. Lock (kernel flock): a live holder blocks; a leftover lock file alone does not.
+hold() { perl -MFcntl=:flock -e 'open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; sleep 30' "$HERMES_CARRY_CI_DIR.lock" & SLEEPER=$!; sleep 0.5; }
+hold; run; want "CHECK=error reason=busy" "8 live holder"
 kill "$SLEEPER"; wait "$SLEEPER" 2>/dev/null
-run; want "CHECK=pass" "8b stale lock reclaimed"
-[ -e "$HERMES_CARRY_CI_DIR.lock" ] && fail "8c lock left behind"
-
-# 8d. Stale lock, but a process still works inside the checkout: never reclaimed.
-mkdir "$HERMES_CARRY_CI_DIR.lock"; echo 999999 >"$HERMES_CARRY_CI_DIR.lock/pid"
-( cd "$HERMES_CARRY_CI_DIR/apps/desktop" && exec sleep 30 ) & SLEEPER=$!
-sleep 0.5
-if command -v lsof >/dev/null; then run; want "CHECK=error reason=busy" "8d stale lock with live worker"; fi
-kill "$SLEEPER" 2>/dev/null; wait "$SLEEPER" 2>/dev/null
-run; want "CHECK=pass" "8e reclaimed once idle"
-# 8f. Descendants do not outlive the run: a vitest that hangs is killed when the check is.
-FAKE_VT_CAND=hang bash "$CHECK" "$CAND" "$BASE" "$FORKB" "$UPB" >/dev/null 2>&1 & CP=$!
+run; want "CHECK=pass" "8b lock file left behind is not a lock"
+# 8c. Two checks at once: exactly one runs.
+FAKE_VT_CAND=slow bash "$CHECK" "$CAND" "$BASE" "$FORKB" "$UPB" >"$W/c1" 2>/dev/null & C1=$!
+sleep 0.5; run; want "CHECK=error reason=busy" "8c concurrent run"
+wait "$C1"; grep -q '^CHECK=pass' "$W/c1" || fail "8c first run did not pass"
+# 8d. A hung step that ignores TERM is KILLed on SIGHUP; nothing survives; lock free.
+FAKE_VT_CAND=hangterm bash "$CHECK" "$CAND" "$BASE" "$FORKB" "$UPB" >/dev/null 2>&1 & CP=$!
 for _ in $(seq 1 50); do pgrep -f "fake-hang-$CAND" >/dev/null && break; sleep 0.2; done
-pgrep -f "fake-hang-$CAND" >/dev/null || fail "8f hang never started"
+pgrep -f "fake-hang-$CAND" >/dev/null || fail "8d hang never started"
 t0=$SECONDS; kill -HUP "$CP"; wait "$CP" 2>/dev/null; sleep 0.5
-[ $((SECONDS - t0)) -lt 10 ] || fail "8f cleanup waited for the hung step ($((SECONDS - t0))s)"
-pgrep -f "fake-hang-$CAND" >/dev/null && fail "8f descendant survived"
-[ -e "$HERMES_CARRY_CI_DIR.lock" ] && fail "8f lock left behind"
+[ $((SECONDS - t0)) -lt 15 ] || fail "8d cleanup too slow ($((SECONDS - t0))s)"
+pgrep -f "fake-hang-$CAND" >/dev/null && fail "8d TERM-ignoring descendant survived"
+run; want "CHECK=pass" "8e lock free after cleanup"
+# 8f. A runner killed by a signal is an error even if its JSON shows only shared failures.
+FAKE_VT_CAND=fail:x,killed FAKE_VT_BASE=fail:x run; want "CHECK=error reason=vitest_killed rc=137" "8f killed runner"
 
 # 9. The reused baseline worktree is cleaned before use.
 echo junk >"$HERMES_CARRY_CI_DIR-base/apps/desktop/stale.generated.ts"
@@ -104,4 +103,4 @@ FAKE_VT_CAND=fail:x FAKE_VT_BASE=fail:x run; want "CHECK=pass" "9 run"
 # 10. Unknown candidate.
 run 0000000000000000000000000000000000000001; want "CHECK=error reason=candidate_missing" "10 missing candidate"
 
-echo "PASS test_desktop_carry_check (21 checks)"
+echo "PASS test_desktop_carry_check (22 checks)"

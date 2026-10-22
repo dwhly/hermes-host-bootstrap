@@ -18,33 +18,29 @@ out() { echo "CHECK=$*"; exit 0; }
 say() { echo "$(date -u +%H:%M:%S) $*" >&2; }
 
 command -v node >/dev/null && command -v npm >/dev/null || out "error reason=no_node"
-# One check at a time on this Mac: an SSH timeout can leave a run going while the
-# control plane retries. The lock is a directory renamed into place with our pid
-# already inside (atomic, never half-written). A stale lock (pid gone) is reclaimed
-# by rename + re-read, and only when no process still works inside the checkouts.
-LOCK="$W.lock"
+# One check at a time on this Mac. Kernel flock on fd 8 (taken via perl: macOS has no
+# flock(1)). The lock belongs to the open file, which every step inherits, so it is held
+# until the last descendant exits: a survivor of a dropped run keeps later runs "busy"
+# instead of letting two checks share the checkouts. No pid files, nothing to reclaim.
 mkdir -p "$(dirname "$W")"
-busy_tree() { lsof -t +d "$W/apps/desktop" +d "$W-base/apps/desktop" 2>/dev/null | grep -q .; }
-take_lock() {
-  local tmp="$W.lock.new.$$"
-  rm -rf "$tmp"; mkdir "$tmp" && echo $$ >"$tmp/pid" || return 1
-  mv "$tmp" "$LOCK" 2>/dev/null && [ "$(cat "$LOCK/pid" 2>/dev/null)" = $$ ] && return 0
-  rm -rf "$tmp"; return 1
+exec 8>>"$W.lock"
+perl -MFcntl=:flock -e 'open(my $f, ">>&=", 8) or exit 2; exit(flock($f, LOCK_EX | LOCK_NB) ? 0 : 1)' \
+  || out "error reason=busy"
+descendants() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do echo "$c"; descendants "$c"; done; }
+stop_all() {  # TERM every descendant, give them 5s, KILL survivors, confirm they are gone
+  local pids
+  pids="$(descendants $$)"; [ -n "$pids" ] || return 0
+  # shellcheck disable=SC2086
+  kill $pids 2>/dev/null
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    pids="$(for q in $pids; do kill -0 "$q" 2>/dev/null && echo "$q"; done)"
+    [ -n "$pids" ] || return 0; sleep 0.5
+  done
+  # shellcheck disable=SC2086
+  kill -9 $pids 2>/dev/null; sleep 0.5
 }
-if ! take_lock; then
-  lp="$(cat "$LOCK/pid" 2>/dev/null)"
-  { [ -n "$lp" ] && kill -0 "$lp" 2>/dev/null; } && out "error reason=busy"
-  busy_tree && out "error reason=busy"
-  mv "$LOCK" "$LOCK.stale.$$" 2>/dev/null || out "error reason=busy"
-  if [ "$(cat "$LOCK.stale.$$/pid" 2>/dev/null)" != "$lp" ]; then
-    mv "$LOCK.stale.$$" "$LOCK" 2>/dev/null; out "error reason=busy"   # not the lock we judged
-  fi
-  rm -rf "$LOCK.stale.$$"
-  take_lock || out "error reason=busy"
-fi
-kill_tree() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$c"; done; [ "$1" = $$ ] || kill "$1" 2>/dev/null; }
-# On any exit (incl. SIGHUP when SSH drops) stop every descendant before releasing.
-trap 'kill_tree $$; rm -rf "$LOCK"' EXIT
+# On any exit (incl. SIGHUP when SSH drops) stop every descendant; the lock goes with fd 8.
+trap 'stop_all' EXIT
 trap 'exit 129' HUP INT TERM
 # Long steps run in the background and are waited on: bash defers traps until a
 # foreground command ends, but `wait` is interrupted at once, so SIGHUP stops a hung step.
@@ -99,6 +95,8 @@ say "vitest (switcher areas)"
 rm -f "$LOG.vt.json" "$LOG.vt-base.json"   # never read a previous run's results
 # shellcheck disable=SC2086
 bg sh -c 'cd "$1" && shift && "$@"' sh "$D" npx vitest run $AREAS --reporter=default --reporter=json --outputFile.json="$LOG.vt.json" >"$LOG.vt" 2>&1; vrc=$?
+# A runner killed by a signal never counts as a result, whatever its JSON says.
+[ "$vrc" -gt 128 ] && out "error reason=vitest_killed rc=$vrc"
 # Any unhandled error on the candidate blocks (identities can't be compared reliably).
 [ "$(unhandled "$LOG.vt")" = 0 ] || out "fail reason=unhandled_error"
 failures "$LOG.vt.json" "$D" >"$LOG.fail-cand" || out "error reason=vitest_no_results"
@@ -113,7 +111,10 @@ if [ ! -d "$B" ]; then git -C "$W" worktree add -q --detach "$B" "$BASE" >&2 || 
 git -C "$B" checkout -q --detach --force "$BASE" >&2 || out "error reason=base_checkout_failed"
 git -C "$B" clean -q -fdx -e node_modules -e '**/node_modules' >&2 || out "error reason=base_clean_failed"
 install "$B" || out "error reason=base_npm_ci_failed"
-bg sh -c 'cd "$1" && echo "$3" | xargs npx vitest run --reporter=default --reporter=json --outputFile.json="$2.json" >"$2" 2>&1' sh "$B/apps/desktop" "$LOG.vt-base" "$ffiles"
+bg sh -c 'cd "$1" && echo "$3" | xargs npx vitest run --reporter=default --reporter=json --outputFile.json="$2.json" >"$2" 2>&1' sh "$B/apps/desktop" "$LOG.vt-base" "$ffiles"; brc=$?
+[ "$brc" -gt 128 ] && out "error reason=base_vitest_killed rc=$brc"
+# xargs reports a child killed by a signal as 125; treat it as abnormal too.
+[ "$brc" = 125 ] && out "error reason=base_vitest_killed rc=$brc"
 failures "$LOG.vt-base.json" "$B/apps/desktop" >"$LOG.fail-base" || out "error reason=base_vitest_no_results"
 only="$(comm -13 "$LOG.fail-base" "$LOG.fail-cand")"
 if [ -n "$only" ]; then
