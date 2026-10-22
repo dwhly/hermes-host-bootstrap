@@ -26,25 +26,35 @@ mkdir -p "$(dirname "$W")"
 exec 8>>"$W.lock"
 perl -MFcntl=:flock -e 'open(my $f, ">>&=", 8) or exit 2; exit(flock($f, LOCK_EX | LOCK_NB) ? 0 : 1)' \
   || out "error reason=busy"
-descendants() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do echo "$c"; descendants "$c"; done; }
-stop_all() {  # TERM every descendant, give them 5s, KILL survivors, confirm they are gone
-  local pids
-  pids="$(descendants $$)"; [ -n "$pids" ] || return 0
-  # shellcheck disable=SC2086
-  kill $pids 2>/dev/null
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    pids="$(for q in $pids; do kill -0 "$q" 2>/dev/null && echo "$q"; done)"
-    [ -n "$pids" ] || return 0; sleep 0.5
-  done
-  # shellcheck disable=SC2086
-  kill -9 $pids 2>/dev/null; sleep 0.5
+# Every step runs as its own process group (perl setpgrp: macOS has no setsid), so
+# workers a runner leaves behind -- even orphaned ones, which npm/node children are
+# when the runner dies, and which do not inherit fd 8 -- stay findable by group.
+STEP_GROUPS=""
+reap() {  # reap <pgid>: TERM the group, 5s grace, KILL, confirm empty
+  local g="$1"
+  kill -0 -- "-$g" 2>/dev/null || return 0
+  kill -TERM -- "-$g" 2>/dev/null
+  for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 -- "-$g" 2>/dev/null || return 0; sleep 0.5; done
+  kill -KILL -- "-$g" 2>/dev/null
+  for _ in 1 2 3 4 5 6; do kill -0 -- "-$g" 2>/dev/null || return 0; sleep 0.5; done
+  echo "warning: process group $g did not exit" >&2; return 1
 }
-# On any exit (incl. SIGHUP when SSH drops) stop every descendant; the lock goes with fd 8.
+stop_all() { local g; for g in $STEP_GROUPS; do reap "$g"; done; }
+# On any exit (incl. SIGHUP when SSH drops) every step group is emptied; then fd 8
+# (the lock) closes with this shell.
 trap 'stop_all' EXIT
 trap 'exit 129' HUP INT TERM
-# Long steps run in the background and are waited on: bash defers traps until a
-# foreground command ends, but `wait` is interrupted at once, so SIGHUP stops a hung step.
-bg() { "$@" & wait $!; }
+# bg <cmd...>: run a step in its own group and wait for it. Waiting (not running in
+# the foreground) lets SIGHUP interrupt at once; bash defers traps for foreground
+# commands. Leftovers of a finished step are reaped before the next step starts.
+bg() {
+  local p rc
+  perl -e 'setpgrp(0, 0) or die "setpgrp: $!"; exec @ARGV or die "exec: $!"' "$@" &
+  p=$!; STEP_GROUPS="$STEP_GROUPS $p"
+  wait "$p"; rc=$?
+  reap "$p" || rc=125
+  return "$rc"
+}
 if [ ! -d "$W/.git" ]; then
   ref=""; [ -d "$HOME/.hermes/hermes-agent/.git" ] && ref="--reference-if-able $HOME/.hermes/hermes-agent --dissociate"
   # shellcheck disable=SC2086

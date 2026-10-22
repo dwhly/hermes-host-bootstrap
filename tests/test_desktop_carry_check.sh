@@ -47,6 +47,10 @@ for m in ${mode//,/ }; do
     hangterm) exec bash -c 'trap "" TERM; exec -a "fake-hang-$0" sleep 60' "$CAND_ID" ;;
     slow) sleep 2 ;;
     killed) killed=1 ;;
+    orphan)  # real node runner spawns a worker, then dies by signal, orphaning it
+      exec node -e '
+        require("child_process").spawn("bash", ["-c", "exec -a fake-orphan-" + process.argv[1] + " sleep 60"], { stdio: "inherit" }).unref()
+        setTimeout(() => process.kill(process.pid, "SIGKILL"), 300)' "$CAND_ID" ;;
   esac
 done
 echo " Test Files  1 passed"
@@ -95,6 +99,12 @@ run; want "CHECK=pass" "8e lock free after cleanup"
 # 8f. A runner killed by a signal is an error even if its JSON shows only shared failures.
 FAKE_VT_CAND=fail:x,killed FAKE_VT_BASE=fail:x run; want "CHECK=error reason=vitest_killed rc=137" "8f killed runner"
 
+# 8g. Real node: a runner killed by a signal leaves an orphaned worker (no lock fd);
+#     its step group is reaped before the check returns, and the next run is free.
+FAKE_VT_CAND=orphan run; want "CHECK=error reason=vitest_killed rc=137" "8g killed runner"
+sleep 0.5; pgrep -f "fake-orphan-$CAND" >/dev/null && fail "8g orphaned worker survived the check"
+run; want "CHECK=pass" "8h next run after orphan"
+
 # 9. The reused baseline worktree is cleaned before use.
 echo junk >"$HERMES_CARRY_CI_DIR-base/apps/desktop/stale.generated.ts"
 FAKE_VT_CAND=fail:x FAKE_VT_BASE=fail:x run; want "CHECK=pass" "9 run"
@@ -103,4 +113,4 @@ FAKE_VT_CAND=fail:x FAKE_VT_BASE=fail:x run; want "CHECK=pass" "9 run"
 # 10. Unknown candidate.
 run 0000000000000000000000000000000000000001; want "CHECK=error reason=candidate_missing" "10 missing candidate"
 
-echo "PASS test_desktop_carry_check (22 checks)"
+echo "PASS test_desktop_carry_check (24 checks)"
