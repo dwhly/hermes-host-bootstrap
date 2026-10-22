@@ -57,8 +57,12 @@ git -C "$W" cat-file -e "$BASE^{commit}" 2>/dev/null || out "error reason=base_m
 git -C "$W" checkout -q --detach --force "$CAND" >&2 || out "error reason=checkout_failed"
 git -C "$W" clean -q -fdx -e node_modules -e '**/node_modules' >&2 || out "error reason=clean_failed"
 
-install() {  # npm ci in $1; the repo's engines field excludes some npm releases
-  bg sh -c 'cd "$1" && { npm ci --no-audit --no-fund || npx -y npm@11 ci --no-audit --no-fund; } >"$2" 2>&1' sh "$1" "$LOG.npm"
+install() {  # npm ci in $1 with an npm the repo's engines field accepts
+  # `npx npm@11` would reuse an installed 11.x even if engines excludes it; asking for
+  # the exact range makes npx fetch a matching npm when the installed one is outside it.
+  bg sh -c 'cd "$1" || exit 1
+    r="$(node -p "(require(\"./package.json\").engines || {}).npm || \"\"" 2>/dev/null)"
+    { npm ci --no-audit --no-fund || { [ -n "$r" ] && npx -y "npm@$r" ci --no-audit --no-fund; }; } >"$2" 2>&1' sh "$1" "$LOG.npm"
 }
 say "install"; install "$W" || out "error reason=npm_ci_failed"
 D="$W/apps/desktop"
