@@ -1011,9 +1011,11 @@ test_drop_reattach() {
 
   # A link that keeps failing right after reattach stops after 3 quick drops.
   reset_state
-  printf '255 1\n255\n255\n255\n0\n' >"$seq"; printf '0\n' >"$fails"
+  # Threshold 2s with a 2s first session: $SECONDS is whole seconds, so an
+  # instant drop can read as 1s across a tick; it can never read as 2s.
+  printf '255 2\n255\n255\n255\n0\n' >"$seq"; printf '0\n' >"$fails"
   set +e
-  run_core env HMW_BACKEND=herdr STUB_HOSTNAME=origin HMW_DROP_SECONDS=1 \
+  run_core env HMW_BACKEND=herdr STUB_HOSTNAME=origin HMW_DROP_SECONDS=2 \
     SSH_SEQ_FILE="$seq" SSH_PROBE_FAILS_FILE="$fails" "$CORE" remote 1
   status=$?
   set -e
@@ -1023,15 +1025,20 @@ test_drop_reattach() {
 
   # HMW_RECONNECT_MAX_WAIT bounds the wait for a host that never comes back.
   reset_state
-  printf '255\n0\n' >"$seq"; printf '99\n' >"$fails"
+  # The session lasts 1s with HMW_DROP_SECONDS=1, so it is a real drop; after
+  # giving up, no uncapped diagnostic ssh (ServerAliveCountMax=2 probe) may run.
+  printf '255 1\n0\n' >"$seq"; printf '99\n' >"$fails"
   set +e
-  run_core env HMW_BACKEND=herdr STUB_HOSTNAME=origin HMW_DROP_SECONDS=0 HMW_RECONNECT_MAX_WAIT=5 \
+  run_core env HMW_BACKEND=herdr STUB_HOSTNAME=origin HMW_DROP_SECONDS=1 HMW_RECONNECT_MAX_WAIT=5 \
     SSH_SEQ_FILE="$seq" SSH_PROBE_FAILS_FILE="$fails" "$CORE" remote 1
   status=$?
   set -e
   assert_eq 255 "$status" 'giving up keeps the drop status' || return 1
   assert_line_count 1 "$LOG" $'\t-t\t' 'never reattaches to an unreachable host' || return 1
-  assert_contains "$STDERR_FILE" 'gave up waiting for remote after 5s' 'give-up is announced' || return 1
+  assert_contains "$STDERR_FILE" 'gave up waiting for remote (HMW_RECONNECT_MAX_WAIT=5s of back-off)' 'give-up is announced' || return 1
+  assert_contains "$STDERR_FILE" 'rerun hmw to reattach' 'give-up says how to reattach' || return 1
+  assert_not_contains "$LOG" 'ServerAliveCountMax=2' 'giving up runs no uncapped diagnostic ssh' || return 1
+  assert_not_contains "$STDERR_FILE" 'could not open the workspace' 'giving up is not reported as a connect failure' || return 1
   assert_eq $'2\n4' "$(cat "$SLEEP_LOG")" 'back-off doubles until the wait budget is spent' || return 1
   pass 'dropped sessions reattach automatically (bounded, opt-out, flap-safe)'
 }

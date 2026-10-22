@@ -236,14 +236,16 @@ hmw_drain_tty_input() {
   local saved
   [ -t 0 ] || return 0
   saved="$(stty -g 2>/dev/null)" || return 0
-  # min 0 time 2: a read returns after 0.2s with no input, which dd treats as EOF.
-  stty -echo -icanon min 0 time 2 2>/dev/null || return 0
-  # Never leave the user's terminal without echo if Ctrl-C lands mid-drain.
+  # Never leave the user's terminal without echo if Ctrl-C lands mid-drain: the
+  # trap is armed BEFORE the modes change and stays armed until they are restored.
   # shellcheck disable=SC2064
-  trap "stty '$saved' 2>/dev/null; exit 130" INT TERM
-  dd bs=4096 count=16 of=/dev/null 2>/dev/null
-  trap - INT TERM
+  trap "stty '$saved' 2>/dev/null || stty sane 2>/dev/null; exit 130" INT TERM
+  # min 0 time 2: a read returns after 0.2s with no input, which dd treats as EOF.
+  if stty -echo -icanon min 0 time 2 2>/dev/null; then
+    dd bs=4096 count=16 of=/dev/null 2>/dev/null
+  fi
   stty "$saved" 2>/dev/null || stty sane 2>/dev/null || :
+  trap - INT TERM
 }
 
 # After a dropped session, poll until a non-interactive SSH round trip works.
@@ -276,7 +278,10 @@ hmw_wait_for_target() {
 
 # Undo terminal modes the remote TUI left on the OUTER local terminal.
 hmw_heal_local_terminal() {
-  hmw_drain_tty_input
+  # Drain only after ssh itself failed (255: the link dropped mid-session, so
+  # terminal replies were in flight). After a clean exit, keystrokes the user
+  # typed ahead are real input and must reach their shell.
+  [ "${1:-0}" -ne 255 ] || hmw_drain_tty_input
   # Herdr/Hermes enable Kitty keyboard + modifyOtherKeys on the OUTER local
   # terminal. A Broken pipe/SIGHUP skips their normal teardown, leaving the
   # local shell to receive raw CSI-u key reports. Heal locally after every
@@ -328,7 +333,7 @@ dispatch_remote() {
       ssh -o "ServerAliveInterval=$ssh_keepalive_interval" -o "ServerAliveCountMax=$ssh_keepalive_count" -t "$SSH_TARGET" "$remote_command"
       ssh_status=$?
       elapsed=$((SECONDS - ssh_started))
-      hmw_heal_local_terminal
+      hmw_heal_local_terminal "$ssh_status"
       # 255 = ssh's own failure (the link), not the remote launcher's status.
       # The workspace keeps running on the host, so a dropped link (network
       # change, sleep) is reattached automatically. A quick 255 on the FIRST
@@ -345,9 +350,10 @@ dispatch_remote() {
       reconnecting=1
       hmw_note "connection to ${REQUEST_HOST} dropped after ${elapsed}s (network change or sleep); reconnecting — Ctrl-C to stop."
       if ! hmw_wait_for_target; then
-        hmw_note "gave up waiting for ${REQUEST_HOST} after ${HMW_RECONNECT_MAX_WAIT}s."
-        elapsed=0
-        break
+        # Return directly: the connect diagnostics in report_failure run ssh
+        # without a wall-clock cap and could stall again right after this.
+        hmw_note "gave up waiting for ${REQUEST_HOST} (HMW_RECONNECT_MAX_WAIT=${HMW_RECONNECT_MAX_WAIT}s of back-off). The workspace is still running there — rerun hmw to reattach."
+        return 255
       fi
       hmw_note "reattaching to ${REQUEST_HOST}."
     done
