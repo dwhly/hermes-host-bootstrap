@@ -105,6 +105,16 @@ FAKE_VT_CAND=orphan run; want "CHECK=error reason=vitest_killed rc=137" "8g kill
 sleep 0.5; pgrep -f "fake-orphan-$CAND" >/dev/null && fail "8g orphaned worker survived the check"
 run; want "CHECK=pass" "8h next run after orphan"
 
+# 8i. A step group that cannot be stopped: an error (never a pass, even with only shared
+#     failures), and the run keeps the lock while it retries, so a second run is busy.
+HERMES_CARRY_TEST_STUCK=1 HERMES_CARRY_HOLD_SECS=6 FAKE_VT_CAND=fail:x FAKE_VT_BASE=fail:x \
+  bash "$CHECK" "$CAND" "$BASE" "$FORKB" "$UPB" >"$W/c2" 2>/dev/null & C2=$!
+for _ in $(seq 1 50); do grep -q '^CHECK=' "$W/c2" 2>/dev/null && break; sleep 0.2; done
+grep -q '^CHECK=error reason=cleanup_failed$' "$W/c2" || fail "8i want cleanup_failed, got: $(cat "$W/c2")"
+run; want "CHECK=error reason=busy" "8i lock held while a group survives"
+wait "$C2"
+run; want "CHECK=pass" "8j lock released after the hold"
+
 # 9. The reused baseline worktree is cleaned before use.
 echo junk >"$HERMES_CARRY_CI_DIR-base/apps/desktop/stale.generated.ts"
 FAKE_VT_CAND=fail:x FAKE_VT_BASE=fail:x run; want "CHECK=pass" "9 run"
@@ -113,4 +123,4 @@ FAKE_VT_CAND=fail:x FAKE_VT_BASE=fail:x run; want "CHECK=pass" "9 run"
 # 10. Unknown candidate.
 run 0000000000000000000000000000000000000001; want "CHECK=error reason=candidate_missing" "10 missing candidate"
 
-echo "PASS test_desktop_carry_check (24 checks)"
+echo "PASS test_desktop_carry_check (27 checks)"

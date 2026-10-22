@@ -14,7 +14,10 @@ W="${HERMES_CARRY_CI_DIR:-$HOME/build/switcher-ci}"
 LOG="$W.log"
 AREAS="src/app/chat/sidebar src/components/pane-shell src/app/contrib src/app/shell src/app/right-sidebar electron/machine-profile.test.ts electron/window-focus-policy.test.ts"
 
-out() { echo "CHECK=$*"; exit 0; }
+# The verdict goes to fd 7 (the real stdout), so it is delivered even when raised
+# inside a step whose output is redirected to a log.
+exec 7>&1
+out() { echo "CHECK=$*" >&7; exit 0; }
 say() { echo "$(date -u +%H:%M:%S) $*" >&2; }
 
 command -v node >/dev/null && command -v npm >/dev/null || out "error reason=no_node"
@@ -30,17 +33,28 @@ perl -MFcntl=:flock -e 'open(my $f, ">>&=", 8) or exit 2; exit(flock($f, LOCK_EX
 # workers a runner leaves behind -- even orphaned ones, which npm/node children are
 # when the runner dies, and which do not inherit fd 8 -- stay findable by group.
 STEP_GROUPS=""
+HOLD_SECS="${HERMES_CARRY_HOLD_SECS:-600}"
+alive() { [ -n "${HERMES_CARRY_TEST_STUCK:-}" ] || kill -0 -- "-$1" 2>/dev/null; }   # test hook: a group that never exits
 reap() {  # reap <pgid>: TERM the group, 5s grace, KILL, confirm empty
   local g="$1"
-  kill -0 -- "-$g" 2>/dev/null || return 0
+  alive "$g" || return 0
   kill -TERM -- "-$g" 2>/dev/null
-  for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 -- "-$g" 2>/dev/null || return 0; sleep 0.5; done
+  for _ in 1 2 3 4 5 6 7 8 9 10; do alive "$g" || return 0; sleep 0.5; done
   kill -KILL -- "-$g" 2>/dev/null
-  for _ in 1 2 3 4 5 6; do kill -0 -- "-$g" 2>/dev/null || return 0; sleep 0.5; done
+  for _ in 1 2 3 4 5 6; do alive "$g" || return 0; sleep 0.5; done
   echo "warning: process group $g did not exit" >&2; return 1
 }
-stop_all() { local g; for g in $STEP_GROUPS; do reap "$g"; done; }
-# On any exit (incl. SIGHUP when SSH drops) every step group is emptied; then fd 8
+stop_all() {  # empty every step group; while any survives, stay alive (holding fd 8,
+  local g left t=0  # the lock) and keep KILLing, up to HOLD_SECS
+  while :; do
+    left=""
+    for g in $STEP_GROUPS; do reap "$g" || left="$left $g"; done
+    [ -z "$left" ] && return 0
+    [ "$t" -ge "$HOLD_SECS" ] && { echo "warning: groups$left still alive after ${HOLD_SECS}s" >&2; return 1; }
+    sleep 5; t=$((t + 5))
+  done
+}
+# On any exit (incl. SIGHUP when SSH drops) every step group is emptied before fd 8
 # (the lock) closes with this shell.
 trap 'stop_all' EXIT
 trap 'exit 129' HUP INT TERM
@@ -52,7 +66,7 @@ bg() {
   perl -e 'setpgrp(0, 0) or die "setpgrp: $!"; exec @ARGV or die "exec: $!"' "$@" &
   p=$!; STEP_GROUPS="$STEP_GROUPS $p"
   wait "$p"; rc=$?
-  reap "$p" || rc=125
+  reap "$p" || out "error reason=cleanup_failed"   # never a result from a step we could not stop
   return "$rc"
 }
 if [ ! -d "$W/.git" ]; then
