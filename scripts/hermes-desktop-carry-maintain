@@ -1,0 +1,188 @@
+#!/bin/bash
+# hermes-desktop-carry-maintain — control-plane job (h-do1) that keeps the fork's
+# fleet/desktop-switcher branch merged with upstream main, so fleet Macs (M7 sync)
+# never merge the switcher themselves.
+#
+# Each run (systemd timer, every 3h):
+#   1. fetch upstream main + the fork's fleet branch into a bare repo;
+#   2. current            -> nothing to do;
+#      upstream has it    -> "retired" (one message; Macs retire themselves);
+#      merge conflicts    -> message Dan once per fleet head, with the files;
+#      clean merge        -> commit (deterministic), push to <branch>-candidate, run
+#                            hermes-desktop-carry-check on the test Mac over SSH;
+#                            pass -> fast-forward the fleet branch to the candidate;
+#                            fail -> message once; test Mac unreachable > 1 day -> message;
+#   3. read each M7 Mac's ~/.hermes/desktop-carry/last; message on error, or on any
+#      hold that has lasted > 1 day.
+# Never force-pushes the fleet branch; only fast-forwards it to a tested candidate.
+set -u
+export PATH="${PATH:+$PATH:}/root/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export GIT_TERMINAL_PROMPT=0
+
+STATE="${HERMES_CARRY_STATE:-/var/lib/hermes-desktop-carry}"
+CONF="${HERMES_CARRY_CONF:-/etc/hermes-desktop-carry}"
+FORK="${HERMES_CARRY_FORK:-https://github.com/dwhly/hermes-agent.git}"
+UP="${HERMES_CARRY_UPSTREAM:-https://github.com/NousResearch/hermes-agent.git}"
+CHECK="${HERMES_CARRY_CHECK:-/usr/local/lib/hermes-desktop-carry/hermes-desktop-carry-check}"
+CHECK_TIMEOUT="${HERMES_CARRY_CHECK_TIMEOUT:-3600}"
+STALE_SECS="${HERMES_CARRY_STALE_SECS:-86400}"
+BRANCH=fleet/desktop-switcher
+CANDIDATE="$BRANCH-candidate"
+REPO="$STATE/repo.git"
+NOW="$(date +%s)"
+
+mkdir -p "$STATE" || exit 1
+exec 9>"$STATE/lock"
+flock -n 9 || { echo "desktop-carry-maintain: another run is active"; exit 0; }
+touch "$STATE/alerted"
+
+SUMMARY=()
+note() { SUMMARY+=("$*"); echo "$*"; }
+
+send() {  # send <subject> <body>
+  if [ -n "${HERMES_CARRY_SEND:-}" ]; then
+    printf '%s\n%s\n' "$1" "$2" | $HERMES_CARRY_SEND
+  else
+    printf '%s\n' "$2" | hermes send -q -t telegram -s "$1" -f -
+  fi
+}
+alert() {  # alert <key> <subject> <body>: once per key until cleared
+  grep -Fqx -- "$1" "$STATE/alerted" && return 0
+  if send "$2" "$3"; then echo "$1" >>"$STATE/alerted"; else note "alert send failed: $1"; fi
+}
+clear_alerts() {  # clear_alerts <prefix>: a recovered condition may alert again later
+  grep -v -F -- "$1" "$STATE/alerted" >"$STATE/alerted.tmp" 2>/dev/null
+  mv "$STATE/alerted.tmp" "$STATE/alerted"
+}
+since() {  # since <key> -> seconds this condition has been continuously observed
+  local f="$STATE/since.$1"
+  [ -f "$f" ] || echo "$NOW" >"$f"
+  echo $(( NOW - $(cat "$f") ))
+}
+unsince() { rm -f "$STATE/since.$1"; }
+g() { git -C "$REPO" "$@"; }
+ssh_t() { ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 "$@"; }
+target_of() { awk -v h="$1" '$1 == h { print $2; exit }' "$CONF/targets" 2>/dev/null; }
+
+# ---- 1. fetch --------------------------------------------------------------
+[ -d "$REPO" ] || git init -q --bare "$REPO" || exit 1
+if ! g fetch -q "$UP" "+refs/heads/main:refs/up/main" 2>"$STATE/fetch.err" \
+   || ! g fetch -q "$FORK" "+refs/heads/$BRANCH:refs/fork/fleet" 2>>"$STATE/fetch.err"; then
+  note "fleet: fetch_failed ($(head -c 200 "$STATE/fetch.err" | tr '\n' ' '))"
+  if [ "$(since fetch_failed)" -gt "$STALE_SECS" ]; then
+    alert "fetch_failed" "Desktop switcher: h-do1 cannot fetch GitHub" \
+      "hermes-desktop-carry-maintain has failed to fetch upstream or the fork for over a day. Fleet Macs keep their last good build. See $STATE/fetch.err."
+  fi
+  FLEET_STATE=fetch_failed
+else
+  unsince fetch_failed; clear_alerts "fetch_failed"
+  up="$(g rev-parse refs/up/main)"; fleet="$(g rev-parse refs/fork/fleet)"
+  FLEET_STATE=""
+fi
+
+# ---- 2. keep the fleet branch merged ---------------------------------------
+if [ -z "$FLEET_STATE" ]; then
+  if g merge-base --is-ancestor "$up" "$fleet"; then
+    FLEET_STATE=current
+  else
+    mt="$(g merge-tree --write-tree --name-only --no-messages "$fleet" "$up")"; mrc=$?
+    tree="$(echo "$mt" | head -1)"
+    if [ "$mrc" = 0 ] && [ "$tree" = "$(g rev-parse "$up^{tree}")" ]; then
+      FLEET_STATE=retired
+      alert "retired:$up" "Desktop switcher: upstream has it" \
+        "Upstream main ${up:0:10} already contains everything on $BRANCH. The Macs' sync job retires itself on its next run (back to plain main). Disable this timer when they have: systemctl disable --now hermes-desktop-carry-maintain.timer"
+    elif [ "$mrc" = 1 ]; then
+      FLEET_STATE=conflict
+      files="$(echo "$mt" | sed 1d | sed '/^$/d' | head -10)"
+      alert "conflict:$fleet" "Desktop switcher: upstream conflicts with the fleet branch" \
+        "Merging upstream main ${up:0:10} into $BRANCH (${fleet:0:10}) conflicts in:
+$files
+Fleet Macs hold safely on their last good build until the branch is resolved. Ask Hermes: \"resolve the desktop switcher fleet merge\"."
+    elif [ "$mrc" != 0 ]; then
+      FLEET_STATE=error; note "fleet: merge-tree failed rc=$mrc"
+    else
+      # Clean merge. Deterministic commit (dates pinned to upstream) so reruns reuse it.
+      d="$(g log -1 --format=%cI "$up")"
+      cand="$(GIT_AUTHOR_NAME="Hermes fleet carry" GIT_AUTHOR_EMAIL=fleet-carry@hermes.local \
+              GIT_COMMITTER_NAME="Hermes fleet carry" GIT_COMMITTER_EMAIL=fleet-carry@hermes.local \
+              GIT_AUTHOR_DATE="$d" GIT_COMMITTER_DATE="$d" \
+              g commit-tree "$tree" -p "$fleet" -p "$up" -m "Merge upstream main ${up:0:10} into $BRANCH")"
+      verdict="$(awk -v c="$cand" '$1 == c { print $2 }' "$STATE/tested" 2>/dev/null | tail -1)"
+      if [ -z "$verdict" ] || [ "$verdict" = unavailable ]; then
+        if ! g push -q "$FORK" "+$cand:refs/heads/$CANDIDATE" 2>"$STATE/push.err"; then
+          verdict=push_failed
+        else
+          test_host="$(target_of test)"
+          if [ -z "$test_host" ]; then
+            verdict=unavailable
+          else
+            res="$(timeout "$CHECK_TIMEOUT" ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 "$test_host" "bash -s -- $cand $up $FORK $UP" <"$CHECK" 2>"$STATE/check.err" | grep '^CHECK=' | tail -1)"
+            case "$res" in
+              "CHECK=pass") verdict=pass ;;
+              CHECK=fail*)  verdict=fail; echo "$res" >"$STATE/check.result" ;;
+              *)            verdict=unavailable; echo "${res:-no result}" >"$STATE/check.result" ;;
+            esac
+          fi
+          [ "$verdict" = unavailable ] || echo "$cand $verdict" >>"$STATE/tested"
+        fi
+      fi
+      case "$verdict" in
+        pass)
+          if g push -q "$FORK" "$cand:refs/heads/$BRANCH" 2>"$STATE/push.err"; then
+            FLEET_STATE="advanced:${cand:0:10}"; unsince test_unavailable
+            clear_alerts "testfail:"; clear_alerts "conflict:"; clear_alerts "test_unavailable"
+          else
+            FLEET_STATE=push_failed
+          fi ;;
+        fail)
+          FLEET_STATE=tests_failed
+          alert "testfail:$cand" "Desktop switcher: upstream merge fails checks" \
+            "The clean merge of upstream ${up:0:10} into $BRANCH fails on the test Mac: $(cat "$STATE/check.result" 2>/dev/null)
+The fleet branch was NOT advanced; Macs keep their last good build. Candidate: $CANDIDATE ${cand:0:10}. Ask Hermes: \"fix the desktop switcher fleet merge\"." ;;
+        push_failed)
+          FLEET_STATE=push_failed ;;
+        *)
+          FLEET_STATE=test_unavailable
+          if [ "$(since test_unavailable)" -gt "$STALE_SECS" ]; then
+            alert "test_unavailable" "Desktop switcher: test Mac unreachable" \
+              "Upstream merges have been waiting over a day because the test Mac ($(target_of test)) can't run the checks: $(cat "$STATE/check.result" 2>/dev/null). Macs keep their last good build."
+          fi ;;
+      esac
+      if [ "$FLEET_STATE" = push_failed ] && [ "$(since push_failed)" -gt "$STALE_SECS" ]; then
+        alert "push_failed" "Desktop switcher: h-do1 cannot push to the fork" \
+          "$(head -c 300 "$STATE/push.err")"
+      fi
+      [ "$FLEET_STATE" = push_failed ] || { unsince push_failed; clear_alerts "push_failed"; }
+    fi
+  fi
+  case "$FLEET_STATE" in current|advanced:*) clear_alerts "conflict:"; clear_alerts "testfail:" ;; esac
+  note "fleet: $FLEET_STATE (upstream ${up:0:10}, fleet ${fleet:0:10})"
+fi
+
+# ---- 3. client Macs --------------------------------------------------------
+while IFS= read -r h; do
+  case "$h" in ''|'#'*) continue ;; esac
+  t="$(target_of "$h")"
+  if [ -z "$t" ]; then note "$h: no ssh target in $CONF/targets"; continue; fi
+  last="$(ssh_t -n "$t" 'cat ~/.hermes/desktop-carry/last 2>/dev/null' 2>/dev/null)"
+  if [ -z "$last" ]; then note "$h: unreachable or no status"; continue; fi
+  result="$(echo "$last" | sed -n 's/^result=//p')"; reason="$(echo "$last" | sed -n 's/^reason=//p')"
+  head="$(echo "$last" | sed -n 's/^head=//p')"; at="$(echo "$last" | sed -n 's/^at=//p')"
+  note "$h: $result ($reason) head=$head at=$at"
+  key="client.$h"
+  case "$result" in
+    ok|retired)
+      unsince "$key"; clear_alerts "client:$h:" ;;
+    error)
+      alert "client:$h:error:$reason:$head" "Desktop switcher: $h sync error" \
+        "$h's desktop-carry sync reports error ($reason) at $head ($at). It changes nothing until fixed. Ask Hermes: \"check the desktop switcher on $h\"." ;;
+    *)
+      if [ "$(since "$key")" -gt "$STALE_SECS" ]; then
+        alert "client:$h:$reason:$head" "Desktop switcher: $h held for over a day" \
+          "$h's desktop-carry sync has been holding ($reason) for over a day, at $head (last run $at). Ask Hermes: \"finish the desktop switcher on $h\"."
+      fi ;;
+  esac
+done <"$CONF/hosts"
+
+{ echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; printf '%s\n' "${SUMMARY[@]}"; } >"$STATE/status.tmp" && mv "$STATE/status.tmp" "$STATE/status"
+exit 0

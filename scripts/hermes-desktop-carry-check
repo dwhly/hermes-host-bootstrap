@@ -1,0 +1,68 @@
+#!/bin/bash
+# hermes-desktop-carry-check — run ON the test Mac (piped over SSH by
+# hermes-desktop-carry-maintain). Checks a fleet/desktop-switcher merge candidate:
+# typecheck, the switcher-area tests and eslint on the switcher's files. Any vitest
+# failure is re-run on the clean upstream base; only candidate-only failures block.
+#
+# usage: bash -s -- <candidate-sha> <upstream-sha> <fork-url> <upstream-url>
+# stdout last line: CHECK=pass | CHECK=fail reason=<...> | CHECK=error reason=<...>
+set -u
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export GIT_TERMINAL_PROMPT=0
+CAND="${1:?candidate sha}"; BASE="${2:?upstream sha}"; FORK="${3:?fork url}"; UP="${4:?upstream url}"
+W="${HERMES_CARRY_CI_DIR:-$HOME/build/switcher-ci}"
+LOG="$W.log"
+AREAS="src/app/chat/sidebar src/components/pane-shell src/app/contrib src/app/shell src/app/right-sidebar electron/machine-profile.test.ts electron/window-focus-policy.test.ts"
+
+out() { echo "CHECK=$*"; exit 0; }
+say() { echo "$(date -u +%H:%M:%S) $*" >&2; }
+
+command -v node >/dev/null && command -v npm >/dev/null || out "error reason=no_node"
+if [ ! -d "$W/.git" ]; then
+  ref=""; [ -d "$HOME/.hermes/hermes-agent/.git" ] && ref="--reference-if-able $HOME/.hermes/hermes-agent --dissociate"
+  # shellcheck disable=SC2086
+  git clone -q $ref "$UP" "$W" >&2 || out "error reason=clone_failed"
+fi
+git -C "$W" fetch -q "$FORK" "+refs/heads/fleet/desktop-switcher-candidate:refs/ci/candidate" >&2 || out "error reason=fetch_candidate_failed"
+git -C "$W" fetch -q "$UP" "+refs/heads/main:refs/ci/upstream" >&2 || out "error reason=fetch_upstream_failed"
+git -C "$W" cat-file -e "$CAND^{commit}" 2>/dev/null || out "error reason=candidate_missing"
+git -C "$W" cat-file -e "$BASE^{commit}" 2>/dev/null || out "error reason=base_missing"
+git -C "$W" checkout -q --detach --force "$CAND" >&2 || out "error reason=checkout_failed"
+git -C "$W" clean -q -fdx -e node_modules -e '**/node_modules' >&2
+
+install() {  # npm ci in $1; the repo's engines field excludes some npm releases
+  ( cd "$1" && { npm ci --no-audit --no-fund >"$LOG.npm" 2>&1 || npx -y npm@11 ci --no-audit --no-fund >"$LOG.npm" 2>&1; } )
+}
+say "install"; install "$W" || out "error reason=npm_ci_failed"
+D="$W/apps/desktop"
+say "typecheck"; ( cd "$D" && npm run -s typecheck >"$LOG.tc" 2>&1 ) || out "fail reason=typecheck"
+files="$(git -C "$W" diff --name-only --diff-filter=AM "$BASE" "$CAND" -- apps/desktop | grep -E '\.(ts|tsx)$' | sed 's#^apps/desktop/##')"
+if [ -n "$files" ]; then
+  say "eslint"; ( cd "$D" && echo "$files" | xargs npx eslint --max-warnings=0 >"$LOG.lint" 2>&1 ) || out "fail reason=eslint"
+fi
+
+failing() {  # failing test names from a vitest log
+  sed -E 's/\x1b\[[0-9;]*m//g' "$1" | grep -E '^ *(FAIL|×) ' | sed -E 's/^ *(FAIL|×) +//; s/ [0-9]+ms$//' | sort -u
+}
+say "vitest (switcher areas)"
+# shellcheck disable=SC2086
+( cd "$D" && npx vitest run $AREAS >"$LOG.vt" 2>&1 ); vrc=$?
+[ "$vrc" = 0 ] && out "pass"
+grep -qE 'Test Files' "$LOG.vt" || out "error reason=vitest_crashed"
+failing "$LOG.vt" >"$LOG.fail-cand"
+ffiles="$(sed -E 's/\x1b\[[0-9;]*m//g' "$LOG.vt" | grep -E '^ *FAIL ' | grep -oE '[A-Za-z0-9_./-]+\.test\.(ts|tsx|mjs)' | sort -u)"
+[ -n "$ffiles" ] || out "error reason=vitest_failed_unparsed"
+
+say "baseline on upstream $BASE"
+B="$W-base"
+if [ ! -d "$B" ]; then git -C "$W" worktree add -q --detach "$B" "$BASE" >&2 || out "error reason=base_worktree_failed"; fi
+git -C "$B" checkout -q --detach --force "$BASE" >&2 || out "error reason=base_checkout_failed"
+install "$B" || out "error reason=base_npm_ci_failed"
+( cd "$B/apps/desktop" && echo "$ffiles" | xargs npx vitest run >"$LOG.vt-base" 2>&1 )
+failing "$LOG.vt-base" >"$LOG.fail-base"
+only="$(comm -13 "$LOG.fail-base" "$LOG.fail-cand")"
+if [ -n "$only" ]; then
+  echo "$only" | head -5 >&2
+  out "fail reason=tests n=$(echo "$only" | wc -l | tr -d ' ')"
+fi
+out "pass"

@@ -1,0 +1,6 @@
+# SSH targets for M8: each M7 host (status reads) plus `test` (the Mac that runs
+# hermes-desktop-carry-check on every upstream merge before the fleet sees it).
+# <name> <user@tailnet-ip>
+test    dano@100.110.241.2
+h-air2  dano@100.102.78.73
+h-mini2 dano@100.110.241.2
