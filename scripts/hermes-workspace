@@ -217,8 +217,11 @@ shell_quote() {
   printf "'%s'" "$value"
 }
 
-# Run a command with a hard wall-clock cap. ssh's ConnectTimeout bounds only the
+# Run a command with a wall-clock cap. ssh's ConnectTimeout bounds only the
 # TCP connect; a Tailscale SSH browser check can block indefinitely after that.
+# The cap is hard only for direct ssh with perl present (every fleet Mac and
+# Linux host): a ProxyCommand child can outlive the alarm and hold the capture
+# pipe open, and without perl the command runs uncapped.
 hmw_bounded() {
   local seconds=$1
   shift
