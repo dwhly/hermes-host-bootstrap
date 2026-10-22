@@ -106,14 +106,20 @@ sleep 0.5; pgrep -f "fake-orphan-$CAND" >/dev/null && fail "8g orphaned worker s
 run; want "CHECK=pass" "8h next run after orphan"
 
 # 8i. A step group that cannot be stopped: an error (never a pass, even with only shared
-#     failures), and the run keeps the lock while it retries, so a second run is busy.
-HERMES_CARRY_TEST_STUCK=1 HERMES_CARRY_HOLD_SECS=6 FAKE_VT_CAND=fail:x FAKE_VT_BASE=fail:x \
-  bash "$CHECK" "$CAND" "$BASE" "$FORKB" "$UPB" >"$W/c2" 2>/dev/null & C2=$!
-for _ in $(seq 1 50); do grep -q '^CHECK=' "$W/c2" 2>/dev/null && break; sleep 0.2; done
+#     failures). The verdict is delivered and the caller returns at once, but the run
+#     keeps the lock for as long as the group survives -- no time limit -- and frees
+#     it only once the group is confirmed gone.
+STUCK="$W/stuck"; : >"$STUCK"
+t0=$SECONDS
+HERMES_CARRY_TEST_STUCK="$STUCK" FAKE_VT_CAND=fail:x FAKE_VT_BASE=fail:x \
+  bash "$CHECK" "$CAND" "$BASE" "$FORKB" "$UPB" >"$W/c2" 2>/dev/null
 grep -q '^CHECK=error reason=cleanup_failed$' "$W/c2" || fail "8i want cleanup_failed, got: $(cat "$W/c2")"
+[ $((SECONDS - t0)) -lt 40 ] || fail "8i caller waited for the hold ($((SECONDS - t0))s)"
 run; want "CHECK=error reason=busy" "8i lock held while a group survives"
-wait "$C2"
-run; want "CHECK=pass" "8j lock released after the hold"
+sleep 20
+run; want "CHECK=error reason=busy" "8i lock still held 20s later (no time limit)"
+rm -f "$STUCK"; sleep 7
+run; want "CHECK=pass" "8j lock released once the group is gone"
 
 # 9. The reused baseline worktree is cleaned before use.
 echo junk >"$HERMES_CARRY_CI_DIR-base/apps/desktop/stale.generated.ts"

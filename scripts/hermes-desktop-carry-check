@@ -33,8 +33,8 @@ perl -MFcntl=:flock -e 'open(my $f, ">>&=", 8) or exit 2; exit(flock($f, LOCK_EX
 # workers a runner leaves behind -- even orphaned ones, which npm/node children are
 # when the runner dies, and which do not inherit fd 8 -- stay findable by group.
 STEP_GROUPS=""
-HOLD_SECS="${HERMES_CARRY_HOLD_SECS:-600}"
-alive() { [ -n "${HERMES_CARRY_TEST_STUCK:-}" ] || kill -0 -- "-$1" 2>/dev/null; }   # test hook: a group that never exits
+# Test hook: while the file HERMES_CARRY_TEST_STUCK names exists, every group looks alive.
+alive() { { [ -n "${HERMES_CARRY_TEST_STUCK:-}" ] && [ -e "$HERMES_CARRY_TEST_STUCK" ]; } || kill -0 -- "-$1" 2>/dev/null; }
 reap() {  # reap <pgid>: TERM the group, 5s grace, KILL, confirm empty
   local g="$1"
   alive "$g" || return 0
@@ -44,15 +44,23 @@ reap() {  # reap <pgid>: TERM the group, 5s grace, KILL, confirm empty
   for _ in 1 2 3 4 5 6; do alive "$g" || return 0; sleep 0.5; done
   echo "warning: process group $g did not exit" >&2; return 1
 }
-stop_all() {  # empty every step group; while any survives, stay alive (holding fd 8,
-  local g left t=0  # the lock) and keep KILLing, up to HOLD_SECS
-  while :; do
-    left=""
-    for g in $STEP_GROUPS; do reap "$g" || left="$left $g"; done
-    [ -z "$left" ] && return 0
-    [ "$t" -ge "$HOLD_SECS" ] && { echo "warning: groups$left still alive after ${HOLD_SECS}s" >&2; return 1; }
-    sleep 5; t=$((t + 5))
-  done
+stop_all() {  # empty every step group. The lock (fd 8) is never released while any
+  local g left  # group survives: a detached holder inherits fd 8 (same open file, so
+  left=""       # the same flock) and keeps KILLing until every group is gone, while
+  for g in $STEP_GROUPS; do reap "$g" || left="$left $g"; done   # this run exits and
+  [ -z "$left" ] && return 0                                    # delivers its verdict.
+  (
+    trap '' HUP INT TERM PIPE
+    exec </dev/null >/dev/null 2>&1 7>&-
+    # shellcheck disable=SC2086
+    set -- $left
+    while [ "$#" -gt 0 ]; do
+      sleep 5; still=""
+      for g in "$@"; do kill -KILL -- "-$g" 2>/dev/null; alive "$g" && still="$still $g"; done
+      # shellcheck disable=SC2086
+      set -- $still
+    done
+  ) &
 }
 # On any exit (incl. SIGHUP when SSH drops) every step group is emptied before fd 8
 # (the lock) closes with this shell.
