@@ -47,6 +47,7 @@ reap() {  # reap <pgid>: TERM the group, 5s grace, KILL, confirm empty
 stop_all() {  # empty every step group. The lock (fd 8) is never released while any
   local g left  # group survives: a detached holder inherits fd 8 (same open file, so
   left=""       # the same flock) and keeps KILLing until every group is gone, while
+  trap '' HUP INT TERM PIPE   # a second signal must not cut cleanup short
   for g in $STEP_GROUPS; do reap "$g" || left="$left $g"; done   # this run exits and
   [ -z "$left" ] && return 0                                    # delivers its verdict.
   (

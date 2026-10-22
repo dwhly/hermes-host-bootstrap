@@ -96,6 +96,16 @@ t0=$SECONDS; kill -HUP "$CP"; wait "$CP" 2>/dev/null; sleep 0.5
 [ $((SECONDS - t0)) -lt 15 ] || fail "8d cleanup too slow ($((SECONDS - t0))s)"
 pgrep -f "fake-hang-$CAND" >/dev/null && fail "8d TERM-ignoring descendant survived"
 run; want "CHECK=pass" "8e lock free after cleanup"
+# 8e2. Repeated signals: TERM starts cleanup, HUP arrives mid-reap. Cleanup must still
+#      finish: the TERM-ignoring step is KILLed before the check exits.
+FAKE_VT_CAND=hangterm bash "$CHECK" "$CAND" "$BASE" "$FORKB" "$UPB" >/dev/null 2>&1 & CP=$!
+for _ in $(seq 1 50); do pgrep -f "fake-hang-$CAND" >/dev/null && break; sleep 0.2; done
+pgrep -f "fake-hang-$CAND" >/dev/null || fail "8e2 hang never started"
+kill -TERM "$CP"; sleep 1.5; kill -HUP "$CP"; sleep 0.3; kill -TERM "$CP" 2>/dev/null
+wait "$CP" 2>/dev/null; sleep 0.5
+pgrep -f "fake-hang-$CAND" >/dev/null && fail "8e2 second signal cut cleanup short: step survived"
+run; want "CHECK=pass" "8e2 next run after repeated signals"
+
 # 8f. A runner killed by a signal is an error even if its JSON shows only shared failures.
 FAKE_VT_CAND=fail:x,killed FAKE_VT_BASE=fail:x run; want "CHECK=error reason=vitest_killed rc=137" "8f killed runner"
 
@@ -129,4 +139,4 @@ FAKE_VT_CAND=fail:x FAKE_VT_BASE=fail:x run; want "CHECK=pass" "9 run"
 # 10. Unknown candidate.
 run 0000000000000000000000000000000000000001; want "CHECK=error reason=candidate_missing" "10 missing candidate"
 
-echo "PASS test_desktop_carry_check (27 checks)"
+echo "PASS test_desktop_carry_check (29 checks)"
