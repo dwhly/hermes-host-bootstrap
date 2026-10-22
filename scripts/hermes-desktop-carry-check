@@ -18,6 +18,17 @@ out() { echo "CHECK=$*"; exit 0; }
 say() { echo "$(date -u +%H:%M:%S) $*" >&2; }
 
 command -v node >/dev/null && command -v npm >/dev/null || out "error reason=no_node"
+# One check at a time on this Mac: an SSH timeout can leave a run going while the
+# control plane retries. mkdir is atomic; a lock whose pid is gone is reclaimed.
+LOCK="$W.lock"
+mkdir -p "$(dirname "$W")"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  lp="$(cat "$LOCK/pid" 2>/dev/null)"
+  if [ -n "$lp" ] && kill -0 "$lp" 2>/dev/null; then out "error reason=busy"; fi
+  rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null || out "error reason=busy"
+fi
+echo $$ >"$LOCK/pid"
+trap 'rm -rf "$LOCK"' EXIT
 if [ ! -d "$W/.git" ]; then
   ref=""; [ -d "$HOME/.hermes/hermes-agent/.git" ] && ref="--reference-if-able $HOME/.hermes/hermes-agent --dissociate"
   # shellcheck disable=SC2086
@@ -28,7 +39,7 @@ git -C "$W" fetch -q "$UP" "+refs/heads/main:refs/ci/upstream" >&2 || out "error
 git -C "$W" cat-file -e "$CAND^{commit}" 2>/dev/null || out "error reason=candidate_missing"
 git -C "$W" cat-file -e "$BASE^{commit}" 2>/dev/null || out "error reason=base_missing"
 git -C "$W" checkout -q --detach --force "$CAND" >&2 || out "error reason=checkout_failed"
-git -C "$W" clean -q -fdx -e node_modules -e '**/node_modules' >&2
+git -C "$W" clean -q -fdx -e node_modules -e '**/node_modules' >&2 || out "error reason=clean_failed"
 
 install() {  # npm ci in $1; the repo's engines field excludes some npm releases
   ( cd "$1" && { npm ci --no-audit --no-fund >"$LOG.npm" 2>&1 || npx -y npm@11 ci --no-audit --no-fund >"$LOG.npm" 2>&1; } )
@@ -41,25 +52,44 @@ if [ -n "$files" ]; then
   say "eslint"; ( cd "$D" && echo "$files" | xargs npx eslint --max-warnings=0 >"$LOG.lint" 2>&1 ) || out "fail reason=eslint"
 fi
 
-failing() {  # failing test names from a vitest log
-  sed -E 's/\x1b\[[0-9;]*m//g' "$1" | grep -E '^ *(FAIL|×) ' | sed -E 's/^ *(FAIL|×) +//; s/ [0-9]+ms$//' | sort -u
+# failures <json> <root> -> one id per failing suite or test, from vitest's JSON
+# reporter (never from console text). Prints nothing and exits 1 if the JSON is
+# missing or incomplete.
+failures() {
+  node - "$1" "$2" <<'JS'
+const fs = require('fs'); const [json, root] = process.argv.slice(2)
+let r; try { r = JSON.parse(fs.readFileSync(json, 'utf8')) } catch { process.exit(1) }
+if (!Array.isArray(r.testResults)) process.exit(1)
+const ids = new Set()
+for (const f of r.testResults) {
+  const file = String(f.name || '').split(root + '/').pop()
+  const failed = (f.assertionResults || []).filter(a => a.status === 'failed')
+  if (f.status === 'failed' && failed.length === 0) ids.add(`suite ${file}`)
+  for (const a of failed) ids.add(`test ${file} :: ${a.fullName || a.title}`)
 }
+if (ids.size) console.log([...ids].sort().join('\n'))
+JS
+}
+unhandled() { sed -E 's/\x1b\[[0-9;]*m//g' "$1" | grep -cE 'Unhandled (Error|Rejection)'; }
 say "vitest (switcher areas)"
+rm -f "$LOG.vt.json" "$LOG.vt-base.json"   # never read a previous run's results
 # shellcheck disable=SC2086
-( cd "$D" && npx vitest run $AREAS >"$LOG.vt" 2>&1 ); vrc=$?
-[ "$vrc" = 0 ] && out "pass"
-grep -qE 'Test Files' "$LOG.vt" || out "error reason=vitest_crashed"
-failing "$LOG.vt" >"$LOG.fail-cand"
-ffiles="$(sed -E 's/\x1b\[[0-9;]*m//g' "$LOG.vt" | grep -E '^ *FAIL ' | grep -oE '[A-Za-z0-9_./-]+\.test\.(ts|tsx|mjs)' | sort -u)"
-[ -n "$ffiles" ] || out "error reason=vitest_failed_unparsed"
+( cd "$D" && npx vitest run $AREAS --reporter=default --reporter=json --outputFile.json="$LOG.vt.json" >"$LOG.vt" 2>&1 ); vrc=$?
+[ "$vrc" = 0 ] && [ "$(unhandled "$LOG.vt")" = 0 ] && out "pass"
+failures "$LOG.vt.json" "$D" >"$LOG.fail-cand" || out "error reason=vitest_no_results"
+[ -s "$LOG.fail-cand" ] || out "fail reason=runner_error"   # nonzero exit / unhandled error, no failing test to compare
+ffiles="$(sed -E 's/^(suite|test) //; s/ :: .*$//' "$LOG.fail-cand" | sort -u)"
 
 say "baseline on upstream $BASE"
 B="$W-base"
 if [ ! -d "$B" ]; then git -C "$W" worktree add -q --detach "$B" "$BASE" >&2 || out "error reason=base_worktree_failed"; fi
 git -C "$B" checkout -q --detach --force "$BASE" >&2 || out "error reason=base_checkout_failed"
+git -C "$B" clean -q -fdx -e node_modules -e '**/node_modules' >&2 || out "error reason=base_clean_failed"
 install "$B" || out "error reason=base_npm_ci_failed"
-( cd "$B/apps/desktop" && echo "$ffiles" | xargs npx vitest run >"$LOG.vt-base" 2>&1 )
-failing "$LOG.vt-base" >"$LOG.fail-base"
+( cd "$B/apps/desktop" && echo "$ffiles" | xargs npx vitest run --reporter=default --reporter=json --outputFile.json="$LOG.vt-base.json" >"$LOG.vt-base" 2>&1 )
+failures "$LOG.vt-base.json" "$B/apps/desktop" >"$LOG.fail-base" || out "error reason=base_vitest_no_results"
+# An unhandled error on the candidate that the clean base does not also show blocks.
+[ "$(unhandled "$LOG.vt")" -gt "$(unhandled "$LOG.vt-base")" ] && out "fail reason=unhandled_error"
 only="$(comm -13 "$LOG.fail-base" "$LOG.fail-cand")"
 if [ -n "$only" ]; then
   echo "$only" | head -5 >&2

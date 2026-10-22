@@ -40,6 +40,7 @@ esac
 SH
 cat >"$W/check.sh" <<'SH'
 echo "check args: $*" >&2
+[ -n "${FAKE_CHECK_SIDE:-}" ] && eval "$FAKE_CHECK_SIDE"
 echo "CHECK=${FAKE_CHECK:-pass}"
 SH
 cat >"$W/send.sh" <<'SH'
@@ -97,31 +98,53 @@ FAKE_SSH_DOWN=1 run; [ "$(sends)" = 2 ] || fail "5: no alert after a day"
 FAKE_SSH_DOWN=1 run; [ "$(sends)" = 2 ] || fail "5: repeated"
 run; expect "fleet: advanced:"; [ -e "$W/state/since.test_unavailable" ] && fail "5: since not cleared"
 
+# 5b. Unavailable, then a completed (failing) check: availability state resets, so a later
+#     outage is quiet again for a day instead of alerting at once.
+up_commit e2.txt e2
+FAKE_SSH_DOWN=1 run; echo 0 >"$W/state/since.test_unavailable"
+n="$(sends)"; FAKE_SSH_DOWN=1 run; [ "$(sends)" = $((n + 1)) ] || fail "5b: no outage alert"
+FAKE_CHECK="fail reason=tests n=1" run; expect "fleet: tests_failed"
+[ -e "$W/state/since.test_unavailable" ] && fail "5b: availability not reset by a completed check"
+grep -q "^test_unavailable$" "$W/state/alerted" && fail "5b: outage alert key kept"
+up_commit e3.txt e3
+n="$(sends)"; FAKE_SSH_DOWN=1 run; [ "$(sends)" = "$n" ] || fail "5b: immediate alert on a fresh outage"
+run; expect "fleet: advanced:"
+
+# 5c. The fork branch is rewound while the check runs: the leased push refuses, and the
+#     fleet branch keeps the rewound head (nothing is overwritten).
+fr="$(fleet_head)"; up_commit e4.txt e4
+FAKE_CHECK_SIDE="git --git-dir='$FORKB' update-ref refs/heads/fleet/desktop-switcher '$fr~1'" run
+expect "fleet: push_failed"
+[ "$(fleet_head)" = "$(git --git-dir="$FORKB" rev-parse "$fr~1")" ] || fail "5c: rewound branch overwritten"
+git --git-dir="$FORKB" update-ref refs/heads/fleet/desktop-switcher "$fr"
+run; expect "fleet: advanced:"
+
 # 6. Conflict: one message naming the file; fleet untouched; resolved by hand -> current.
+: >"$W/sent"   # counts below are from here
 git -C "$F" pull -q --no-rebase "$FORKB" fleet/desktop-switcher
 echo fleet-a >"$F/apps/desktop/a.txt"; git -C "$F" commit -qam "fleet: a"; git -C "$F" push -q "$FORKB" fleet/desktop-switcher
 f4="$(fleet_head)"; up_commit a.txt up-a
 run; expect "fleet: conflict"; [ "$(fleet_head)" = "$f4" ] || fail "6: fleet moved"
-[ "$(sends)" = 3 ] || fail "6: want alert"; tail -8 "$W/sent" | grep -q "apps/desktop/a.txt" || fail "6: file not named"
-run; [ "$(sends)" = 3 ] || fail "6: repeated"
+[ "$(sends)" = 1 ] || fail "6: want alert"; tail -8 "$W/sent" | grep -q "apps/desktop/a.txt" || fail "6: file not named"
+run; [ "$(sends)" = 1 ] || fail "6: repeated"
 git -C "$F" pull -q --no-rebase "$UPB" main 2>/dev/null; echo resolved >"$F/apps/desktop/a.txt"
 git -C "$F" commit -qam "merge upstream (resolved)"; git -C "$F" push -q "$FORKB" fleet/desktop-switcher
 run; expect "fleet: current"; grep -q "^conflict:" "$W/state/alerted" && fail "6: conflict alert not cleared"
 
 # 7. Clients: held -> quiet for a day, then one alert; ok clears; error alerts at once;
 #    a listed host with no ssh target or no status is noted, never fatal.
-client held needs_full_update; run; expect "h-air2: held (needs_full_update)"; [ "$(sends)" = 3 ] || fail "7: early"
-echo 0 >"$W/state/since.client.h-air2"; run; [ "$(sends)" = 4 ] || fail "7: no stale alert"
-run; [ "$(sends)" = 4 ] || fail "7: repeated"
+client held needs_full_update; run; expect "h-air2: held (needs_full_update)"; [ "$(sends)" = 1 ] || fail "7: early"
+echo 0 >"$W/state/since.client.h-air2"; run; [ "$(sends)" = 2 ] || fail "7: no stale alert"
+run; [ "$(sends)" = 2 ] || fail "7: repeated"
 client ok up_to_date; run; grep -q "^client:h-air2:" "$W/state/alerted" && fail "7: not cleared"
-client error merge_conflict_unexpected; run; [ "$(sends)" = 5 ] || fail "7: error not alerted"
+client error merge_conflict_unexpected; run; [ "$(sends)" = 3 ] || fail "7: error not alerted"
 client ok up_to_date
 printf 'h-air2\nh-gone\nh-nomap\n' >"$W/conf/hosts"
 run; expect "h-gone: unreachable"; expect "h-nomap: no ssh target"
 printf 'h-air2\n' >"$W/conf/hosts"
 
 # 8. Fetch failure: no crash, no early alert.
-HERMES_CARRY_FORK="$W/missing.git" run; expect "fleet: fetch_failed"; [ "$(sends)" = 5 ] || fail "8: early alert"
+HERMES_CARRY_FORK="$W/missing.git" run; expect "fleet: fetch_failed"; [ "$(sends)" = 3 ] || fail "8: early alert"
 
 # 9. Another run holds the lock: exit quietly.
 ( flock 9; sleep 3 ) 9>"$W/state/lock" & sleep 0.5
@@ -139,5 +162,6 @@ git -C "$U" pull -q --no-rebase "$UPB" main; git -C "$U" pull -q --no-rebase --n
 git -C "$U" push -q "$UPB" main; git -C "$U" commit -q --allow-empty -m "up: after merge"; git -C "$U" push -q "$UPB" main
 n="$(sends)"; run; expect "fleet: retired"; [ "$(sends)" = $((n + 1)) ] || fail "11: no retired message"
 run; [ "$(sends)" = $((n + 1)) ] || fail "11: repeated"
+up_commit h.txt h; run; expect "fleet: retired"; [ "$(sends)" = $((n + 1)) ] || fail "11: re-sent as upstream moved"
 
-echo "PASS test_desktop_carry_maintain (11 scenarios)"
+echo "PASS test_desktop_carry_maintain (13 scenarios)"

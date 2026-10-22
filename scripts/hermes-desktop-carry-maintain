@@ -51,8 +51,7 @@ alert() {  # alert <key> <subject> <body>: once per key until cleared
   if send "$2" "$3"; then echo "$1" >>"$STATE/alerted"; else note "alert send failed: $1"; fi
 }
 clear_alerts() {  # clear_alerts <prefix>: a recovered condition may alert again later
-  grep -v -F -- "$1" "$STATE/alerted" >"$STATE/alerted.tmp" 2>/dev/null
-  mv "$STATE/alerted.tmp" "$STATE/alerted"
+  awk -v p="$1" 'index($0, p) != 1' "$STATE/alerted" >"$STATE/alerted.tmp" && mv "$STATE/alerted.tmp" "$STATE/alerted"
 }
 since() {  # since <key> -> seconds this condition has been continuously observed
   local f="$STATE/since.$1"
@@ -89,7 +88,7 @@ if [ -z "$FLEET_STATE" ]; then
     tree="$(echo "$mt" | head -1)"
     if [ "$mrc" = 0 ] && [ "$tree" = "$(g rev-parse "$up^{tree}")" ]; then
       FLEET_STATE=retired
-      alert "retired:$up" "Desktop switcher: upstream has it" \
+      alert "retired" "Desktop switcher: upstream has it" \
         "Upstream main ${up:0:10} already contains everything on $BRANCH. The Macs' sync job retires itself on its next run (back to plain main). Disable this timer when they have: systemctl disable --now hermes-desktop-carry-maintain.timer"
     elif [ "$mrc" = 1 ]; then
       FLEET_STATE=conflict
@@ -123,14 +122,21 @@ Fleet Macs hold safely on their last good build until the branch is resolved. As
               *)            verdict=unavailable; echo "${res:-no result}" >"$STATE/check.result" ;;
             esac
           fi
-          [ "$verdict" = unavailable ] || echo "$cand $verdict" >>"$STATE/tested"
+          if [ "$verdict" != unavailable ]; then
+            echo "$cand $verdict" >>"$STATE/tested"
+            unsince test_unavailable; clear_alerts "test_unavailable"   # the test Mac answered
+          fi
         fi
       fi
       case "$verdict" in
         pass)
-          if g push -q "$FORK" "$cand:refs/heads/$BRANCH" 2>"$STATE/push.err"; then
+          # Promote only as a fast-forward of exactly the fleet head we merged: the lease
+          # rejects the push if the fork branch moved (pushed or rewound) since our fetch.
+          if [ "$(g rev-parse "$cand^1")" != "$fleet" ]; then
+            FLEET_STATE=error; note "fleet: candidate first parent is not the fetched fleet head"
+          elif g push -q --force-with-lease="refs/heads/$BRANCH:$fleet" "$FORK" "$cand:refs/heads/$BRANCH" 2>"$STATE/push.err"; then
             FLEET_STATE="advanced:${cand:0:10}"; unsince test_unavailable
-            clear_alerts "testfail:"; clear_alerts "conflict:"; clear_alerts "test_unavailable"
+            clear_alerts "testfail:"; clear_alerts "conflict:"
           else
             FLEET_STATE=push_failed
           fi ;;
@@ -155,7 +161,11 @@ The fleet branch was NOT advanced; Macs keep their last good build. Candidate: $
       [ "$FLEET_STATE" = push_failed ] || { unsince push_failed; clear_alerts "push_failed"; }
     fi
   fi
-  case "$FLEET_STATE" in current|advanced:*) clear_alerts "conflict:"; clear_alerts "testfail:" ;; esac
+  case "$FLEET_STATE" in
+    current|retired|advanced:*)
+      clear_alerts "conflict:"; clear_alerts "testfail:"; unsince push_failed; clear_alerts "push_failed" ;;
+  esac
+  [ "$FLEET_STATE" = retired ] || clear_alerts "retired"
   note "fleet: $FLEET_STATE (upstream ${up:0:10}, fleet ${fleet:0:10})"
 fi
 
