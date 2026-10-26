@@ -165,12 +165,68 @@ class Herdr082Tests(unittest.TestCase):
         self.assertFalse((self.home / ".hermes/logs/hmw-review.restore.lock").exists())
 
     def test_reboot_running_session_idle_label_still_refuses(self):
+        # Verify never launches into a server it did not start: it reports the
+        # relaunch a real run would do, and readiness stays honest (fails).
         self.restored()
         result = self.run_core(2)
         self.assert_failed(result)
         self.assertIn("no duplicate was created", result.stderr)
+        self.assertIn("HMW_VERIFY relaunch=H1 pane=w1:p1", result.stdout)
         self.assert_no_launch()
+        self.assertEqual(self.agent_starts(), [])
         self.assertNotIn(["server", "stop"], self.calls())
+
+    def run_live(self, count=1, resume_ids=None):
+        # Real (non-verify) run against an already-running server.
+        stub = "#!/bin/sh\n"
+        for label, sid in (resume_ids or {}).items():
+            stub += '[ "$1" = --print-resume-id ] && [ "$2" = %s ] && { echo %s; exit 0; }\n' % (label, sid)
+        (self.bin / "hermes-pane").write_text(stub + "exit 0\n")
+        env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
+                   HMW_BACKEND="herdr", HMW_REMOTE="1", HMW_VERIFY="0", HERDR_SESSION="review",
+                   HMW_HERDR_READY_TIMEOUT="3", HMW_RESTORE_LOCK_WAIT="2", HMW_SNAPSHOT_INTERVAL="0",
+                   HERMES_HOME=str(self.home / ".hermes"), HERDR_082_STATE=str(self.path), HERDR_082_LOG=str(self.log))
+        return subprocess.run(["bash", str(CORE), str(count)], env=env, capture_output=True, text=True, timeout=25)
+
+    def test_running_session_idle_slot_relaunches_in_same_pane(self):
+        # Hermes exited in H1/H2 (hermes-pane fell to `exec $SHELL`): relaunch in
+        # the SAME panes, resuming each pane:<label> session; never a duplicate.
+        self.restored(launched_state={"visible": COMPOSER, "process": LIVE})
+        result = self.run_live(2, {"H1": "S_H1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.agent_starts(), [
+            start("h1", "w1:p1", "chat", "--source", "pane:H1", "--resume", "S_H1"),
+            start("h2", "w1:p2", "chat", "--source", "pane:H2")])
+        self.assert_no_launch()
+        self.assertEqual(len(self.state()["panes"]), 3)
+        self.assertIn("Hermes had exited in w1:p1 (H1)", result.stderr)
+
+    def test_running_session_busy_slot_is_never_relaunched(self):
+        # Anything but the bare login shell in the foreground fails closed.
+        for name, process in [
+                ("vim", dict(SHELL, foreground_process_group_id=20,
+                             foreground_processes=[{"pid": 20, "name": "vim", "argv": ["vim"]}])),
+                ("two-jobs", dict(SHELL, foreground_processes=SHELL["foreground_processes"]
+                                  + [{"pid": 11, "name": "cat", "argv": ["cat"]}])),
+                ("not-a-shell", dict(SHELL, foreground_processes=[{"pid": 10, "name": "htop", "argv": ["htop"]}]))]:
+            with self.subTest(name):
+                if self.log.exists():
+                    self.log.unlink()
+                self.write(panes=[self.pane("H1")], visible="", process=process)
+                result = self.run_live(1)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("no duplicate was created", result.stderr)
+                self.assertEqual(self.agent_starts(), [])
+                self.assert_no_launch()
+
+    def test_running_session_refused_relaunch_stays_bounded(self):
+        # Herdr refuses (retained identity): note it, fail readiness, no fallback typing.
+        self.write(panes=[self.pane("H1", agent="hermes")], visible="", process=SHELL)
+        result = self.run_live(1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not restart Hermes in w1:p1 (H1)", result.stderr)
+        self.assert_no_launch()
+        self.assertEqual(len(self.state()["panes"]), 1)
 
     def test_reboot_restore_lock_held_refuses_with_hint(self):
         self.restored(stopped=True, launched_state={"visible": COMPOSER, "process": LIVE})

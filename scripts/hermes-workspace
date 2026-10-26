@@ -1503,6 +1503,86 @@ hmw_id_listed() {
   [ -n "$2" ] && printf '%s\n' "$2" | grep -Fqx -- "$1"
 }
 
+# True only when the pane's ONLY foreground job is its own login shell (pid ==
+# shell_pid == foreground group, argv[0] a known shell): Hermes exited and
+# hermes-pane fell through to `exec $SHELL`. Anything else running there
+# (an editor, a build, a half-typed command's child) fails closed.
+herdr_pane_idle_shell() {
+  local pane_id=$1 process_json
+  process_json="$("${HERDR[@]}" pane process-info --pane "$pane_id" 2>/dev/null)" || return
+  HMW_PROCESS_JSON="$process_json" python3 -c 'import json, os, sys
+try:
+    p = json.loads(os.environ["HMW_PROCESS_JSON"])["result"]["process_info"]
+    if p["pane_id"] != sys.argv[1]:
+        raise ValueError
+    jobs = p["foreground_processes"]
+    shell = p["shell_pid"]
+    if type(shell) is not int or shell <= 0 or p["foreground_process_group_id"] != shell:
+        raise ValueError
+    if not isinstance(jobs, list) or len(jobs) != 1 or not isinstance(jobs[0], dict):
+        raise ValueError
+    job = jobs[0]
+    argv = job.get("argv")
+    if job.get("pid") != shell or not isinstance(argv, list) or not argv or not isinstance(argv[0], str):
+        raise ValueError
+    if os.path.basename(argv[0]).lstrip("-") not in ("bash", "zsh", "sh", "dash", "fish", "ksh"):
+        raise ValueError
+except (ValueError, KeyError, TypeError, AttributeError):
+    raise SystemExit(1)' "$pane_id"
+}
+
+# Server already running, but a requested HN slot holds only its idle shell
+# (Hermes exited: /exit, update restart, crash). Relaunch Hermes in that SAME
+# pane — never a duplicate — resuming its pane:<label> session unless that
+# session is already open in another live pane. Runs under the restore lock.
+# Herdr's `agent start --pane` itself refuses a pane not at its prompt.
+herdr_relaunch_idle_slots() {
+  local number label target sid live_map reserved="" unknown=0 mapped=0
+  number=1
+  while [ "$number" -le "$REQUEST_COUNT" ]; do
+    label="$(label_for "$number")"
+    number=$((number + 1))
+    target="$(herdr_target_for_label "$label")" || continue
+    # The live process check is authoritative: Herdr can retain a hermes
+    # identity on a pane after Hermes exits.
+    herdr_pane_idle_shell "$target" || continue
+    # Verify never launches into a server it did not start (the agent would
+    # outlive the probe): report the plan; readiness below stays honest.
+    if [ "$VERIFY" = "1" ]; then
+      printf 'HMW_VERIFY relaunch=%s pane=%s\n' "$label" "$target"
+      continue
+    fi
+    if [ "$mapped" -eq 0 ]; then
+      mapped=1
+      if live_map="$(hmw_snapshot_panes print)"; then
+        reserved="$(printf '%s\n' "$live_map" | awk -F '\t' 'NF == 2 { print $2 }')"
+      else
+        unknown=1
+      fi
+    fi
+    if [ "$unknown" -eq 1 ] || ! sid="$(hermes-pane --print-resume-id "$label" 2>/dev/null)"; then
+      sid="~"
+    fi
+    case "$sid" in ''|*[!A-Za-z0-9_.:-]*) sid="~" ;; esac
+    if [ "$sid" != "~" ] && hmw_id_listed "$sid" "$reserved"; then
+      hmw_note "starting a fresh session in $target ($label): its last session is open elsewhere"
+      sid="~"
+    fi
+    if [ "$sid" = "~" ]; then
+      set -- chat --source "pane:$label"
+      hmw_note "Hermes had exited in $target ($label); starting it again"
+    else
+      reserved+=$'\n'"$sid"
+      set -- chat --source "pane:$label" --resume "$sid"
+      hmw_note "Hermes had exited in $target ($label); resuming session $sid"
+    fi
+    if ! herdr_restore_agent_start "$target" "$label" "$@"; then
+      hmw_note "could not restart Hermes in $target ($label): Herdr refused (not at its shell prompt, or not ready in time)"
+    fi
+  done
+  return 0
+}
+
 herdr_relaunch_restored_panes() {
   local record label target resume_map live_map pane_id sid plan="" fallbacks="" labelled_ids="" reserved="" unknown=0
 
@@ -1676,6 +1756,10 @@ ensure_herdr_workspace() {
     herdr_slot_inventory || return
   fi
   herdr_resolve_requested_slots || return
+  if [ "$HMW_STARTED_SERVER" -eq 0 ]; then
+    HMW_VERIFY_RELAUNCH=""
+    herdr_relaunch_idle_slots
+  fi
   number=1
   while [ "$number" -le "$REQUEST_COUNT" ]; do
     label="$(label_for "$number")"
