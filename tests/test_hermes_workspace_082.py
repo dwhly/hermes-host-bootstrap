@@ -193,7 +193,10 @@ class Herdr082Tests(unittest.TestCase):
         # the SAME panes, resuming each pane:<label> session; never a duplicate.
         self.restored(launched_state={"visible": COMPOSER, "process": LIVE})
         result = self.run_live(2, {"H1": "S_H1"})
-        self.assertEqual(result.returncode, 0, result.stderr)
+        # Readiness passed and hmw went on to attach (the fixture rejects the
+        # bare interactive `herdr` call, so the exit code is not the signal).
+        self.assertNotIn("no duplicate was created", result.stderr)
+        self.assertIn([], [c for c in self.calls() if isinstance(c, list)])
         self.assertEqual(self.agent_starts(), [
             start("h1", "w1:p1", "chat", "--source", "pane:H1", "--resume", "S_H1"),
             start("h2", "w1:p2", "chat", "--source", "pane:H2")])
