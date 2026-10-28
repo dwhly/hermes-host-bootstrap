@@ -759,6 +759,52 @@ class Herdr082Tests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assert_no_launch()
 
+    def tui_process(self, launcher_argv, gateway=True):
+        # The real 0.21 TUI foreground job: managed launcher -> node ui-tui -> gateway.
+        jobs = [{"pid": 20, "argv": launcher_argv},
+                {"pid": 21, "argv": ["/h/.hermes/tools/node-26.7.0/bin/node", "--expose-gc", "/h/ui-tui/dist/entry.js"]}]
+        if gateway:
+            jobs.append({"pid": 22, "argv": [STORE_PY, "-m", "tui_gateway.entry"]})
+        return dict(LIVE, foreground_processes=jobs)
+
+    RESUMED_TUI = ("    • Upstream: I could open a fix PR, since origin/main has the bug too.\n"
+                   "    • Wiki: the commit is still waiting for your go-ahead.             ┃\n"
+                   " ─ ready │ opus late ─  Find photo touched up with Gemin…\n ❯\n")
+
+    def test_resumed_managed_tui_without_identity_is_ready(self):
+        # h-mini2: Herdr cannot name a python3 process, and a resumed TUI never shows
+        # the classic composer. Live launcher + TUI gateway + TUI ready line is ready.
+        argv = [STORE_PY, "-I", "-c", launcher_script("hermes_cli.main"), "--resume", "20260925_051119_02a67f"]
+        self.write(panes=[self.pane("H1")], visible=self.RESUMED_TUI, process=self.tui_process(argv))
+        result = self.run_core()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_no_launch()
+
+    def test_resumed_tui_ready_line_sixth_from_last_is_ready(self):
+        # Window edge: ready status 6th from last non-empty line, prompt last.
+        argv = [STORE_PY, "-I", "-c", launcher_script("hermes_cli.main"), "--resume", "20260925_051119_02a67f"]
+        visible = " ─ ready │ opus ─ t\n" + "".join(f"line {n}\n" for n in range(4)) + " ❯\n"
+        self.write(panes=[self.pane("H1")], visible=visible, process=self.tui_process(argv))
+        result = self.run_core()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_no_launch()
+
+    def test_resumed_tui_lookalikes_fail_closed(self):
+        hermes = [STORE_PY, "-I", "-c", launcher_script("hermes_cli.main"), "--resume", "20260925_051119_02a67f"]
+        cases = {
+            "no gateway": (hermes, self.RESUMED_TUI, False),
+            "still starting": (hermes, " ─ summoning hermes… │                ─ ~\n ❯\n", True),
+            "no prompt": (hermes, " ─ ready │ opus late ─  title\n", True),
+            "ready only above the bottom six lines": (hermes, " ─ ready │ opus ─ t\n" + "".join(f"line {n}\n" for n in range(6)) + " ❯\n", True),
+            "not chat": ([STORE_PY, "-I", "-c", launcher_script("hermes_cli.main"), "update"], self.RESUMED_TUI, True),
+            "not hermes": ([STORE_PY, "-I", "-c", launcher_script("acp_adapter.entry")], self.RESUMED_TUI, True),
+        }
+        for name, (argv, visible, gateway) in cases.items():
+            with self.subTest(name):
+                self.write(panes=[self.pane("H1")], visible=visible, process=self.tui_process(argv, gateway))
+                self.assert_failed(self.run_core())
+                self.assert_no_launch()
+
     def test_managed_launcher_lookalikes_fail_closed(self):
         for argv in ([STORE_PY, "-I", "-c", launcher_script("acp_adapter.entry")],
                      [STORE_PY, "-I", "-c", launcher_script("hermes_cli.main"), "--run-module", "http.server"],

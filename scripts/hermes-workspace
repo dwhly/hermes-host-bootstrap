@@ -1081,11 +1081,23 @@ try:
             live = True
     if not live:
         raise ValueError
-    # Semantic detection remains authoritative when present. For 0.8.2 panes
-    # with no identity, require BOTH a live Hermes executable and its composer.
-    visible = os.environ["HMW_VISIBLE"].lower()
-    composer = "hermes" in visible and ("ask me anything" in visible or "type your message" in visible)
-    if kind != "hermes" and not composer:
+    # Semantic detection remains authoritative when present. For panes with
+    # no identity (0.8.2, or a 0.21 managed launcher whose process is named
+    # python3), require BOTH a live Hermes executable and a ready front end:
+    # the classic composer, or the TUI ready status line. A resumed TUI
+    # shows the conversation and a bare prompt, never the classic composer.
+    visible = os.environ["HMW_VISIBLE"]
+    low = visible.lower()
+    composer = "hermes" in low and ("ask me anything" in low or "type your message" in low)
+    def tui_gateway(argv):
+        return (isinstance(argv, list) and len(argv) >= 3 and all(isinstance(a, str) for a in argv)
+                and re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?", os.path.basename(argv[0])) is not None
+                and argv[-2:] == ["-m", "tui_gateway.entry"])
+    bottom = [line for line in visible.splitlines() if line.strip()][-6:]
+    tui_ready = (any(tui_gateway(job.get("argv")) for job in jobs)
+                 and any(re.match(r"\s*─+\s*ready\s*│", line) for line in bottom)
+                 and any(re.match(r"\s*❯", line) for line in bottom))
+    if kind != "hermes" and not composer and not tui_ready:
         raise ValueError
 except (ValueError, KeyError, TypeError, AttributeError):
     raise SystemExit(1)' "$pane_id"
