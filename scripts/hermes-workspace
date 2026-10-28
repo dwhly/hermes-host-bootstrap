@@ -611,7 +611,8 @@ ensure_herdr_server() {
     if [ "$attempt" -eq 1 ]; then
       # NO_TMUX=1: the server's restored pane shells inherit this env; without
       # it an SSH-aware rc can auto-attach tmux before hmw relaunches Hermes.
-      NO_TMUX=1 nohup "${HERDR[@]}" server >/dev/null 2>&1 &
+      # Detached: the server must outlive the SSH login that started it.
+      hmw_detached env NO_TMUX=1 "${HERDR[@]}" server
       launched=1
     fi
     if [ "$attempt" -lt 20 ]; then
@@ -1195,6 +1196,86 @@ HMW_SNAPSHOT_INTERVAL="${HMW_SNAPSHOT_INTERVAL:-300}"
 HMW_RESTORE_PENDING_SECONDS="${HMW_RESTORE_PENDING_SECONDS:-180}"
 HMW_SNAPSHOT_MAX_AGE="${HMW_SNAPSHOT_MAX_AGE:-1209600}"
 HMW_LOOP_MARKER="--hmw-snapshot-loop"
+# Distinct earlier snapshots (and pre-restore pins) kept under $HMW_STATE_DIR/history.
+HMW_SNAPSHOT_KEEP="${HMW_SNAPSHOT_KEEP:-5}"
+# Shared archive writer (prepended to both writers' Python, like HMW_PY_HERMES_ARGV).
+# Names are <prefix><UTC stamp with usec>Z-NNN.json: fixed width, so name order is
+# age order. NNN is always above the highest number already used for that stamp,
+# so a same-stamp burst never reuses a name that pruning just removed. The file is
+# created exclusively, and deleted again if writing fails (e.g. disk full).
+HMW_PY_ARCHIVE='import os, time
+def hmw_stamp(t):
+    return time.strftime("%Y%m%dT%H%M%S", time.gmtime(t)) + ".%06dZ" % int((t % 1) * 1e6)
+def hmw_keep():
+    try:
+        return max(3, int(os.environ.get("HMW_SNAPSHOT_KEEP") or 5))
+    except ValueError:
+        return 5
+def hmw_archive(hist, prefix, stamp, text, keep):
+    os.makedirs(hist, exist_ok=True)
+    mine = lambda n: (n.startswith(prefix) and n.endswith(".json")
+                      and n[len(prefix):len(prefix) + 1].isdigit())
+    head = prefix + stamp + "-"
+    seq = 0
+    for n in os.listdir(hist):
+        if mine(n) and n.startswith(head) and n[len(head):-len(".json")].isdigit():
+            seq = max(seq, int(n[len(head):-len(".json")]) + 1)
+    for n in range(seq, 1000):
+        path = os.path.join(hist, "%s%03d.json" % (head, n))
+        try:
+            fh = open(path, "x")
+        except FileExistsError:
+            continue
+        try:
+            with fh:
+                fh.write(text)
+        except BaseException:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            raise
+        break
+    for n in sorted(n for n in os.listdir(hist) if mine(n))[:-keep]:
+        os.remove(os.path.join(hist, n))
+'
+
+# Start a long-lived helper (Herdr server, snapshot loop) in its own session.
+# A plain `nohup cmd &` stays in the SSH login's session: when that client goes
+# away (quit, Mac terminal restart, given-up reconnect), the hangup reaches the
+# Herdr server, which shuts down and kills every pane (h-btp 2026-10-28). Linux
+# has setsid(1); macOS does not, so use perl POSIX::setsid. Neither forks when
+# called from this non-interactive script (not a process-group leader), so $!
+# stays the helper's own pid for the loop pidfile. Last resort: plain nohup.
+hmw_detached() {
+  local monitor=0
+  # Job control (interactive parent, or inherited SHELLOPTS=monitor) would make
+  # the child a group leader: setsid(1) would fork (stale $!) and perl setsid()
+  # would fail. Spawn with monitor mode off, then restore it.
+  case $- in *m*) monitor=1; set +m ;; esac
+  if command -v setsid >/dev/null 2>&1; then
+    nohup setsid "$@" </dev/null >/dev/null 2>&1 &
+  elif command -v perl >/dev/null 2>&1; then
+    nohup perl -MPOSIX -e 'POSIX::setsid(); exec { $ARGV[0] } @ARGV or exit 127' "$@" </dev/null >/dev/null 2>&1 &
+  else
+    nohup "$@" </dev/null >/dev/null 2>&1 &
+  fi
+  [ "$monitor" = 0 ] || set -m
+}
+
+# Keep the snapshot a restore is about to use, so a bad restore (and the
+# snapshot loop that follows it) can never erase the record it started from.
+hmw_snapshot_pin_pre_restore() {
+  local file
+  file="$(hmw_snapshot_file)"
+  [ -s "$file" ] || return 0
+  HMW_SNAPSHOT_FILE="$file" HMW_SNAPSHOT_KEEP="$HMW_SNAPSHOT_KEEP" python3 -c "$HMW_PY_ARCHIVE"'
+file = os.environ["HMW_SNAPSHOT_FILE"]
+with open(file) as src:
+    text = src.read()
+hmw_archive(os.path.join(os.path.dirname(file), "history"),
+            os.path.basename(file)[:-len(".json")] + ".pre-restore-", hmw_stamp(time.time()), text, hmw_keep())' 2>/dev/null || :
+}
 
 # psutil.Process(pid).create_time(), as Hermes stamps process_start_time. On
 # Linux that is /proc/<pid>/stat starttime / CLK_TCK + /proc/stat btime (psutil
@@ -1250,8 +1331,8 @@ for p in json.load(sys.stdin)["result"]["panes"]:
   ps_out="$(ps -A -o pid= -o ppid= 2>/dev/null)" || return 1
   [ "$print_only" -eq 1 ] || mkdir -p "$HMW_STATE_DIR" 2>/dev/null || return 1
   HMW_PANES="$panes_json" HMW_INFOS="$infos" HMW_PS="$ps_out" HMW_SNAPSHOT_FILE="$file" \
-  HMW_PRINT_ONLY="$print_only" HMW_INFO_FAIL="$info_fail" HMW_LEASES="${HERMES_HOME:-$HOME/.hermes}/runtime/active_sessions.json" \
-  python3 -c "$HMW_PY_HERMES_ARGV$HMW_PY_START_TIME"'import json, time
+  HMW_PRINT_ONLY="$print_only" HMW_INFO_FAIL="$info_fail" HMW_SNAPSHOT_KEEP="$HMW_SNAPSHOT_KEEP" HMW_LEASES="${HERMES_HOME:-$HOME/.hermes}/runtime/active_sessions.json" \
+  python3 -c "$HMW_PY_HERMES_ARGV$HMW_PY_START_TIME$HMW_PY_ARCHIVE"'import json, time
 file = os.environ["HMW_SNAPSHOT_FILE"]
 print_only = os.environ["HMW_PRINT_ONLY"] == "1"
 # print mode feeds the restore "already live" reservation: any doubt about a
@@ -1335,10 +1416,31 @@ if print_only:
     for o in out:
         print(o["pane_id"] + "\t" + o["session_id"])
     raise SystemExit(0)
+# Read the previous snapshot into memory, replace the main snapshot FIRST, and
+# only then archive the previous one (when the pane set changed). History is
+# best effort: it can never block or starve the main write.
+try:
+    with open(file) as fh:
+        prev = json.load(fh)
+except (OSError, ValueError):
+    prev = None
 tmp = "%s.tmp.%d" % (file, os.getpid())
 with open(tmp, "w") as fh:
     json.dump({"saved_at": time.time(), "panes": out}, fh, indent=1)
-os.replace(tmp, file)'
+os.replace(tmp, file)
+if isinstance(prev, dict) and prev.get("panes") and prev.get("panes") != out:
+    try:
+        try:
+            saved = float(prev.get("saved_at") or 0)
+        except (TypeError, ValueError):
+            saved = 0.0
+        if not (946684800.0 <= saved <= 4102444800.0):   # 2000..2100, finite; else now
+            saved = time.time()
+        hmw_archive(os.path.join(os.path.dirname(file), "history"),
+                    os.path.basename(file)[:-len(".json")] + ".", hmw_stamp(saved),
+                    json.dumps(prev, indent=1), hmw_keep())
+    except (OSError, ValueError, TypeError, OverflowError):
+        pass'
 }
 
 # Snapshots are written ONLY under the restore lock, taken without waiting: a
@@ -1463,7 +1565,7 @@ hmw_snapshot_loop_ensure() {
   fi
   token="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
   [ -n "$token" ] || token="$$.$RANDOM.$RANDOM"
-  HMW_LOOP_TOKEN="$token" HERDR_SESSION="$SESSION" nohup bash "${BASH_SOURCE[0]}" "$HMW_LOOP_MARKER" >/dev/null 2>&1 &
+  hmw_detached env HMW_LOOP_TOKEN="$token" HERDR_SESSION="$SESSION" bash "${BASH_SOURCE[0]}" "$HMW_LOOP_MARKER"
   pid=$!
   start="$(hmw_proc_start_time "$pid")" || start=unknown
   printf '%s %s %s\n' "$pid" "$start" "$token" >"$pidfile.tmp.$$" 2>/dev/null &&
@@ -1473,7 +1575,7 @@ hmw_snapshot_loop_ensure() {
 hmw_snapshot_spawn_once() {
   [ "$HMW_SNAPSHOT_INTERVAL" != "0" ] || return 0
   [ "$VERIFY" != "1" ] || return 0
-  HMW_SNAPSHOT=1 HERDR_SESSION="$SESSION" nohup bash "${BASH_SOURCE[0]}" >/dev/null 2>&1 &
+  hmw_detached env HMW_SNAPSHOT=1 HERDR_SESSION="$SESSION" bash "${BASH_SOURCE[0]}"
 }
 
 hmw_snapshot_loop() {
@@ -1603,6 +1705,7 @@ herdr_relaunch_restored_panes() {
   # interleave). Resume each pane's snapshotted conversation; labelled slots
   # without one fall back to their pane:<label> session, pinned here. Never
   # close panes: layout persistence is a feature Dan wants.
+  hmw_snapshot_pin_pre_restore
   resume_map="$(hmw_snapshot_resume_map)" || resume_map=""
   # Reserved = sessions already running in live panes (fresh lease mapping,
   # the snapshot's own validated logic) + snapshot ids of live panes + every

@@ -264,7 +264,7 @@ class Herdr082Tests(unittest.TestCase):
         # What the fake /proc below yields (psutil's Linux create_time formula).
         return pid * 100 / os.sysconf("SC_CLK_TCK") + 1000.0
 
-    def run_snapshot(self, leases, tree):
+    def run_snapshot(self, leases, tree, **extra_env):
         runtime = self.home / ".hermes/runtime"
         runtime.mkdir(parents=True, exist_ok=True)
         leases = [dict(l, process_start_time=l.get("process_start_time", self.start_of(l["pid"])))
@@ -283,7 +283,7 @@ class Herdr082Tests(unittest.TestCase):
         env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
                    HMW_BACKEND="herdr", HMW_SNAPSHOT="1", HERDR_SESSION="review",
                    HERMES_HOME=str(self.home / ".hermes"), HMW_PROC_ROOT=str(proc),
-                   HERDR_082_STATE=str(self.path), HERDR_082_LOG=str(self.log))
+                   HERDR_082_STATE=str(self.path), HERDR_082_LOG=str(self.log), **extra_env)
         return subprocess.run(["bash", str(CORE)], env=env, capture_output=True, text=True, timeout=25)
 
     def snapshot_path(self):
@@ -550,6 +550,102 @@ class Herdr082Tests(unittest.TestCase):
         loops = subprocess.run(["pgrep", "-f", "--", "hermes-workspace --hmw-snapshot-loop"],
                                capture_output=True, text=True).stdout.split()
         self.assertEqual(loops, [first[0]])
+
+    # ── snapshot history: one bad write must not erase the last good record ──
+    def history(self, kind=""):
+        hist = self.snapshot_path().parent / "history"
+        pattern = "review.panes.pre-restore-*.json" if kind == "pin" else "review.panes.2*.json"
+        return sorted(hist.glob(pattern)) if hist.is_dir() else []
+
+    def seed_snapshot(self, sessions, saved_at):
+        self.snapshot_path().parent.mkdir(parents=True, exist_ok=True)
+        self.snapshot_path().write_text(json.dumps({"saved_at": saved_at, "panes": [
+            {"pane_id": "w1:p%d" % (i + 1), "tab_id": "w1:t1", "pane_label": None, "session_id": s}
+            for i, s in enumerate(sessions)]}))
+
+    def test_pane_memory_history_keeps_previous_snapshot_on_change(self):
+        # h-btp 2026-10-28: after a partial restore the loop overwrote the only good
+        # snapshot. The previous pane set must survive in history/.
+        self.write(panes=[self.pane("H1")], process_by_pane={"w1:p1": self.fg(100)})
+        self.seed_snapshot(["S_OLD1", "S_OLD2", "S_OLD3"], 1793156400.0)   # 2026-10-28T03:00:00Z
+        lease = [dict(session_id="S_A", surface="cli", pid=100)]
+        self.assertEqual(self.run_snapshot(lease, {100: 10}).returncode, 0)
+        self.assertEqual([p["session_id"] for p in json.loads(self.snapshot_path().read_text())["panes"]], ["S_A"])
+        kept = self.history()
+        self.assertEqual([k.name for k in kept], ["review.panes.20261028T030000.000000Z-000.json"])
+        self.assertEqual([p["session_id"] for p in json.loads(kept[0].read_text())["panes"]],
+                         ["S_OLD1", "S_OLD2", "S_OLD3"])
+        # An unchanged pane set rotates nothing.
+        self.assertEqual(self.run_snapshot(lease, {100: 10}).returncode, 0)
+        self.assertEqual(self.history(), kept)
+
+    def test_pane_memory_history_is_bounded_and_never_below_three(self):
+        self.write(panes=[self.pane("H1")], process_by_pane={"w1:p1": self.fg(100)})
+        lease = [dict(session_id="S_NOW", surface="cli", pid=100)]
+        for keep, expected in (("3", 3), ("1", 3), ("junk", 5)):
+            with self.subTest(keep=keep):
+                shutil.rmtree(self.snapshot_path().parent / "history", ignore_errors=True)
+                for n in range(7):
+                    self.seed_snapshot(["S_%d" % n], 1793156400.0 + 60 * n)
+                    self.assertEqual(self.run_snapshot(lease, {100: 10}, HMW_SNAPSHOT_KEEP=keep).returncode, 0)
+                names = [k.name for k in self.history()]
+                self.assertEqual(len(names), expected)
+                self.assertEqual(names[-1], "review.panes.20261028T030600.000000Z-000.json")   # newest kept
+
+    def test_pane_memory_history_same_timestamp_never_overwrites(self):
+        # Frozen clock: three distinct snapshots sharing one saved_at must all be kept.
+        self.write(panes=[self.pane("H1")], process_by_pane={"w1:p1": self.fg(100)})
+        lease = [dict(session_id="S_NOW", surface="cli", pid=100)]
+        for s in ("S_A", "S_B", "S_C"):
+            self.seed_snapshot([s], 1793156400.5)
+            self.assertEqual(self.run_snapshot(lease, {100: 10}).returncode, 0)
+        kept = sorted(json.loads(k.read_text())["panes"][0]["session_id"] for k in self.history())
+        self.assertEqual(kept, ["S_A", "S_B", "S_C"])
+
+    def test_pane_memory_bad_saved_at_never_blocks_the_snapshot(self):
+        self.write(panes=[self.pane("H1")], process_by_pane={"w1:p1": self.fg(100)})
+        lease = [dict(session_id="S_A", surface="cli", pid=100)]
+        for bad in ("1e400", "-1e400", "\"soon\"", "[1]"):
+            with self.subTest(saved_at=bad):
+                shutil.rmtree(self.snapshot_path().parent / "history", ignore_errors=True)
+                self.snapshot_path().parent.mkdir(parents=True, exist_ok=True)
+                self.snapshot_path().write_text('{"saved_at": %s, "panes": [{"pane_id": "w1:p9", '
+                                                '"tab_id": "w1:t1", "session_id": "S_OLD"}]}' % bad)
+                result = self.run_snapshot(lease, {100: 10})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual([p["session_id"] for p in json.loads(self.snapshot_path().read_text())["panes"]],
+                                 ["S_A"])
+                self.assertEqual(len(self.history()), 1)
+
+    def test_pane_memory_history_failure_never_blocks_the_main_write(self):
+        # history/ is a regular file: every archive attempt fails; the main write must not.
+        self.write(panes=[self.pane("H1")], process_by_pane={"w1:p1": self.fg(100)})
+        self.seed_snapshot(["S_OLD"], 1793156400.0)
+        (self.snapshot_path().parent / "history").write_text("not a directory")
+        result = self.run_snapshot([dict(session_id="S_A", surface="cli", pid=100)], {100: 10})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([p["session_id"] for p in json.loads(self.snapshot_path().read_text())["panes"]], ["S_A"])
+
+    def test_pane_memory_empty_previous_snapshot_is_not_history(self):
+        self.write(panes=[self.pane("H1")], process_by_pane={"w1:p1": self.fg(100)})
+        self.seed_snapshot([], 1793156400.0)
+        self.assertEqual(self.run_snapshot([dict(session_id="S_A", surface="cli", pid=100)], {100: 10}).returncode, 0)
+        self.assertEqual(self.history(), [])
+
+    def test_pane_memory_restore_pins_the_snapshot_it_used(self):
+        self.write(panes=[self.pane("H1"), dict(self.pane("", "w1:p3"), tab_id="w1:t2")],
+                   visible="", process=SHELL, stopped=True,
+                   launched_state={"visible": COMPOSER, "process": LIVE})
+        self.snapshot_path().parent.mkdir(parents=True)
+        used = {"saved_at": time.time(), "panes": [
+            {"pane_id": "w1:p1", "tab_id": "w1:t1", "pane_label": "H1", "session_id": "S_H1"},
+            {"pane_id": "w1:p3", "tab_id": "w1:t2", "session_id": "S_TAB"}]}
+        self.snapshot_path().write_text(json.dumps(used))
+        result = self.run_core(1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pins = self.history("pin")
+        self.assertEqual(len(pins), 1)
+        self.assertEqual(json.loads(pins[0].read_text()), used)
 
     def test_pane_memory_f6_snapshot_skipped_while_lock_held(self):
         self.write(panes=[self.pane("H1")], process_by_pane={"w1:p1": self.fg(100)})
@@ -1138,6 +1234,134 @@ class Herdr082Tests(unittest.TestCase):
                 self.write(panes=[self.pane("H1")], rpc_result=result)
                 self.assert_failed(self.run_core())
                 self.assert_no_launch()
+
+
+class SnapshotArchiveTests(unittest.TestCase):
+    """The shared hmw_archive writer used by snapshot history and pre-restore pins."""
+
+    def setUp(self):
+        src = CORE.read_text()
+        start = src.index("HMW_PY_ARCHIVE='") + len("HMW_PY_ARCHIVE='")
+        self.ns = {}
+        exec(compile(src[start:src.index("\n'\n", start) + 1], "HMW_PY_ARCHIVE", "exec"), self.ns)
+        tmp = tempfile.TemporaryDirectory(prefix="hmw-archive-")
+        self.addCleanup(tmp.cleanup)
+        self.hist = os.path.join(tmp.name, "history")
+
+    def names(self):
+        return sorted(os.listdir(self.hist))
+
+    def test_same_stamp_burst_beyond_keep_keeps_the_newest(self):
+        for prefix in ("ws.panes.", "ws.panes.pre-restore-"):
+            with self.subTest(prefix=prefix):
+                shutil.rmtree(self.hist, ignore_errors=True)
+                for n in range(12):   # more than keep, and numbers above nine
+                    self.ns["hmw_archive"](self.hist, prefix, "20261028T130819.000000Z", "S_%d" % n, 3)
+                kept = self.names()
+                self.assertEqual(kept, [prefix + "20261028T130819.000000Z-%03d.json" % n for n in (9, 10, 11)])
+                self.assertEqual([Path(self.hist, k).read_text() for k in kept], ["S_9", "S_10", "S_11"])
+
+    def test_history_and_pins_prune_independently(self):
+        archive = self.ns["hmw_archive"]
+        for n in range(4):
+            archive(self.hist, "ws.panes.", "20261028T13000%d.000000Z" % n, "H%d" % n, 3)
+            archive(self.hist, "ws.panes.pre-restore-", "20261028T13000%d.000000Z" % n, "P%d" % n, 3)
+        names = self.names()
+        self.assertEqual(sum(1 for n in names if n.startswith("ws.panes.pre-restore-")), 3)
+        self.assertEqual(sum(1 for n in names if n.startswith("ws.panes.2")), 3)
+
+    def test_failed_write_leaves_no_partial_file(self):
+        real_open = open
+
+        class Full:
+            def __init__(self, fh): self.fh = fh
+            def __enter__(self): return self
+            def __exit__(self, *a): self.fh.close()
+            def write(self, _): raise OSError(28, "No space left on device")
+
+        self.ns["open"] = lambda p, mode="r", *a, **k: Full(real_open(p, mode, *a, **k)) if mode == "x" else real_open(p, mode, *a, **k)
+        with self.assertRaises(OSError):
+            self.ns["hmw_archive"](self.hist, "ws.panes.", "20261028T130819.000000Z", "S", 3)
+        self.assertEqual(self.names(), [])
+
+    def test_keep_floor_and_junk(self):
+        for value, expected in (("1", 3), ("junk", 5), ("", 5), ("7", 7)):
+            with self.subTest(value=value):
+                os.environ["HMW_SNAPSHOT_KEEP"] = value
+                try:
+                    self.assertEqual(self.ns["hmw_keep"](), expected)
+                finally:
+                    del os.environ["HMW_SNAPSHOT_KEEP"]
+
+
+class DetachedHelperTests(unittest.TestCase):
+    """hmw_detached must put long-lived helpers in their own session, so an SSH
+    client going away cannot hang up the Herdr server (h-btp 2026-10-28)."""
+
+    def run_helper(self, path_dirs, use="hmw_detached", **extra_env):
+        src = CORE.read_text()
+        start = src.index("hmw_detached() {")
+        func = src[start:src.index("\n}\n", start) + 3]
+        script = func + (
+            'nohup_plain() { nohup "$@" </dev/null >/dev/null 2>&1 & }\n'
+            '%s sleep 30\nchild=$!\nsleep 0.5\n'
+            'echo "$$ $child $(ps -o args= -p $child)"\n'
+            'read -r _\nkill $child\n' % use)
+        env = dict(os.environ, PATH=os.pathsep.join(path_dirs), **extra_env)
+        # The harness is its own session leader, like an SSH login shell (portable:
+        # no setsid(1) needed, so this runs on macOS too).
+        proc = subprocess.Popen([shutil.which("bash"), "-c", script], env=env, start_new_session=True,
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            out = proc.stdout.readline().split()
+            harness, child = int(out[0]), int(out[1])
+            sids = (os.getsid(harness), os.getsid(child))
+        finally:
+            proc.communicate("\n", timeout=20)
+        return sids[0], child, sids[1], " ".join(out[2:])
+
+    def tools_without_setsid(self):
+        tmp = tempfile.TemporaryDirectory(prefix="hmw-nosetsid-")
+        self.addCleanup(tmp.cleanup)
+        for tool in ("nohup", "perl", "sleep", "ps", "kill", "env"):
+            found = shutil.which(tool)
+            if found:
+                os.symlink(found, os.path.join(tmp.name, tool))
+        return tmp.name
+
+    def test_setsid_path_leads_its_own_session_and_keeps_pid(self):
+        if not shutil.which("setsid"):
+            self.skipTest("no setsid(1) on this host")
+        harness_sid, child, child_sid, args = self.run_helper(os.environ["PATH"].split(os.pathsep))
+        self.assertNotEqual(child_sid, harness_sid)
+        self.assertEqual(child_sid, child, "$! must be the helper itself, as session leader")
+        self.assertIn("sleep 30", args)
+
+    def test_perl_path_without_setsid_leads_its_own_session(self):
+        if not shutil.which("perl"):
+            self.skipTest("no perl on this host")
+        bindir = self.tools_without_setsid()
+        self.assertIsNone(shutil.which("setsid", path=bindir))
+        harness_sid, child, child_sid, args = self.run_helper([bindir])
+        self.assertNotEqual(child_sid, harness_sid)
+        self.assertEqual(child_sid, child)
+        self.assertIn("sleep 30", args)
+
+    def test_inherited_monitor_mode_still_detaches_with_true_pid(self):
+        paths = [("setsid", os.environ["PATH"].split(os.pathsep))]
+        if shutil.which("perl"):
+            paths.append(("perl", [self.tools_without_setsid()]))
+        for name, path in paths:
+            with self.subTest(path=name):
+                harness_sid, child, child_sid, args = self.run_helper(path, SHELLOPTS="monitor")
+                self.assertNotEqual(child_sid, harness_sid)
+                self.assertEqual(child_sid, child)
+                self.assertIn("sleep 30", args)
+
+    def test_plain_nohup_stays_in_the_login_session(self):
+        # Control: the pre-fix spawn shares the SSH login session (the bug).
+        harness_sid, child, child_sid, _ = self.run_helper(os.environ["PATH"].split(os.pathsep), use="nohup_plain")
+        self.assertEqual(child_sid, harness_sid)
 
 
 if __name__ == "__main__":
