@@ -689,8 +689,15 @@ def test_dealroom_execute_plan_never_runs_or_retries_upgrade():
         assert core.execute_plan(dealroom_unverified_plan(), NoOperations()) == "refused:dealroom_runtime_proof_unavailable"
 
 
-def test_dealroom_no_duplicate_container_restart():
-    core.HostOps(None, None).restart_units(dealroom_unverified_plan())
+def test_dealroom_no_duplicate_container_restart(monkeypatch):
+    calls = []
+    ops = core.HostOps(None, None)
+    monkeypatch.setattr(core, "guard_mutation", lambda: None)
+    monkeypatch.setattr(core, "_resolve_tool", lambda name: name)
+    monkeypatch.setattr(ops, "journal_before", lambda *args: None)
+    monkeypatch.setattr(core.subprocess, "run", lambda cmd, **kw: calls.append(cmd))
+    ops.restart_units(dealroom_unverified_plan())
+    assert calls == []
 
 
 def test_dealroom_never_uses_code_only_automatic_rollback():
