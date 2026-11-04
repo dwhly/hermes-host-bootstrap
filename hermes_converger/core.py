@@ -35,28 +35,31 @@ except ImportError:  # pragma: no cover - exercised only on hosts without chief-
     chief_spec_validate_event = None
 
 
-ALLOWLIST = {"chief", "hermes-node", "harness", "config", "remits", "theme"}
+ALLOWLIST = {"dealroom", "chief", "hermes-node", "harness", "config", "remits", "theme"}
 LIVE_PATCH = {"config", "remits", "theme"}
-RESTART_REQUIRED = {"chief", "hermes-node", "harness"}
+RESTART_REQUIRED = {"dealroom", "chief", "hermes-node", "harness"}
 IS_MACOS = sys.platform == "darwin"
-SUPERVISED_PROCESS_ALLOWLIST = {"chief-node", "chief-loop-watchdog", "chief-core"}
+SUPERVISED_PROCESS_ALLOWLIST = {"dealroom", "chief-node", "chief-loop-watchdog", "chief-core"}
 LINUX_UNIT_MAP = {
     "chief-node": "chief-node.service",
     "chief-loop-watchdog": "chief-loop-watchdog.service",
     "chief-core": "chief-stack-core-1",
+    "dealroom": "chief-dealroom-send-web-1",
 }
 MACOS_UNIT_MAP = {
     "chief-node": "com.chief.node",
     "chief-loop-watchdog": "com.chief.loop-watchdog",
     "chief-core": "chief-stack-core-1",
+    "dealroom": "chief-dealroom-send-web-1",
 }
-DOCKER_TOKENS = {"chief-core"}
+DOCKER_TOKENS = {"chief-core", "dealroom"}
 MACOS_USER_AGENT_TOKENS = {"chief-node"}
 MACOS_RUNTIME_STAMP_DIR = pathlib.Path("/var/run/chief/runtime")
 # macOS /var/run is root:daemon 0775. Persistent root-written locks live
 # below /var/lib/chief; flock releases on exit/reboot, independent of file age.
 RUN_BASE = "/var/lib" if IS_MACOS else "/run"
 ARTIFACT_PROCESS_MAP = {
+    "dealroom": (("dealroom",), ("dealroom",)),
     "chief": (("chief-core",), ("chief-core",)),
     "hermes-node": (("chief-node",), ("chief-node",)),
     "harness": (("chief-loop-watchdog",), ("chief-loop-watchdog",)),
@@ -996,6 +999,7 @@ class HostOps:
         root = self._chief_code_root()
         mapping = {
             "chief": root,
+            "dealroom": f"{root}/chief-dealroom",
             "hermes-node": f"{root}/hermes-node",
             "harness": f"{root}/harness",
             "config": "/etc/chief/config",
@@ -1038,6 +1042,11 @@ class HostOps:
     def install_restart_required(self, plan: VerifiedPlan) -> None:
         guard_mutation()
         self.journal_before("install", {"artifact": plan.artifact})
+        if plan.artifact == "dealroom":
+            self.run_artifact(
+                ["/bin/bash", "deploy/dealroom/upgrade.sh"],
+                self.artifact_path("dealroom"), env=_tool_subprocess_env(), check=True,
+            )
         if plan.artifact == "hermes-node":
             cwd = f"{self._chief_code_root()}/hermes-node"
             user = pwd.getpwnam(os.environ.get("CHIEF_RUNTIME_USER", "root"))
