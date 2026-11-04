@@ -1365,8 +1365,12 @@ def name(value, default=None):
     if not isinstance(value, str) or not value.strip() or value == default:
         return None
     return value
-tab_names = {t.get("tab_id"): name(t.get("label"), str(t.get("number"))) for t in listed("HMW_TABS", "tabs")}
-ws_names = {w.get("workspace_id"): name(w.get("label")) for w in listed("HMW_WORKSPACES", "workspaces")}
+tab_names = {t.get("tab_id"): name(t.get("label"), str(t.get("number"))) for t in listed("HMW_TABS", "tabs")
+             if isinstance(t.get("tab_id"), str)}
+ws_names = {w.get("workspace_id"): name(w.get("label")) for w in listed("HMW_WORKSPACES", "workspaces")
+            if isinstance(w.get("workspace_id"), str)}
+def ws_name(wid):
+    return ws_names.get(wid) if isinstance(wid, str) else None
 def hint(q):
     # The Herdr record of the agent session. It can go stale, so restore
     # never resumes from it; it is a hint for a manual recovery only.
@@ -1380,7 +1384,7 @@ for p in panes:   # every tab, shells included, so closed tabs keep their names
         continue
     seen_tabs.add(tid)
     tabs.append({"tab_id": tid, "workspace_id": p.get("workspace_id"),
-                 "workspace_label": ws_names.get(p.get("workspace_id")),
+                 "workspace_label": ws_name(p.get("workspace_id")),
                  "tab_label": tab_names.get(tid), "cwd": p.get("cwd") if isinstance(p.get("cwd"), str) else None,
                  "panes": [{"pane_id": q.get("pane_id"), "pane_label": q.get("label") or None,
                             "agent": q.get("agent") if isinstance(q.get("agent"), str) else None,
@@ -1446,8 +1450,8 @@ for p in panes:
         continue
     used.add(sid)
     out.append({"pane_id": p["pane_id"], "workspace_id": p.get("workspace_id"), "tab_id": p.get("tab_id"),
-                "workspace_label": ws_names.get(p.get("workspace_id")),
-                "tab_label": tab_names.get(p.get("tab_id")), "pane_label": p.get("label") or None, "session_id": sid})
+                "workspace_label": ws_name(p.get("workspace_id")),
+                "tab_label": tab_names.get(p.get("tab_id")) if isinstance(p.get("tab_id"), str) else None, "pane_label": p.get("label") or None, "session_id": sid})
 if print_only:
     if uncertain:
         raise SystemExit(3)

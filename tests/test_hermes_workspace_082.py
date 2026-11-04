@@ -352,6 +352,19 @@ class Herdr082Tests(unittest.TestCase):
                          [("w1:p1", None, "S_A")])
         self.assertEqual([t["tab_label"] for t in snap["tabs"]], [None, None, None])
 
+    def test_pane_memory_snapshot_malformed_name_lists_never_block(self):
+        # Review r1: unhashable ids in the optional lists must not abort the snapshot.
+        layout = self.labelled_layout()
+        layout["tabs"] = [{"tab_id": ["w1:t1"], "label": "x"}, {"tab_id": "w1:t3", "number": 3, "label": "email"}, 7]
+        layout["workspaces"] = [{"workspace_id": {"a": 1}, "label": "ws"}]
+        self.write(**layout)
+        result = self.run_snapshot([dict(session_id="S_A", surface="tui", pid=100)], {100: 10})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snap = json.loads(self.snapshot_path().read_text())
+        self.assertEqual([p["session_id"] for p in snap["panes"]], ["S_A"])
+        self.assertEqual([(t["workspace_label"], t["tab_label"]) for t in snap["tabs"]],
+                         [(None, None), (None, None), (None, "email")])
+
     def test_pane_memory_history_rotates_on_tab_rename_not_on_cd(self):
         leases = [dict(session_id="S_A", surface="tui", pid=100), dict(session_id="S_B", surface="cli", pid=300)]
         self.write(**self.labelled_layout())
