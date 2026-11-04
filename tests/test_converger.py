@@ -701,3 +701,7 @@ def test_dealroom_fixed_upgrade_hook(monkeypatch):
     monkeypatch.setenv("CHIEF_CODE_ROOT", "/opt/chief/deploy")
     ops.install_restart_required(verified)
     assert calls == [(["/bin/bash", "deploy/dealroom/upgrade.sh"], "/opt/chief/deploy/chief-dealroom")]
+
+
+def test_dealroom_never_uses_code_only_automatic_rollback():
+    assert core.attempt_rollback_once(verify(make_plan(artifact="dealroom")), None) is False

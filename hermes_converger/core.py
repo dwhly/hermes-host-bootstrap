@@ -1332,6 +1332,9 @@ def execute_plan(
 
 
 def attempt_rollback_once(plan: VerifiedPlan, ops: HostOps) -> bool:
+    # Database migrations require a coordinated encrypted restore, never a code-only downgrade.
+    if plan.artifact == "dealroom":
+        return False
     lkg_path = ops.state.state_dir / "last-known-good.json"
     lkg = ops.state.read_json(lkg_path, {}).get(plan.artifact)
     if not lkg or lkg.get("restore_method") not in {"git_checkout+uv_install+systemd_restart"}:
