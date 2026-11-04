@@ -310,6 +310,65 @@ class Herdr082Tests(unittest.TestCase):
                          [("w1:p1", "w1:t1", "H1", "S_A"), ("w1:p3", "w1:t2", None, "S_B")])
         self.assertEqual(list(self.snapshot_path().parent.glob("*.tmp.*")), [])
 
+    def labelled_layout(self, tab2="email", cwd="/root"):
+        # H1 in a renamed tab, an unnamed Hermes tab, and a renamed plain-shell tab.
+        tab = lambda pid, tid, **kw: dict(self.pane("", pid, **kw), tab_id=tid, cwd=cwd)
+        return dict(
+            panes=[dict(self.pane("H1", agent="hermes", agent_session={"kind": "id", "value": "S_A"}), cwd=cwd),
+                   tab("w1:p3", "w1:t2", agent_session={"value": "bad id;rm"}), tab("w1:p4", "w1:t3")],
+            tabs=[{"tab_id": "w1:t1", "workspace_id": "w1", "number": 1, "label": "convergence"},
+                  {"tab_id": "w1:t2", "workspace_id": "w1", "number": 2, "label": "2"},      # default number
+                  {"tab_id": "w1:t3", "workspace_id": "w1", "number": 3, "label": tab2}],
+            workspaces=[{"workspace_id": "w1", "number": 1, "label": "ws"}],
+            process_by_pane={"w1:p1": self.fg(100), "w1:p3": self.fg(300), "w1:p4": SHELL})
+
+    def test_pane_memory_snapshot_records_tab_and_workspace_names(self):
+        # 2026-11-04: closing a workspace lost every tab name; pane list has no tab label.
+        self.write(**self.labelled_layout())
+        leases = [dict(session_id="S_A", surface="tui", pid=100), dict(session_id="S_B", surface="cli", pid=300)]
+        result = self.run_snapshot(leases, {100: 10, 300: 10})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snap = json.loads(self.snapshot_path().read_text())
+        self.assertEqual([(p["pane_id"], p["workspace_label"], p["tab_label"], p["session_id"]) for p in snap["panes"]],
+                         [("w1:p1", "ws", "convergence", "S_A"), ("w1:p3", "ws", None, "S_B")])
+        # Every tab is on record, the plain-shell one included.
+        self.assertEqual([(t["tab_id"], t["tab_label"], t["cwd"], [q["pane_id"] for q in t["panes"]])
+                          for t in snap["tabs"]],
+                         [("w1:t1", "convergence", "/root", ["w1:p1"]), ("w1:t2", None, "/root", ["w1:p3"]),
+                          ("w1:t3", "email", "/root", ["w1:p4"])])
+        # Herdr's session record rides along as a recovery hint; unsafe ids are dropped.
+        self.assertEqual([[(q["agent"], q["session_hint"]) for q in t["panes"]] for t in snap["tabs"]],
+                         [[("hermes", "S_A")], [(None, None)], [(None, None)]])
+
+    def test_pane_memory_snapshot_without_name_lists_still_maps_panes(self):
+        # Herdr without (or failing) tab/workspace list: names are null, map unchanged.
+        layout = self.labelled_layout()
+        del layout["tabs"], layout["workspaces"]
+        self.write(**layout)
+        result = self.run_snapshot([dict(session_id="S_A", surface="tui", pid=100)], {100: 10})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snap = json.loads(self.snapshot_path().read_text())
+        self.assertEqual([(p["pane_id"], p["tab_label"], p["session_id"]) for p in snap["panes"]],
+                         [("w1:p1", None, "S_A")])
+        self.assertEqual([t["tab_label"] for t in snap["tabs"]], [None, None, None])
+
+    def test_pane_memory_history_rotates_on_tab_rename_not_on_cd(self):
+        leases = [dict(session_id="S_A", surface="tui", pid=100), dict(session_id="S_B", surface="cli", pid=300)]
+        self.write(**self.labelled_layout())
+        self.assertEqual(self.run_snapshot(leases, {100: 10, 300: 10}).returncode, 0)
+        self.assertEqual(self.history(), [])
+        # A shell cd (cwd change) alone keeps history as it is.
+        self.write(**self.labelled_layout(cwd="/tmp"))
+        self.assertEqual(self.run_snapshot(leases, {100: 10, 300: 10}).returncode, 0)
+        self.assertEqual(self.history(), [])
+        # Renaming the shell-only tab archives the previous names.
+        self.write(**self.labelled_layout(tab2="mail"))
+        self.assertEqual(self.run_snapshot(leases, {100: 10, 300: 10}).returncode, 0)
+        kept = self.history()
+        self.assertEqual(len(kept), 1)
+        self.assertEqual([t["tab_label"] for t in json.loads(kept[0].read_text())["tabs"]],
+                         ["convergence", None, "email"])
+
     def test_pane_memory_snapshot_waits_out_a_pending_restore(self):
         self.write(panes=[self.pane("H1")], process_by_pane={"w1:p1": SHELL})
         self.snapshot_path().parent.mkdir(parents=True)

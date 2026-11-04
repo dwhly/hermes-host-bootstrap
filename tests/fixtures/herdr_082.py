@@ -44,6 +44,8 @@ elif cmd == ["agent", "list"]:
     emit("agents", state.get("agents", []))
 elif cmd == ["pane", "list"]:
     emit("panes", state["panes"])
+elif cmd in (["tab", "list"], ["workspace", "list"]) and cmd[0] + "s" in state:
+    emit(cmd[0] + "s", state[cmd[0] + "s"])
 elif cmd == ["agent", "start"] and args[2:] == ["--help"]:
     print("Usage: herdr agent start <NAME> --kind <KIND> --pane <ID>")
 elif cmd == ["agent", "start"]:

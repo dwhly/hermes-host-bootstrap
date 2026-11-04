@@ -1315,11 +1315,15 @@ hmw_snapshot_file() {
 # foreground Hermes holds a live lease (restore uses it to reserve sessions
 # that are already running).
 hmw_snapshot_panes() {
-  local panes_json pane_ids pane_id info infos="" ps_out file print_only=0 info_fail=0
+  local panes_json tabs_json workspaces_json pane_ids pane_id info infos="" ps_out file print_only=0 info_fail=0
 
   [ "${1:-}" = print ] && print_only=1
   file="$(hmw_snapshot_file)"
   panes_json="$("${HERDR[@]}" pane list 2>/dev/null)" || return 1
+  # Tab and workspace names live only in these lists (pane list has no tab
+  # label). Best effort: a failure records no names but never blocks the map.
+  tabs_json="$("${HERDR[@]}" tab list 2>/dev/null)" || tabs_json=""
+  workspaces_json="$("${HERDR[@]}" workspace list 2>/dev/null)" || workspaces_json=""
   pane_ids="$(printf '%s' "$panes_json" | python3 -c 'import json, sys
 for p in json.load(sys.stdin)["result"]["panes"]:
     print(p["pane_id"])')" || return 1
@@ -1330,7 +1334,7 @@ for p in json.load(sys.stdin)["result"]["panes"]:
   done <<< "$pane_ids"
   ps_out="$(ps -A -o pid= -o ppid= 2>/dev/null)" || return 1
   [ "$print_only" -eq 1 ] || mkdir -p "$HMW_STATE_DIR" 2>/dev/null || return 1
-  HMW_PANES="$panes_json" HMW_INFOS="$infos" HMW_PS="$ps_out" HMW_SNAPSHOT_FILE="$file" \
+  HMW_PANES="$panes_json" HMW_TABS="$tabs_json" HMW_WORKSPACES="$workspaces_json" HMW_INFOS="$infos" HMW_PS="$ps_out" HMW_SNAPSHOT_FILE="$file" \
   HMW_PRINT_ONLY="$print_only" HMW_INFO_FAIL="$info_fail" HMW_SNAPSHOT_KEEP="$HMW_SNAPSHOT_KEEP" HMW_LEASES="${HERMES_HOME:-$HOME/.hermes}/runtime/active_sessions.json" \
   python3 -c "$HMW_PY_HERMES_ARGV$HMW_PY_START_TIME$HMW_PY_ARCHIVE"'import json, time
 file = os.environ["HMW_SNAPSHOT_FILE"]
@@ -1349,6 +1353,39 @@ except (OSError, ValueError, AttributeError, TypeError):
     pass
 safe = re.compile(r"[A-Za-z0-9_.:-]+")
 panes = json.loads(os.environ["HMW_PANES"])["result"]["panes"]
+def listed(var, key):
+    # Best-effort name lists: anything malformed records no names.
+    try:
+        items = json.loads(os.environ.get(var) or "null")["result"][key]
+        return [i for i in items if isinstance(i, dict)] if isinstance(items, list) else []
+    except (ValueError, KeyError, TypeError):
+        return []
+def name(value, default=None):
+    # Herdr shows a tab number until the tab is renamed: that is no name.
+    if not isinstance(value, str) or not value.strip() or value == default:
+        return None
+    return value
+tab_names = {t.get("tab_id"): name(t.get("label"), str(t.get("number"))) for t in listed("HMW_TABS", "tabs")}
+ws_names = {w.get("workspace_id"): name(w.get("label")) for w in listed("HMW_WORKSPACES", "workspaces")}
+def hint(q):
+    # The Herdr record of the agent session. It can go stale, so restore
+    # never resumes from it; it is a hint for a manual recovery only.
+    s = q.get("agent_session")
+    v = s.get("value") if isinstance(s, dict) else None
+    return v if isinstance(v, str) and safe.fullmatch(v) else None
+tabs, seen_tabs = [], set()
+for p in panes:   # every tab, shells included, so closed tabs keep their names
+    tid = p.get("tab_id")
+    if not isinstance(tid, str) or tid in seen_tabs:
+        continue
+    seen_tabs.add(tid)
+    tabs.append({"tab_id": tid, "workspace_id": p.get("workspace_id"),
+                 "workspace_label": ws_names.get(p.get("workspace_id")),
+                 "tab_label": tab_names.get(tid), "cwd": p.get("cwd") if isinstance(p.get("cwd"), str) else None,
+                 "panes": [{"pane_id": q.get("pane_id"), "pane_label": q.get("label") or None,
+                            "agent": q.get("agent") if isinstance(q.get("agent"), str) else None,
+                            "session_hint": hint(q)}
+                           for q in panes if q.get("tab_id") == tid]})
 fg = {}  # pane -> pids of its FOREGROUND interactive Hermes processes
 for line in os.environ["HMW_INFOS"].splitlines():
     try:
@@ -1409,7 +1446,8 @@ for p in panes:
         continue
     used.add(sid)
     out.append({"pane_id": p["pane_id"], "workspace_id": p.get("workspace_id"), "tab_id": p.get("tab_id"),
-                "tab_label": p.get("tab_label"), "pane_label": p.get("label") or None, "session_id": sid})
+                "workspace_label": ws_names.get(p.get("workspace_id")),
+                "tab_label": tab_names.get(p.get("tab_id")), "pane_label": p.get("label") or None, "session_id": sid})
 if print_only:
     if uncertain:
         raise SystemExit(3)
@@ -1426,9 +1464,16 @@ except (OSError, ValueError):
     prev = None
 tmp = "%s.tmp.%d" % (file, os.getpid())
 with open(tmp, "w") as fh:
-    json.dump({"saved_at": time.time(), "panes": out}, fh, indent=1)
+    json.dump({"saved_at": time.time(), "panes": out, "tabs": tabs}, fh, indent=1)
 os.replace(tmp, file)
-if isinstance(prev, dict) and prev.get("panes") and prev.get("panes") != out:
+# Archive on any change to the mapped panes OR the tab set and names, so a
+# closed or renamed shell tab is still on record afterwards.
+def tab_shape(ts):
+    # A shell cd changes cwd constantly; that alone is not worth a history slot.
+    return [{k: v for k, v in t.items() if k != "cwd"} if isinstance(t, dict) else t
+            for t in ts] if isinstance(ts, list) else ts
+if (isinstance(prev, dict) and (prev.get("panes") or prev.get("tabs"))
+        and (prev.get("panes") != out or tab_shape(prev.get("tabs")) != tab_shape(tabs))):
     try:
         try:
             saved = float(prev.get("saved_at") or 0)
