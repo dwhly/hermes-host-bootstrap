@@ -335,6 +335,9 @@ def verify_plan(
     if artifact in RESTART_REQUIRED and apply_mode != "restart_required":
         raise VerificationError("apply_mode_mismatch")
 
+    if artifact == "dealroom":
+        raise VerificationError("dealroom_runtime_proof_unavailable: automatic upgrades disabled")
+
     expected_digest = sha256_digest(canonical_json(plan_digest_payload(plan)))
     if plan.get("plan_digest") != expected_digest:
         raise VerificationError("plan_digest_mismatch")
@@ -1069,6 +1072,8 @@ class HostOps:
         subprocess.run([_resolve_tool("launchctl"), "kickstart", "-k", target], check=True)
 
     def restart_units(self, plan: VerifiedPlan) -> None:
+        if plan.artifact == "dealroom":
+            return  # upgrade.py owns the complete restart and health check.
         guard_mutation()
         for token in plan.restart_units:
             validate_supervised_process(token, action="restart_unit")
@@ -1259,6 +1264,8 @@ def execute_plan(
     idle_snapshot: dict[str, Any] | None = None,
     idle_snapshot_reader: Callable[[], dict[str, Any] | None] | None = None,
 ) -> str:
+    if plan.artifact == "dealroom":
+        return "refused:dealroom_runtime_proof_unavailable"
     if already_converged(plan, ops.state):
         # Chief Spec v1 has no convergence.running event. Stay silent, before
         # idle admission, events, leases, fetches, installs or reload/restart.

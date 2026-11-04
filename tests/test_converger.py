@@ -671,37 +671,27 @@ def test_macos_converger_defers_restart_without_gui(tmp_path, monkeypatch):
     assert calls == [["launchctl", "print", "gui/502"]]
 
 
-def test_dealroom_fixed_mapping_ignores_plan_targets(monkeypatch):
-    plan = make_plan(artifact="dealroom", restart_units=["chief-core"],
-                     affected_processes=["chief-node"], target={"path": "/tmp/attacker"})
-    verified = verify(plan)
-    assert verified.restart_units == ("dealroom",)
-    assert verified.affected_processes == ("dealroom",)
-    monkeypatch.setenv("CHIEF_CODE_ROOT", "/opt/chief/deploy")
-    ops = core.HostOps(None, None)
-    assert ops.artifact_path("dealroom") == "/opt/chief/deploy/chief-dealroom"
-    for is_macos in (True, False):
-        monkeypatch.setattr(core, "IS_MACOS", is_macos)
-        assert core.unit_for("dealroom") == "chief-dealroom-send-web-1"
-    assert "dealroom" in core.DOCKER_TOKENS
+def dealroom_unverified_plan():
+    import dataclasses
+    return dataclasses.replace(verify(make_plan()), artifact="dealroom", restart_units=("dealroom",), affected_processes=("dealroom",))
 
 
-def test_dealroom_rejects_live_patch():
-    with pytest.raises(core.VerificationError, match="apply_mode_mismatch"):
-        verify(make_plan(artifact="dealroom", apply_mode="live_patch"))
+def test_dealroom_verify_fails_closed():
+    with pytest.raises(core.VerificationError, match="dealroom_runtime_proof_unavailable"):
+        verify(make_plan(artifact="dealroom"))
 
 
-def test_dealroom_fixed_upgrade_hook(monkeypatch):
-    verified = verify(make_plan(artifact="dealroom"))
-    calls = []
-    ops = core.HostOps(None, None)
-    monkeypatch.setattr(core, "guard_mutation", lambda: None)
-    monkeypatch.setattr(ops, "journal_before", lambda *args: None)
-    monkeypatch.setattr(ops, "run_artifact", lambda cmd, cwd, **kw: calls.append((cmd, cwd)))
-    monkeypatch.setenv("CHIEF_CODE_ROOT", "/opt/chief/deploy")
-    ops.install_restart_required(verified)
-    assert calls == [(["/bin/bash", "deploy/dealroom/upgrade.sh"], "/opt/chief/deploy/chief-dealroom")]
+def test_dealroom_execute_plan_never_runs_or_retries_upgrade():
+    class NoOperations:
+        def __getattr__(self, name):
+            raise AssertionError(f"unexpected operation: {name}")
+    for trigger in ("periodic", "wake", "network"):
+        assert core.execute_plan(dealroom_unverified_plan(), NoOperations()) == "refused:dealroom_runtime_proof_unavailable"
+
+
+def test_dealroom_no_duplicate_container_restart():
+    core.HostOps(None, None).restart_units(dealroom_unverified_plan())
 
 
 def test_dealroom_never_uses_code_only_automatic_rollback():
-    assert core.attempt_rollback_once(verify(make_plan(artifact="dealroom")), None) is False
+    assert core.attempt_rollback_once(dealroom_unverified_plan(), None) is False
