@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""hmw-ledger: a durable record of every herdr tab, independent of herdr's own state.
+
+PROTOTYPE (branch proto/hmw-tab-ledger). Herdr forgets tabs whenever its
+session.json is cleared (shutdown race), a workspace is closed, or memguard
+ends the Hermes inside a tab. The ledger never drops an entry on its own: a tab
+that disappears is marked lost with a reason, and stays restorable until you
+`forget` it.
+
+  hmw-ledger update            reconcile the ledger with live herdr (timer runs this)
+  hmw-ledger status            live vs lost tabs
+  hmw-ledger restore [NAME..]  recreate lost tabs (all if no names) and resume Hermes
+  hmw-ledger forget NAME..     stop tracking lost tabs
+  hmw-ledger update --auto     also restore tabs lost to a server restart
+
+Session ids, best first: hmw lease map (exact) > herdr agent_session whose title
+matches the pane title (verified) > herdr agent_session alone (unverified; it
+can be stale, which is how memguard logged a wrong id on 2026-11-03).
+"""
+import json, os, re, sqlite3, subprocess, sys, time
+
+SESSION = os.environ.get("HERDR_SESSION", "ws")
+HOME = os.path.expanduser("~")
+STATE = os.environ.get("HMW_STATE_DIR", os.path.join(HOME, ".hermes/hmw"))
+LEDGER = os.path.join(STATE, f"{SESSION}.ledger.json")
+SNAP = os.path.join(STATE, f"{SESSION}.panes.json")
+DB = os.path.join(HOME, ".hermes/state.db")
+MEMGUARD_LOG_GLOB = os.path.join(HOME, ".hermes/logs")
+SID_RE = re.compile(r"^\d{8}_\d{6}_[0-9a-f]{6}$")
+now = time.time()
+
+
+def herdr(*args, check=True):
+    r = subprocess.run(["herdr", "--session", SESSION, *args], capture_output=True, text=True, timeout=60)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"herdr {' '.join(args)}: {r.stderr.strip() or r.stdout.strip()}")
+    return json.loads(r.stdout)["result"] if r.stdout.strip().startswith("{") else {}
+
+
+def db():
+    return sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+
+
+def leaf(c, sid):
+    """Follow compression continuations only; other children (side/background sessions) are not the tab."""
+    seen = set()
+    while sid and sid not in seen:
+        seen.add(sid)
+        r = c.execute("select end_reason from sessions where id=?", (sid,)).fetchone()
+        if not r or r[0] != "compression":
+            break
+        k = c.execute("select id from sessions where parent_session_id=? order by started_at desc limit 1", (sid,)).fetchone()
+        if not k:
+            break
+        sid = k[0]
+    return sid
+
+
+def lineage(c, sid):
+    """sid plus all ancestors, so a compressed child matches its parent's entry."""
+    out, seen = set(), set()
+    while sid and sid not in seen:
+        seen.add(sid); out.add(sid)
+        r = c.execute("select parent_session_id from sessions where id=?", (sid,)).fetchone()
+        sid = r[0] if r else None
+    return out
+
+
+def title_of(c, sid):
+    r = c.execute("select coalesce(title,'') from sessions where id=?", (sid,)).fetchone()
+    return r[0] if r else ""
+
+
+def by_title(c, pane_title):
+    """Unique interactive session whose title matches the pane title prefix (leaf of its chain)."""
+    key = norm(pane_title)
+    if len(key) < 8:
+        return None
+    rows = c.execute("select id, title from sessions where source in ('tui','cli') and title is not null "
+                     "order by last_activity_at desc limit 400").fetchall()
+    hits = {leaf(c, i) for i, t in rows if norm(t).startswith(key[:24])}
+    return hits.pop() if len(hits) == 1 else None
+
+
+def norm(t):
+    t = re.sub(r"^[^\w]+", "", t or "")          # status glyphs
+    return t.split("…")[0].split(" · ")[0].strip().lower()
+
+
+def server_start():
+    r = subprocess.run(["pgrep", "-f", f"herdr --session {SESSION} server"], capture_output=True, text=True)
+    pids = r.stdout.split()
+    if not pids:
+        return None
+    try:   # real start time: btime + starttime ticks (Linux); pid string elsewhere
+        ticks = int(open(f"/proc/{pids[0]}/stat").read().rsplit(")", 1)[1].split()[19])
+        btime = next(int(l.split()[1]) for l in open("/proc/stat") if l.startswith("btime"))
+        return float(round(btime + ticks / os.sysconf("SC_CLK_TCK")))
+    except (OSError, ValueError, IndexError, StopIteration):
+        return pids[0]
+
+
+def load():
+    try:
+        return json.load(open(LEDGER))
+    except (OSError, ValueError):
+        return {"version": 1, "session": SESSION, "entries": [], "server_start": None}
+
+
+def save(led):
+    os.makedirs(STATE, exist_ok=True)
+    tmp = f"{LEDGER}.tmp.{os.getpid()}"
+    with open(tmp, "w") as fh:
+        json.dump(led, fh, indent=1)
+    os.replace(tmp, LEDGER)
+
+
+def lease_map():
+    try:
+        d = json.load(open(SNAP))
+    except (OSError, ValueError):
+        return {}
+    if now - d.get("saved_at", 0) > 900:
+        return {}
+    return {p["pane_id"]: p["session_id"] for p in d.get("panes", []) if p.get("session_id")}
+
+
+def live_tabs(c):
+    panes = herdr("pane", "list")["panes"]
+    tabs = {t["tab_id"]: t for t in herdr("tab", "list")["tabs"]}
+    wss = {w["workspace_id"]: w for w in herdr("workspace", "list")["workspaces"]}
+    leases = lease_map()
+    out = {}
+    for p in panes:
+        tid = p["tab_id"]
+        t = out.setdefault(tid, {"tab_id": tid, "workspace_id": p["workspace_id"],
+                                 "workspace_label": (wss.get(p["workspace_id"]) or {}).get("label"),
+                                 "tab_label": (tabs.get(tid) or {}).get("label"), "panes": []})
+        sid, src = None, None
+        hint = (p.get("agent_session") or {}).get("value")
+        if p["pane_id"] in leases:
+            sid, src = leases[p["pane_id"]], "lease"
+        elif p.get("agent") == "hermes" and isinstance(hint, str) and SID_RE.match(hint):
+            lt = title_of(c, leaf(c, hint))
+            ok = lt and norm(lt)[:18] == norm(p.get("terminal_title_stripped"))[:18]
+            sid, src = hint, ("herdr-verified" if ok else "herdr-unverified")
+            if not ok:
+                alt = by_title(c, p.get("terminal_title_stripped"))
+                if alt:
+                    sid, src = alt, "title-match"
+        t["panes"].append({"pane_id": p["pane_id"], "pane_label": p.get("label"), "cwd": p.get("cwd"),
+                           "agent": p.get("agent"), "session_id": sid, "sid_source": src,
+                           "title": p.get("terminal_title_stripped")})
+    return out
+
+
+def memguard_ended_sids(since):
+    sids = set()
+    try:
+        r = subprocess.run(["journalctl", "-u", "hermes-memguard", "--since", f"@{int(since)}", "-o", "cat", "--no-pager"],
+                           capture_output=True, text=True, timeout=30)
+        sids.update(re.findall(r"--resume (\d{8}_\d{6}_[0-9a-f]{6})", r.stdout))
+    except Exception:
+        pass
+    return sids
+
+
+def update(auto=False):
+    c = db()
+    led = load()
+    live = live_tabs(c)
+    srv = server_start()
+    restarted = led.get("server_start") not in (None, srv)
+    # Lineage index of live Hermes panes, to match entries across compression/restarts.
+    live_lineage = {}
+    for t in live.values():
+        for q in t["panes"]:
+            if q["session_id"]:
+                for s in lineage(c, leaf(c, q["session_id"])):
+                    live_lineage.setdefault(s, t["tab_id"])
+    matched_tabs = set()
+    for e in led["entries"]:
+        if e["state"] == "forgotten":
+            continue
+        tid = None
+        for q in e["panes"]:
+            if q.get("session_id"):
+                tid = live_lineage.get(leaf(c, q["session_id"])) or live_lineage.get(q["session_id"])
+                if tid:
+                    break
+        if not tid and not any(q.get("session_id") for q in e["panes"]):
+            # shell-only tab: same server instance + same tab id + same name
+            cand = live.get(e.get("live_tab_id"))
+            if cand and not restarted and cand["tab_label"] == e["tab_label"]:
+                tid = e["live_tab_id"]
+        if not tid and e["state"] == "restoring" and e.get("live_tab_id") in live:
+            tid = e["live_tab_id"]   # just recreated; Hermes may not be detected in the pane yet
+        if tid and tid not in matched_tabs:
+            t = live[tid]; matched_tabs.add(tid)
+            prev = {q.get("pane_label") or i: q for i, q in enumerate(e["panes"])}
+            panes = []
+            for i, q in enumerate(t["panes"]):
+                old = prev.get(q.get("pane_label") or i) or (e["panes"][i] if i < len(e["panes"]) else {})
+                # never downgrade a verified id to an unverified herdr hint, or to nothing while Hermes starts
+                if old.get("session_id") and (q["session_id"] is None or (
+                        q["sid_source"] == "herdr-unverified" and (old.get("sid_source") or "").startswith(("lease", "herdr-verified", "title-match")))):
+                    q = dict(q, session_id=old["session_id"], sid_source=(old.get("sid_source") or "").replace("(kept)", "") + "(kept)")
+                panes.append(q)
+            e.update(live_tab_id=tid, workspace_label=t["workspace_label"], tab_label=t["tab_label"],
+                     panes=panes, state="live", last_seen=now, lost_at=None, lost_reason=None)
+        elif e["state"] in ("live", "restoring"):
+            sids = {leaf(c, q["session_id"]) for q in e["panes"] if q.get("session_id")}
+            shell_left = e.get("live_tab_id") in live and not any(
+                q.get("agent") for q in live[e["live_tab_id"]]["panes"])
+            reason = "server-restart" if restarted else (
+                "memguard" if sids & {leaf(c, s) for s in memguard_ended_sids(e.get("last_seen", now) - 600)}
+                else "hermes-exited" if shell_left else "closed")
+            e.update(state="lost", lost_at=now, lost_reason=reason)
+    for tid, t in live.items():
+        if tid not in matched_tabs:
+            led["entries"].append({"id": f"{int(now)}-{tid}", "first_seen": now, "last_seen": now, "state": "live",
+                                   "live_tab_id": tid, "workspace_label": t["workspace_label"],
+                                   "tab_label": t["tab_label"], "panes": t["panes"], "lost_at": None, "lost_reason": None})
+    led["server_start"] = srv
+    led["updated_at"] = now
+    save(led)
+    if auto:
+        # Grace: after a restart herdr restores tabs and hmw resumes Hermes in them; only
+        # entries still unmatched 5 minutes later are genuinely gone.
+        up = now - srv if isinstance(srv, float) else 0
+        todo = [e for e in led["entries"] if e["state"] == "lost" and e["lost_reason"] == "server-restart"
+                and up > 300 and now - (e.get("lost_at") or now) > 300]
+        if todo:
+            restore_entries(led, todo, c)
+    return led
+
+
+def seed_from_snapshot(path):
+    """Import tabs from an hmw snapshot (with tabs[]) that are not live now, as lost/closed."""
+    c = db(); led = load(); d = json.load(open(path))
+    known = {leaf(c, q["session_id"]) for e in led["entries"] for q in e["panes"] if q.get("session_id")}
+    added = 0
+    for t in d.get("tabs") or []:
+        panes = []
+        for q in t.get("panes") or []:
+            sid = q.get("session_hint")
+            panes.append({"pane_id": q.get("pane_id"), "pane_label": q.get("pane_label"), "cwd": t.get("cwd"),
+                          "agent": q.get("agent"), "session_id": sid, "sid_source": "snapshot-hint" if sid else None,
+                          "title": None})
+        sids = {leaf(c, q["session_id"]) for q in panes if q.get("session_id")}
+        if not sids or sids & known:
+            continue
+        led["entries"].append({"id": f"seed-{int(d.get('saved_at', 0))}-{t['tab_id']}", "first_seen": d.get("saved_at"),
+                               "last_seen": d.get("saved_at"), "state": "lost", "live_tab_id": None,
+                               "workspace_label": t.get("workspace_label"), "tab_label": t.get("tab_label"),
+                               "panes": panes, "lost_at": d.get("saved_at"), "lost_reason": "closed (seeded)"})
+        known |= sids; added += 1
+    save(led)
+    print(f"seeded {added} tab(s) from {os.path.basename(path)}")
+
+
+def live_session_ids(c):
+    r = subprocess.run(["pgrep", "-af", "--resume"], capture_output=True, text=True)
+    return {leaf(c, s) for s in re.findall(r"--resume (\d{8}_\d{6}_[0-9a-f]{6})", r.stdout)}
+
+
+def restore_entries(led, entries, c):
+    wss = herdr("workspace", "list")["workspaces"]
+    running = live_session_ids(c)
+    for e in entries:
+        ws = next((w for w in wss if w.get("label") == e.get("workspace_label")), None) or (wss[0] if wss else None)
+        if not ws:
+            print("no live workspace to restore into"); return
+        first = e["panes"][0] if e["panes"] else {}
+        sid = leaf(c, first["session_id"]) if first.get("session_id") else None
+        if sid and sid in running:
+            print(f"skip {e['tab_label']}: {sid} already running"); continue
+        # memguard-style loss: the tab survived as a bare shell; resume into it instead of a new tab.
+        panes_now = {p["pane_id"]: p for p in herdr("pane", "list")["panes"]}
+        old_tab = e.get("live_tab_id")
+        reuse = [p for p in panes_now.values() if p["tab_id"] == old_tab and not p.get("agent")] if old_tab else []
+        made = False
+        if reuse and len([p for p in panes_now.values() if p["tab_id"] == old_tab]) == 1:
+            tab, pane = old_tab, reuse[0]["pane_id"]
+            led["entries"] = [x for x in led["entries"] if x is e or not (
+                x.get("live_tab_id") == tab and not any(q.get("session_id") for q in x["panes"]))]
+        else:
+            created = herdr("tab", "create", "--workspace", ws["workspace_id"], "--cwd", first.get("cwd") or HOME,
+                            "--env", "NO_TMUX=1", "--no-focus")
+            tab, made = created["tab"]["tab_id"], True
+            pane = (created.get("root_pane") or {}).get("pane_id") or created["tab"].get("focused_pane_id")
+        if e.get("tab_label"):
+            herdr("tab", "rename", tab, e["tab_label"], check=False)
+        if first.get("pane_label"):
+            herdr("pane", "rename", pane, first["pane_label"], check=False)
+        if sid:
+            src = ["--source", f"pane:{first['pane_label']}"] if re.match(r"^H\d+$", first.get("pane_label") or "") else []
+            name = re.sub(r"[^a-z0-9_-]", "-", f"hmw-{pane}".lower())[:32]   # herdr: lowercase, 1-32 chars
+            try:
+                herdr("agent", "start", name, "--kind", "hermes", "--pane", pane,
+                      "--timeout", "120000", "--", "chat", *src, "--resume", sid)
+            except RuntimeError as err:
+                print(f"FAILED to resume {sid} in {pane}: {err}")
+                if made:   # never close a tab we did not create
+                    herdr("tab", "close", tab, check=False)
+                e.update(state="lost"); continue
+        extra = len(e["panes"]) - 1
+        print(f"restored {e.get('tab_label') or '(unnamed)'} -> {tab}" + (f" (resumed {sid})" if sid else " (shell)")
+              + (f"; {extra} split pane(s) not recreated" if extra > 0 else ""))
+        e.update(state="restoring", live_tab_id=tab)
+    save(led)
+
+
+def status(led):
+    c = db()
+    for state in ("live", "lost"):
+        rows = [e for e in led["entries"] if e["state"] in ((state, "restoring") if state == "live" else (state,))]
+        print(f"\n{state.upper()} ({len(rows)})")
+        for e in sorted(rows, key=lambda e: -(e.get("lost_at") or e.get("last_seen") or 0)):
+            q = next((q for q in e["panes"] if q.get("session_id")), e["panes"][0] if e["panes"] else {})
+            sid = q.get("session_id")
+            what = f"{leaf(c, sid)} [{q.get('sid_source')}] {title_of(c, leaf(c, sid))[:42]}" if sid else "shell"
+            when = (f"  lost {time.strftime('%m-%d %H:%M', time.gmtime(e['lost_at']))} ({e['lost_reason']})"
+                    if state == "lost" else "")
+            print(f"  {(e.get('tab_label') or '-'):16} {what}{when}")
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "status"
+    if cmd == "update":
+        update(auto="--auto" in argv)
+    elif cmd == "status":
+        status(update())
+    elif cmd == "seed":
+        seed_from_snapshot(argv[2])
+    elif cmd in ("restore", "forget"):
+        c = db(); led = update(); names = set(argv[2:])
+        sel = [e for e in led["entries"] if e["state"] == "lost" and (not names or e.get("tab_label") in names)]
+        if not sel:
+            print("nothing lost matches"); return
+        if cmd == "restore":
+            restore_entries(led, sel, c); update()
+        else:
+            for e in sel:
+                e["state"] = "forgotten"
+            save(led); print(f"forgot {len(sel)} tab(s)")
+    else:
+        print(__doc__); sys.exit(2)
+
+
+if __name__ == "__main__":
+    main(sys.argv)
