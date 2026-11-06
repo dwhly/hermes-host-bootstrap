@@ -82,6 +82,9 @@ if cmd == ["tab", "close"]:
     st["panes"] = [p for p in st["panes"] if p["tab_id"] != a[2]]
     out({})
 if cmd == ["agent", "start"]:
+    if st.get("restart_on_agent_start"):        # the server restarts while Hermes is launching
+        st["server_pid"] = "99999909"
+        st["server_lstart"] = time.strftime("%a %b %d %H:%M:%S %Y", time.localtime(1_800_005_000))
     if st.get("agent_start_sleep"):
         save(); time.sleep(st["agent_start_sleep"]); sys.exit(0)
     if st.get("fail_agent_start"):
@@ -132,6 +135,8 @@ class LedgerTests(unittest.TestCase):
             f.chmod(0o755)
         self.hh = self.tmp / "home" / ".hermes"
         self.hh.mkdir(parents=True)
+        self.proc = self.tmp / "proc"               # a fake, empty /proc: no host processes leak in
+        (self.proc / "self").mkdir(parents=True)
         self.state = self.tmp / "herdr.json"
         self.db = sqlite3.connect(str(self.hh / "state.db"))
         self.db.execute("create table sessions (id text, source text, title text, end_reason text, "
@@ -194,7 +199,7 @@ class LedgerTests(unittest.TestCase):
     def env(self, now=T0 + 60, **extra):
         env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"], HOME=str(self.tmp / "home"),
                    HERMES_HOME=str(self.hh), HERDR_SESSION="ws", FAKE_STATE=str(self.state),
-                   HMW_LEDGER_NOW=repr(float(now)), **extra)
+                   HMW_LEDGER_NOW=repr(float(now)), HMW_PROC_ROOT=str(self.proc), **extra)
         for k in ("HMW_STATE_DIR", "HMW_LOG_DIR"):
             env.pop(k, None)
         return env
@@ -577,6 +582,99 @@ class LedgerTests(unittest.TestCase):
         self.run_ledger("update", now=T0 + 1410)
         alpha = next(t for t in self.load()["tabs"] if t["label"].endswith("ALPHA"))
         self.assertEqual(alpha["label"], "\u25cf ALPHA")
+
+
+    # ── review r2 ──
+    def test_parser_is_hmws_own(self):
+        hw = (REPO / "scripts" / "hermes-workspace").read_text()
+        block = LEDGER.read_text().split("# BEGIN hmw-parser\n", 1)[1].split("\n# END hmw-parser", 1)[0]
+        start = hw.index("def hermes_launcher_code(code):")
+        self.assertEqual(hw[start:start + len(block)], block, "keep hmw-ledger's parser identical to hmw's")
+
+    def test_missing_registry_with_an_unmapped_hermes_restores_nothing(self):
+        self.run_ledger("update")
+        self.close_tab("w1:t2")
+        d = self.proc / "4242"
+        d.mkdir()
+        (d / "cmdline").write_bytes(b"hermes\0chat\0")          # a Hermes nobody can map to a session
+        self.assertIn("not restoring", self.run_ledger("restore", "BETA"))
+        self.assertEqual(self.calls("tab", "create"), [])
+        (d / "cmdline").write_bytes(b"hermes\0chat\0--resume\0" + C.encode() + b"\0")   # explained by --resume
+        self.assertIn("restored BETA", self.run_ledger("restore", "BETA"))
+
+    def test_editor_on_a_hermes_file_is_not_hermes(self):
+        self.run_ledger("update")
+        self.exit_hermes("w1:t1", retain_identity=True)
+        self.load()
+        self.pane_of("w1:t1")["fg"] = [["vim", "hermes.py"]]
+        self.save()
+        self.run_ledger("update")
+        self.assertEqual(self.entry("ALPHA")["lost_reason"], "hermes-exited")
+
+    def test_cleanup_never_closes_a_tab_after_the_server_changed(self):
+        self.run_ledger("update")
+        self.close_tab("w1:t2")
+        self.edit(fail_agent_start=True, restart_on_agent_start=True)
+        self.run_ledger("restore", "BETA")
+        self.assertEqual(self.calls("tab", "close"), [], "the id may now name someone else's tab")
+        self.assertEqual(self.entry("BETA")["state"], "lost")
+
+    def test_kill_mid_restore_keeps_a_checkpoint_and_frees_the_lock(self):
+        self.run_ledger("update")
+        self.close_tab("w1:t2")
+        self.edit(agent_start_sleep=30)
+        proc = subprocess.Popen([sys.executable, str(LEDGER), "restore", "BETA"], env=self.env(),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        for _ in range(100):
+            if self.calls("agent", "start"):
+                break
+            time.sleep(0.1)
+        proc.terminate()
+        proc.communicate(timeout=30)
+        e = self.entry("BETA")
+        self.assertEqual((e["state"], e["restore"]["reason"], e["live_tab_id"]), ("restoring", "closed", "w1:t10"))
+        self.assertFalse((self.hh / "logs" / "hmw-ws.restore.lock").exists())
+
+    def test_closing_the_first_of_two_unlabelled_panes_keeps_it(self):
+        self.load()
+        self.pane("w1:t2", "w1:p9", C, "BETA")
+        self.save()
+        self.run_ledger("update")
+        self.load()
+        self.st["panes"] = [p for p in self.st["panes"] if p["pane_id"] != "w1:p2"]   # B's pane goes
+        self.save()
+        self.run_ledger("update")
+        kept = [e for e in self.ledger()["entries"] if e["state"] == "lost"]
+        self.assertEqual([e["panes"][0]["session_id"] for e in kept], [B])
+        self.assertEqual([q["session_id"] for q in self.entry("BETA")["panes"]], [C])
+
+    def test_same_conversation_twice_in_one_tab_launches_once(self):
+        self.load()
+        self.pane("w1:t2", "w1:p9", B, "BETA", pane_label="H2")
+        self.save()
+        self.run_ledger("update")
+        self.close_tab("w1:t2")
+        self.run_ledger("restore", "BETA")
+        self.assertEqual(self.resumed(), [B])
+
+    def test_unconfirmed_restore_is_undone_and_stays_eligible(self):
+        self.run_ledger("update")
+        self.restart_server()
+        self.run_ledger("update", "--auto", now=T0 + 1010)
+        self.edit(agent_start_sleep=9)
+        self.run_ledger("update", "--auto", now=T0 + 1400, HMW_LEDGER_AGENT_START_MS="1000")
+        self.assertEqual({self.entry(n)["state"] for n in ("ALPHA", "BETA")}, {"restoring"})
+        self.edit(agent_start_sleep=0)
+        self.run_ledger("update", "--auto", now=T0 + 1500)
+        self.assertEqual(self.entry("ALPHA")["state"], "restoring", "still inside the confirmation window")
+        self.run_ledger("update", now=T0 + 2100)          # Hermes never appeared: undo, keep the reason
+        e = self.entry("ALPHA")
+        self.assertEqual((e["state"], e["lost_reason"]), ("lost", "server-restart"))
+        self.assertEqual(len(self.calls("tab", "close")), 2, "only the bare tabs it made itself")
+        self.run_ledger("update", "--auto", now=T0 + 2500)
+        self.assertEqual(self.entry("ALPHA")["state"], "restoring")
+        self.run_ledger("update", now=T0 + 2510)              # Hermes is in the tab now: confirmed
+        self.assertEqual(self.entry("ALPHA")["state"], "live")
 
     # ── robustness ──
     def test_missing_state_db_still_records_tabs(self):

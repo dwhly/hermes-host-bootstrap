@@ -37,6 +37,7 @@ LEASES = os.path.join(HERMES_HOME, "runtime", "active_sessions.json")
 LOG_DIR = os.environ.get("HMW_LOG_DIR") or os.path.join(HERMES_HOME, "logs")
 RESTORE_LOCK = os.path.join(LOG_DIR, f"hmw-{SESSION}.restore.lock")   # shared with hmw's own restore
 GRACE = 300            # seconds after a server restart before tabs still missing count as gone
+RESTORE_WAIT = 600     # a restore Hermes has not confirmed by then is undone and stays restorable
 RECENT = 600           # a session active this recently may be open somewhere: never resume it
 AGENT_START_MS = int(os.environ.get("HMW_LEDGER_AGENT_START_MS") or 120000)   # override: tests only
 MARK = "\u25cf "       # "● ": unseen finished work carried across a herdr restart
@@ -44,6 +45,7 @@ SID_RE = re.compile(r"^\d{8}_\d{6}_[0-9a-f]{6}$")
 VERIFIED = ("lease", "herdr-verified", "title-match")
 SHELLS = {"sh", "bash", "zsh", "dash", "fish", "ksh", "tcsh", "csh"}
 DAY = 86400
+PROC = os.environ.get("HMW_PROC_ROOT") or "/proc"      # override: tests only (as in hermes-workspace)
 now = float(os.environ.get("HMW_LEDGER_NOW") or time.time())   # override: tests only
 
 
@@ -128,8 +130,8 @@ def server_start():
         return None
     pid = pids[0]
     try:   # Linux: btime + starttime ticks
-        ticks = int(open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[19])
-        btime = next(int(l.split()[1]) for l in open("/proc/stat") if l.startswith("btime"))
+        ticks = int(open(f"{PROC}/{pid}/stat").read().rsplit(")", 1)[1].split()[19])
+        btime = next(int(l.split()[1]) for l in open(f"{PROC}/stat") if l.startswith("btime"))
         return float(round(btime + ticks / os.sysconf("SC_CLK_TCK")))
     except (OSError, ValueError, IndexError, StopIteration):
         pass
@@ -184,11 +186,145 @@ def is_shell(argv):
     return bool(argv) and os.path.basename(str(argv[0])).lstrip("-") in SHELLS
 
 
+# ── Hermes invocation parser: VERBATIM from scripts/hermes-workspace (hmw), which is the
+# reviewed definition of "this process is an interactive Hermes chat". A test keeps them equal.
+# BEGIN hmw-parser
+def hermes_launcher_code(code):
+    # Hermes 0.21+ managed launchers exec the store Python as
+    # `python3 -I -c <bootstrap>`. Accept only the published Hermes CLI
+    # entry shapes (hermes_cli/_launchers.py); arbitrary -c code, and
+    # sibling entry points such as hermes-acp, stay rejected.
+    lines = code.strip().splitlines()
+    if not lines:
+        return False
+    if (lines[-1] == "sys.exit(main())" and "import hermes_bootstrap" in lines
+            and "from hermes_cli.main import main" in lines):
+        return True
+    statements = [part.strip() for part in code.strip().split(";")]
+    # (chr(39) is a single quote; this code lives in a single-quoted shell string.)
+    entry = "runpy.run_module({0}hermes_cli.main{0}, run_name={0}__main__{0}, alter_sys=True)"
+    return "import hermes_bootstrap" in statements and statements[-1] == entry.format(chr(39))
+
+def hermes_args(argv):
+    executable = os.path.basename(argv[0])
+    if executable == "hermes":
+        return argv[1:]
+    if not re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?", executable):
+        return None
+    # Parse interpreter options, not arbitrary later tokens that happen
+    # to say hermes. In particular, -c code and other scripts are not it.
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            i += 1
+            break
+        if not arg.startswith("-"):
+            break
+        if arg == "--check-hash-based-pycs":
+            if argv[i + 1:i + 2] not in (["default"], ["always"], ["never"]):
+                return None
+            i += 2
+            continue
+        if arg == "-" or arg.startswith("--"):
+            return None
+        # Python groups short flags and allows attached m/W/X operands.
+        # An operand consumes the rest of this token, never more flags.
+        j = 1
+        while j < len(arg):
+            option = arg[j]
+            if option in "mWX":
+                value = arg[j + 1:]
+                if not value:
+                    i += 1
+                    if i >= len(argv) or not argv[i]:
+                        return None
+                    value = argv[i]
+                if option == "m":
+                    return argv[i + 1:] if value == "hermes_cli.main" else None
+                break
+            if option == "c":
+                value = arg[j + 1:]
+                if not value:
+                    i += 1
+                    if i >= len(argv):
+                        return None
+                    value = argv[i]
+                return argv[i + 1:] if hermes_launcher_code(value) else None
+            # -i keeps Python alive at its REPL after Hermes exits. It
+            # cannot prove live Hermes even when PID/identity are retained.
+            if option not in "bBdEIOPqsSuvx":
+                return None
+            j += 1
+        i += 1
+    if i < len(argv) and os.path.basename(argv[i]) == "hermes":
+        return argv[i + 1:]
+    return None
+
+def interactive_chat(args):
+    if args is None:
+        return False
+    # Bare hermes defaults to chat, as do its profile/resume shortcuts.
+    # Use known option arities, so values like --resume setup are not
+    # confused with subcommands. Unknown modes fail closed. Query/oneshot
+    # invocations are deliberately excluded (behavior varies by version).
+    values = {"--profile", "-p", "--model", "-m", "--provider", "--reasoning",
+              "--toolsets", "-t", "--skills", "-s", "--resume", "-r", "--in"}
+    switches = {"--tui", "--cli", "--dev", "--worktree", "-w", "--yolo",
+                "--pass-session-id", "--ignore-user-config", "--ignore-rules",
+                "--safe-mode", "--accept-hooks", "--no-restore-cwd"}
+    chat_values = {"--source", "--max-turns", "--run-budget"}
+    chat_switches = {"--checkpoints", "--create-if-missing", "--verbose", "-v"}
+    chat = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "chat" and not chat:
+            chat = True
+            i += 1
+            continue
+        # -w can lead a group; -v is safe only after explicit chat.
+        # Peel switches; the first value option owns the remaining suffix.
+        # Profile -p is a launcher shortcut, not a parser group member.
+        group_switches = "wv" if chat else "w"
+        while len(arg) > 2 and arg[0] == "-" and arg[1] in group_switches:
+            if arg[2] not in group_switches + "cmrst":
+                return False
+            arg = "-" + arg[2:]
+        option, equal, value = arg.partition("=")
+        # Only known single-letter value options may consume a suffix.
+        # Do not interpret arbitrary substrings or one-shot -q/-z as chat.
+        if len(arg) > 2 and (arg[:2] in values or arg[:2] == "-c"):
+            option, equal, value = arg[:2], "=", arg[2:]
+            if value.startswith("="):
+                value = value[1:]
+        if option in values or (chat and option in chat_values):
+            if equal:
+                if not value:
+                    return False
+            else:
+                i += 1
+                if i >= len(args) or not args[i] or args[i].startswith("-"):
+                    return False
+        elif option in ("--continue", "-c"):
+            if equal and not value:
+                return False
+            if not equal and i + 1 < len(args) and not args[i + 1].startswith("-"):
+                i += 1
+        elif not equal and (option in switches or (chat and option in chat_switches)):
+            pass
+        else:
+            return False
+        i += 1
+    return True
+# END hmw-parser
+
+
 def hermes_in(fg):
-    """True/False when the foreground is known to hold / not hold Hermes; None if unknown."""
+    """True/False when the foreground is known to hold / not hold an interactive Hermes; None if unknown."""
     if fg is None:
         return None
-    return any(" ".join(map(str, a)).lower().find("hermes") >= 0 and not is_shell(a) for a in fg)
+    return any(all(isinstance(x, str) for x in a) and interactive_chat(hermes_args(a)) for a in fg if a)
 
 
 def live_tabs(c):
@@ -276,6 +412,67 @@ def prune(led):
     led["entries"] = keep
 
 
+def match_panes(c, old, live):
+    """Pair each live pane with its recorded pane: same conversation, then same pane id, then
+    same label; by position only when the layout is unchanged and no conversation says otherwise."""
+    used, out = set(), []
+    same_layout = len(old) == len(live)
+    for i, q in enumerate(live):
+        free = [k for k in range(len(old)) if k not in used]
+        lin = lineage(c, leaf(c, q["session_id"])) if q["session_id"] else set()
+        j = None
+        for test in (lambda o: bool(lin) and bool(o.get("session_id")) and leaf(c, o["session_id"]) in lin,
+                     lambda o: o.get("pane_id") == q["pane_id"],
+                     lambda o: bool(q.get("pane_label")) and o.get("pane_label") == q.get("pane_label")):
+            j = next((k for k in free if test(old[k])), None)
+            if j is not None:
+                break
+        if j is None and same_layout and i in free and not (q["session_id"] and old[i].get("session_id")):
+            j = i
+        o = old[j] if j is not None else {}
+        if j is not None:
+            used.add(j)
+        # never downgrade a verified id to an unverified herdr hint, or to nothing while Hermes starts
+        if o.get("session_id") and (q["session_id"] is None or (q["sid_source"] == "herdr-unverified" and verified(o))):
+            q = dict(q, session_id=o["session_id"], sid_source=(o.get("sid_source") or "").replace("(kept)", "") + "(kept)")
+        out.append(q)
+    return out, used
+
+
+def ours(tab, r, srv):
+    """True only if `tab` is still exactly the bare tab this ledger created (same server, same panes)."""
+    if not r.get("made") or r.get("server") != srv or server_start() != srv:
+        return False
+    have = [p for p in herdr("pane", "list")["panes"] if p.get("tab_id") == tab]
+    if not have or not {p["pane_id"] for p in have} <= set(r.get("panes") or []):
+        return False
+    # unknown foreground counts as busy: never close it
+    return all(all(is_shell(a) for a in (foreground(p["pane_id"]) or [["?"]])) for p in have)
+
+
+def pending(e, live, srv, restarted):
+    """A restore that Hermes has not confirmed yet. Returns the tab id while it is still pending."""
+    r = e.get("restore") or {}
+    reason = "server-restart" if restarted else (r.get("reason") or e.get("lost_reason") or "closed")
+    t = live.get(e.get("live_tab_id"))
+    if t and not restarted and now - r.get("at", now) <= RESTORE_WAIT:
+        e["last_seen"] = now
+        return t["tab_id"]
+    if t and not restarted:                    # Hermes never showed up: undo only what we provably made
+        closed = False
+        try:
+            if ours(t["tab_id"], r, srv):
+                closed = herdr("tab", "close", t["tab_id"], check=False, timeout=20) is not None
+        except (RuntimeError, Ambiguous):
+            pass
+        e.pop("restore", None)
+        e.update(state="lost", lost_at=now, lost_reason=reason, lost_server=srv)
+        return t["tab_id"] if closed else None    # a closed tab is not a new tab to record
+    e.pop("restore", None)
+    e.update(state="lost", lost_at=now, lost_reason=reason, lost_server=srv)
+    return None
+
+
 def update(auto=False):
     c = db()
     led = load()
@@ -308,44 +505,32 @@ def update(auto=False):
             cand = live.get(e.get("live_tab_id"))
             if cand and cand["tab_label"] == e["tab_label"] and not any(q["session_id"] for q in cand["panes"]):
                 tid = e["live_tab_id"]
-        if not tid and e["state"] == "restoring" and e.get("live_tab_id") in live:
-            tid = e["live_tab_id"]   # just recreated; Hermes may not be detected in the pane yet
         if tid and tid not in matched_tabs:
             t = live[tid]; matched_tabs.add(tid)
-            prev = {q.get("pane_label"): i for i, q in enumerate(e["panes"]) if q.get("pane_label")}
-            used, panes = set(), []
-            for i, q in enumerate(t["panes"]):
-                j = prev.get(q.get("pane_label"))
-                if j is None and i < len(e["panes"]) and i not in used and not e["panes"][i].get("pane_label"):
-                    j = i
-                old = e["panes"][j] if j is not None and j not in used else {}
-                if j is not None:
-                    used.add(j)
-                # never downgrade a verified id to an unverified herdr hint, or to nothing while Hermes starts
-                if old.get("session_id") and (q["session_id"] is None or (
-                        q["sid_source"] == "herdr-unverified" and verified(old))):
-                    q = dict(q, session_id=old["session_id"], sid_source=(old.get("sid_source") or "").replace("(kept)", "") + "(kept)")
-                panes.append(q)
+            panes, used = match_panes(c, e["panes"], t["panes"])
             # recorded Hermes panes this tab no longer has (a closed split, a pane not restored): keep them
             gone = [q for j, q in enumerate(e["panes"]) if j not in used and q.get("session_id")
                     and leaf(c, q["session_id"]) not in live_lineage]
             if gone:
-                split_off(led, e, gone, e.get("lost_reason") if e["state"] == "restoring" and e.get("lost_reason") else "closed")
+                split_off(led, e, gone, (e.get("restore") or {}).get("reason") or "closed")
             if restarted and e.get("status") == "done":
                 e["unseen_carry"] = True           # herdr forgets "done" on restart; we do not
+            e.pop("restore", None)
             e.update(live_tab_id=tid, workspace_label=t["workspace_label"], tab_label=t["tab_label"],
                      panes=panes, state="live", last_seen=now, lost_at=None, lost_reason=None,
                      lost_server=None, status=t["status"])
             carry_mark(e, t)
-        elif e["state"] in ("live", "restoring"):
+        elif e["state"] == "restoring":
+            keep = pending(e, live, srv, restarted)
+            if keep:
+                matched_tabs.add(keep)
+        elif e["state"] == "live":
             sids = {leaf(c, q["session_id"]) for q in e["panes"] if q.get("session_id")}
             shell_left = e.get("live_tab_id") in live and not any(
                 q.get("agent") for q in live[e["live_tab_id"]]["panes"])
             reason = "server-restart" if restarted else (
                 "memguard" if sids & {leaf(c, s) for s in memguard_ended_sids(e.get("last_seen", now) - 600)}
                 else "hermes-exited" if shell_left else "closed")
-            if e["state"] == "restoring" and e.get("lost_reason") and not restarted:
-                reason = e["lost_reason"]          # a restore that did not take keeps the original reason
             if reason == "server-restart" and e.get("status") == "done":
                 e["unseen_carry"] = True           # applied once the tab is restored
             e.update(state="lost", lost_at=now, lost_reason=reason, lost_server=srv)
@@ -424,6 +609,31 @@ def pid_alive(pid):
         return False
 
 
+def process_argvs(ps_args):
+    """Exact argv of every process (Linux /proc); elsewhere ps lines, where a Hermes launcher
+    (whose multi-line -c code ps cannot show intact) is reduced to `hermes ...` so it still counts."""
+    out = []
+    if os.path.isdir(f"{PROC}/self"):
+        for d in os.listdir(PROC):
+            if d.isdigit():
+                try:
+                    raw = open(f"{PROC}/{d}/cmdline", "rb").read()
+                except OSError:
+                    continue
+                if raw:
+                    out.append([x.decode("utf-8", "replace") for x in raw.rstrip(b"\0").split(b"\0")])
+        return out
+    for line in ps_args.splitlines():
+        a = line.split()
+        if not a:
+            continue
+        if "hermes_bootstrap" in line or "hermes_cli.main" in line:
+            tail = line.split("hermes_cli.main", 1)[-1].split()
+            a = ["hermes"] + [x for x in tail if not x.startswith(("main", "import", "("))]
+        out.append(a)
+    return out
+
+
 def running_sessions(c, recent=True):
     """Every conversation that may be open anywhere; None when that cannot be known (fail closed).
 
@@ -431,12 +641,13 @@ def running_sessions(c, recent=True):
     covers a Hermes outside herdr that holds no lease. A hand-run restore skips that rule, so a tab you
     just closed by mistake can come straight back."""
     run = set()
+    registry = True
     try:
         entries = json.load(open(LEASES)).get("entries") or []
         if not isinstance(entries, list):
             return None
     except FileNotFoundError:
-        entries = []
+        entries, registry = [], False
     except (OSError, ValueError, AttributeError):
         return None
     for l in entries:     # a live pid counts even if recycled: a skipped restore is safe, a double resume is not
@@ -448,14 +659,23 @@ def running_sessions(c, recent=True):
     except (OSError, subprocess.SubprocessError):
         return None
     run.update(re.findall(r"--resume[ =](\d{8}_\d{6}_[0-9a-f]{6})", args))
+    if not registry:
+        # Without Hermes' lease registry, a Hermes started without --resume (or switched inside
+        # the TUI) is invisible: if any such process exists, nobody can say what it holds.
+        for a in process_argvs(args):
+            if interactive_chat(hermes_args(a)) and not re.search(r"--resume[ =]\d{8}_", " ".join(a)):
+                return None
     if recent:
         run.update(i for (i,) in c.execute("select id from sessions where last_activity_at > ?", (now - RECENT,)))
     try:
         for p in herdr("pane", "list")["panes"]:
             v = (p.get("agent_session") or {}).get("value")
             # herdr keeps agent_session after Hermes exits; count it unless the foreground proves Hermes gone
-            if isinstance(v, str) and hermes_in(foreground(p["pane_id"])) is not False:
+            here = hermes_in(foreground(p["pane_id"])) if p.get("agent") == "hermes" or v else False
+            if isinstance(v, str) and here is not False:
                 run.add(v)
+            elif here and not registry:
+                return None                        # a live Hermes we cannot map, and no registry to ask
     except (RuntimeError, Ambiguous, ValueError, KeyError):
         return None
     out = set()
@@ -529,10 +749,22 @@ def restore_entries(led, entries, c, auto=False):
         srv = server_start()
         wss = herdr("workspace", "list")["workspaces"]
         for e in entries:
-            restore_one(led, e, c, running, srv, wss, auto)
+            try:
+                restore_one(led, e, c, running, srv, wss, auto)
+            except (RuntimeError, Ambiguous, KeyError, TypeError, ValueError) as err:
+                print(f"FAILED to restore {e.get('tab_label') or '(unnamed)'}: {err}")
             save(led)                              # progress survives a later timeout or kill
     finally:
+        save(led)                                  # also on SIGALRM/SIGTERM (main() turns them into SystemExit)
         lock.release()
+
+
+def quiet(*args):
+    """Best-effort cosmetic herdr call (renames): a failure or timeout never aborts a restore."""
+    try:
+        herdr(*args, check=False, timeout=20)
+    except Ambiguous:
+        pass
 
 
 def restore_one(led, e, c, running, srv, wss, auto):
@@ -540,6 +772,7 @@ def restore_one(led, e, c, running, srv, wss, auto):
     if not ws:
         print("no live workspace to restore into"); return
     name = e.get("tab_label") or "(unnamed)"
+    orig = e.get("lost_reason")
     plan, held = [], []                            # panes to launch; Hermes panes kept for later
     for q in e["panes"]:
         sid = leaf(c, q["session_id"]) if q.get("session_id") else None
@@ -550,6 +783,7 @@ def restore_one(led, e, c, running, srv, wss, auto):
         if auto and not verified(q):
             print(f"skip {name}: {sid} is an unverified id; restore it by hand if it is right"); held.append(q); continue
         plan.append((q, sid))
+        running.add(sid)                           # reserve now: never planned twice, in this tab or another
     hermes_tab = any(q.get("session_id") for q in e["panes"])
     if hermes_tab and not plan:
         return                                     # nothing safe to launch; the entry stays lost
@@ -560,17 +794,29 @@ def restore_one(led, e, c, running, srv, wss, auto):
         created = herdr("tab", "create", "--workspace", ws["workspace_id"], "--cwd", first.get("cwd") or HOME,
                         "--env", "NO_TMUX=1", "--no-focus")
         tab = created["tab"]["tab_id"]
-        root = (created.get("root_pane") or {}).get("pane_id") or created["tab"].get("focused_pane_id")
-        targets = [root]
+        targets = [(created.get("root_pane") or {}).get("pane_id") or created["tab"].get("focused_pane_id")]
     else:
-        by_id = {q.get("pane_id"): q for q in e["panes"]}
-        targets = [q.get("pane_id") for q, _ in plan if q.get("pane_id") in by_id]
+        targets = [q.get("pane_id") for q, _ in plan]
+    r = {"at": now, "reason": orig, "server": srv, "made": made, "panes": [x for x in targets if x]}
+    e.update(state="restoring", live_tab_id=tab, restore=r)
+    save(led)                                      # checkpoint before anything is launched
+    if not hermes_tab:                             # a plain shell tab: nothing to confirm
+        if e.get("tab_label"):
+            quiet("tab", "rename", tab, e["tab_label"])
+        if first.get("pane_label") and targets[0]:
+            quiet("pane", "rename", targets[0], first["pane_label"])
+        e.pop("restore", None)
+        e.update(state="live", last_seen=now, lost_at=None, lost_reason=None, lost_server=None)
+        print(f"restored {name} -> {tab} (shell)")
+        return
     launched, failed, ambiguous = [], [], False
     for k, (q, sid) in enumerate(plan):
         if made and k > 0:
             try:
                 split = herdr("pane", "split", targets[-1], "--direction", "right", "--no-focus", "--env", "NO_TMUX=1")
                 targets.append((split.get("pane") or split.get("root_pane") or {}).get("pane_id"))
+                r["panes"] = [x for x in targets if x]
+                save(led)
             except (RuntimeError, Ambiguous) as err:
                 print(f"FAILED to add a pane for {sid}: {err}"); failed.append(q); continue
         pane = targets[k] if k < len(targets) else None
@@ -582,31 +828,30 @@ def restore_one(led, e, c, running, srv, wss, auto):
             herdr("agent", "start", agent, "--kind", "hermes", "--pane", pane, "--timeout", str(AGENT_START_MS),
                   "--", "chat", *src, "--resume", sid, timeout=AGENT_START_MS / 1000 * 1.5 + 5)
         except Ambiguous as err:
-            print(f"UNSURE whether {sid} started in {pane}: {err}; leaving the tab for the next check")
-            running.add(sid); ambiguous = True; launched.append(q); continue
+            print(f"UNSURE whether {sid} started in {pane}: {err}; the next check decides")
+            ambiguous = True; launched.append(q); continue
         except RuntimeError as err:
             print(f"FAILED to resume {sid} in {pane}: {err}"); failed.append(q); continue
-        running.add(sid)                           # reserve: never launch it twice in one batch
         launched.append(q)
         if q.get("pane_label"):
-            herdr("pane", "rename", pane, q["pane_label"], check=False)
-    if hermes_tab and not launched:
-        if made:                                   # never close a tab we did not create
-            herdr("tab", "close", tab, check=False)
-        e.update(state="lost"); return
+            quiet("pane", "rename", pane, q["pane_label"])
+    if not launched:
+        try:
+            if ours(tab, r, srv):                  # never close a tab we did not create, or one that changed
+                herdr("tab", "close", tab, check=False, timeout=20)
+        except (RuntimeError, Ambiguous):
+            pass
+        e.pop("restore", None)
+        e.update(state="lost", lost_reason=orig); return
     if made and e.get("tab_label"):
-        herdr("tab", "rename", tab, e["tab_label"], check=False)
-    if made and not hermes_tab and first.get("pane_label"):
-        herdr("pane", "rename", targets[0], first["pane_label"], check=False)
+        quiet("tab", "rename", tab, e["tab_label"])
     rest = failed + held
     if rest:
-        split_off(led, e, rest, e.get("lost_reason") or "closed")
+        split_off(led, e, rest, orig or "closed")
         e["panes"] = [q for q in e["panes"] if q not in rest]
-    print(f"restored {name} -> {tab}" + (f" (resumed {', '.join(leaf(c, q['session_id']) for q in launched)})"
-                                        if launched else " (shell)")
+    print(f"restored {name} -> {tab} (resumed {', '.join(leaf(c, q['session_id']) for q in launched)})"
           + (f"; {len(rest)} pane(s) kept as separate lost entries" if rest else "")
           + ("; start unconfirmed" if ambiguous else ""))
-    e.update(state="restoring", live_tab_id=tab)
 
 
 def status(led):
