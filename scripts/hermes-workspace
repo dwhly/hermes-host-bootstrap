@@ -752,6 +752,21 @@ herdr_has_label() {
   return 1
 }
 
+# Slots this run deliberately did not recreate (see ensure_herdr_workspace).
+HMW_SKIPPED_SLOTS=""
+hmw_slot_skipped() {
+  case $'\n'"$HMW_SKIPPED_SLOTS"$'\n' in *$'\n'"$1"$'\n'*) return 0 ;; esac
+  return 1
+}
+
+herdr_session_has_panes() {
+  HERDR_PANE_INVENTORY="$HERDR_PANE_INVENTORY" python3 -c 'import json, os
+try:
+    raise SystemExit(0 if json.loads(os.environ["HERDR_PANE_INVENTORY"])["result"]["panes"] else 1)
+except (ValueError, KeyError, TypeError):
+    raise SystemExit(1)'
+}
+
 herdr_target_for_label() {
   local wanted=$1 record name target
 
@@ -797,6 +812,10 @@ herdr_resolve_requested_slots() {
   number=1
   while [ "$number" -le "$REQUEST_COUNT" ]; do
     label="$(label_for "$number")"
+    if hmw_slot_skipped "$label"; then
+      number=$((number + 1))
+      continue
+    fi
     if ! herdr_has_label "$label"; then
       hmw_errf "hermes-workspace: Herdr session '%s' is missing expected agent %s after creation\n" "$SESSION" "$label"
       return 1
@@ -1899,6 +1918,15 @@ ensure_herdr_workspace() {
   while [ "$number" -le "$REQUEST_COUNT" ]; do
     label="$(label_for "$number")"
     if ! herdr_has_label "$label"; then
+      if [ "$legacy_start" -eq 0 ] && ! herdr_target_for_label H1 >/dev/null 2>&1 && herdr_session_has_panes; then
+        # No H1 to split from means this would open a brand-new workspace. In a
+        # session that already has tabs, a missing slot was closed on purpose:
+        # recreating it on every attach resurrects a workspace the user shut.
+        hmw_note "$label is not open in session '$SESSION' (closed?); not recreating it. Open one with: hmw-ledger restore, or a new tab."
+        HMW_SKIPPED_SLOTS+="$label"$'\n'
+        number=$((number + 1))
+        continue
+      fi
       if [ "$legacy_start" -eq 0 ]; then
         start_herdr_agent_in_new_pane "$label" || return
       elif ! "${HERDR[@]}" agent start "$label" --split right --no-focus -- hermes-pane "$label" >/dev/null; then
@@ -1927,6 +1955,10 @@ ensure_herdr_workspace() {
   number=1
   while [ "$number" -le "$REQUEST_COUNT" ]; do
     label="$(label_for "$number")"
+    if hmw_slot_skipped "$label"; then
+      number=$((number + 1))
+      continue
+    fi
     target="$(herdr_target_for_label "$label")" || return
     if ! herdr_wait_for_agent_pane "$target" "$label" "${HMW_HERDR_READY_TIMEOUT:-30}"; then
       hmw_errf "hermes-workspace: Hermes is not ready in existing pane %s for %s in session '%s'; inspect the pane and relaunch Hermes there (no duplicate was created)\n" "$target" "$label" "$SESSION"
@@ -1934,7 +1966,16 @@ ensure_herdr_workspace() {
     fi
     number=$((number + 1))
   done
-  herdr_focus_label H1 || return
+  # Focus H1, or the first slot that is open; with none open, leave focus alone.
+  number=1
+  while [ "$number" -le "$REQUEST_COUNT" ]; do
+    label="$(label_for "$number")"
+    if ! hmw_slot_skipped "$label"; then
+      herdr_focus_label "$label" || return
+      break
+    fi
+    number=$((number + 1))
+  done
   # Hold the restore lock until restored panes are ready; a verify run keeps it
   # through its server-stop cleanup (released by the EXIT trap).
   if [ "$VERIFY" != "1" ]; then

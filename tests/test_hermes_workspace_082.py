@@ -152,6 +152,32 @@ class Herdr082Tests(unittest.TestCase):
         return [c for c in self.calls() if isinstance(c, list) and c[:2] == ["agent", "start"]
                 and c[2:] != ["--help"]]
 
+    def created(self):
+        return [c for c in self.calls() if isinstance(c, list) and c[:2] in (["workspace", "create"], ["pane", "split"])]
+
+    def test_closed_h1_is_not_resurrected_as_a_new_workspace(self):
+        # The user closed the workspace holding H1; H2 and other tabs remain. Attach
+        # must not create a fresh "ws" workspace for H1 (it did on every attach).
+        self.write(panes=[self.pane("", "w1:p1"), self.pane("H2", "w1:p2"), self.pane("", "w1:p3")])
+        result = self.run_core(2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.created(), [])
+        self.assertIn("H1 is not open", result.stderr + result.stdout)
+        self.assertEqual([p["pane_id"] for p in self.state()["panes"] if p.get("focused")], ["w1:p2"])
+
+    def test_no_slots_open_attaches_without_creating_or_focusing(self):
+        self.write(panes=[self.pane("", "w1:p1"), self.pane("notes", "w1:p2")])
+        result = self.run_core(2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.created(), [])
+        self.assertEqual([p for p in self.state()["panes"] if p.get("focused")], [])
+
+    def test_fresh_empty_session_still_creates_slots(self):
+        self.write(panes=[], launched={"agent": "hermes"})
+        result = self.run_core(2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c[:2] for c in self.created()], [["workspace", "create"], ["pane", "split"]], result.stderr)
+
     def test_reboot_restore_relaunches_hermes_once_per_labelled_pane(self):
         self.restored(stopped=True, launched_state={"visible": COMPOSER, "process": LIVE})
         result = self.run_core(2)
