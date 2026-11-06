@@ -26,6 +26,7 @@ LEDGER = os.path.join(STATE, f"{SESSION}.ledger.json")
 SNAP = os.path.join(STATE, f"{SESSION}.panes.json")
 DB = os.path.join(HOME, ".hermes/state.db")
 MEMGUARD_LOG_GLOB = os.path.join(HOME, ".hermes/logs")
+MARK = "\u25cf "   # "● ": unseen finished work carried across a herdr restart
 SID_RE = re.compile(r"^\d{8}_\d{6}_[0-9a-f]{6}$")
 now = time.time()
 
@@ -133,9 +134,15 @@ def live_tabs(c):
     out = {}
     for p in panes:
         tid = p["tab_id"]
+        tinfo = tabs.get(tid) or {}
+        label = tinfo.get("label")
+        if isinstance(label, str) and label.startswith(MARK):
+            label = label[len(MARK):]          # our marker is display-only, never the name
         t = out.setdefault(tid, {"tab_id": tid, "workspace_id": p["workspace_id"],
                                  "workspace_label": (wss.get(p["workspace_id"]) or {}).get("label"),
-                                 "tab_label": (tabs.get(tid) or {}).get("label"), "panes": []})
+                                 "tab_label": label, "shown_label": tinfo.get("label"),
+                                 "status": tinfo.get("agent_status"), "focused": tinfo.get("focused") is True,
+                                 "panes": []})
         sid, src = None, None
         hint = (p.get("agent_session") or {}).get("value")
         if p["pane_id"] in leases:
@@ -191,7 +198,7 @@ def update(auto=False):
         if not tid and not any(q.get("session_id") for q in e["panes"]):
             # shell-only tab: same server instance + same tab id + same name
             cand = live.get(e.get("live_tab_id"))
-            if cand and not restarted and cand["tab_label"] == e["tab_label"]:
+            if cand and cand["tab_label"] == e["tab_label"]:   # herdr restores ids+names on restart
                 tid = e["live_tab_id"]
         if not tid and e["state"] == "restoring" and e.get("live_tab_id") in live:
             tid = e["live_tab_id"]   # just recreated; Hermes may not be detected in the pane yet
@@ -206,8 +213,12 @@ def update(auto=False):
                         q["sid_source"] == "herdr-unverified" and (old.get("sid_source") or "").startswith(("lease", "herdr-verified", "title-match")))):
                     q = dict(q, session_id=old["session_id"], sid_source=(old.get("sid_source") or "").replace("(kept)", "") + "(kept)")
                 panes.append(q)
+            if restarted and e.get("status") == "done":
+                e["unseen_carry"] = True           # herdr forgets "done" on restart; we do not
             e.update(live_tab_id=tid, workspace_label=t["workspace_label"], tab_label=t["tab_label"],
-                     panes=panes, state="live", last_seen=now, lost_at=None, lost_reason=None)
+                     panes=panes, state="live", last_seen=now, lost_at=None, lost_reason=None,
+                     status=t["status"])
+            carry_mark(e, t)
         elif e["state"] in ("live", "restoring"):
             sids = {leaf(c, q["session_id"]) for q in e["panes"] if q.get("session_id")}
             shell_left = e.get("live_tab_id") in live and not any(
@@ -220,7 +231,8 @@ def update(auto=False):
         if tid not in matched_tabs:
             led["entries"].append({"id": f"{int(now)}-{tid}", "first_seen": now, "last_seen": now, "state": "live",
                                    "live_tab_id": tid, "workspace_label": t["workspace_label"],
-                                   "tab_label": t["tab_label"], "panes": t["panes"], "lost_at": None, "lost_reason": None})
+                                   "tab_label": t["tab_label"], "panes": t["panes"], "lost_at": None, "lost_reason": None,
+                                   "status": t["status"]})
     led["server_start"] = srv
     led["updated_at"] = now
     save(led)
@@ -233,6 +245,18 @@ def update(auto=False):
         if todo:
             restore_entries(led, todo, c)
     return led
+
+
+def carry_mark(e, t):
+    """Show MARK on a tab whose finished work was unseen before a restart, until it is seen."""
+    if not e.get("unseen_carry") or not e.get("tab_label"):
+        return
+    seen = t["focused"] or t["status"] in ("working", "blocked", "done")   # done: herdr's own dot is back
+    want = e["tab_label"] if seen else MARK + e["tab_label"]
+    if t.get("shown_label") != want:
+        herdr("tab", "rename", t["tab_id"], want, check=False)
+    if seen:
+        e["unseen_carry"] = False
 
 
 def seed_from_snapshot(path):
