@@ -302,6 +302,19 @@ if [[ -f "$REPO_ROOT/scripts/hermes-terminal-reset" ]]; then
   ok "hermes-terminal-reset → $TARGET_LINK"
 fi
 
+# ── Install hmw-ledger on PATH ─────────────────────────────────────────
+# Durable record of every herdr tab (hmw's snapshot loop runs it); restores
+# tabs herdr lost: `hmw-ledger status|restore [NAME..]|forget NAME..`.
+if [[ -f "$REPO_ROOT/scripts/hmw-ledger" ]]; then
+  mkdir -p "$HOME/.local/bin"
+  TARGET_LINK="$HOME/.local/bin/hmw-ledger"
+  if [[ -L "$TARGET_LINK" || -f "$TARGET_LINK" ]]; then
+    rm -f "$TARGET_LINK"
+  fi
+  ln -s "$REPO_ROOT/scripts/hmw-ledger" "$TARGET_LINK"
+  ok "hmw-ledger → $TARGET_LINK"
+fi
+
 # ── Install hermes-exit on PATH ────────────────────────────────────────
 # Clean way to LEAVE an hmw workspace: detaches tmux (which restores the outer
 # terminal's mouse mode) + resets, so closing/yanking the connection doesn't

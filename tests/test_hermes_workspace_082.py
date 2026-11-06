@@ -626,6 +626,31 @@ class Herdr082Tests(unittest.TestCase):
                    HERDR_082_STATE=str(self.path), HERDR_082_LOG=str(self.log))
         return subprocess.run(["bash", str(CORE), "1"], env=env, capture_output=True, text=True, timeout=25)
 
+    def test_snapshot_loop_runs_the_tab_ledger_each_tick(self):
+        # Fake sleep: the first tick proceeds, the second ends the loop.
+        (self.bin / "sleep").write_text('#!/bin/sh\nc="$HOME/sleeps"; n=$(cat "$c" 2>/dev/null || echo 0)\n'
+                                        'echo $((n + 1)) > "$c"; [ "$n" -lt 1 ]\n')
+        stub = self.home / "ledger-stub"
+        stub.write_text('import os, sys\nopen(os.path.join(os.environ["HOME"], "ledger-calls"), "a").write(\n'
+                        '    " ".join(sys.argv[1:]) + " " + os.environ["HERDR_SESSION"] + "\\n")\nsys.exit(3)\n')
+        self.write(panes=[self.pane("H1", agent="hermes")])
+        pidfile = self.home / ".hermes/hmw/review.snapshot-loop.pid"
+        pidfile.parent.mkdir(parents=True)
+        pidfile.write_text("1 unknown tok\n")
+        env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
+                   HMW_BACKEND="herdr", HERDR_SESSION="review", HMW_LOOP_TOKEN="tok", HMW_SNAPSHOT_INTERVAL="5",
+                   HMW_LEDGER_BIN=str(stub), HERDR_082_STATE=str(self.path), HERDR_082_LOG=str(self.log))
+        r = subprocess.run(["bash", str(CORE), "--hmw-snapshot-loop"], env=env, capture_output=True, text=True,
+                           timeout=25)
+        self.assertEqual(r.returncode, 0, r.stderr)   # a failing ledger never stops the loop
+        self.assertEqual((self.home / "ledger-calls").read_text(), "update --auto review\n")
+        with self.subTest("HMW_LEDGER=0 turns it off"):
+            (self.home / "ledger-calls").unlink()
+            (self.home / "sleeps").unlink()
+            subprocess.run(["bash", str(CORE), "--hmw-snapshot-loop"], env=dict(env, HMW_LEDGER="0"),
+                           capture_output=True, text=True, timeout=25)
+            self.assertFalse((self.home / "ledger-calls").exists())
+
     def test_pane_memory_f5_stale_pidfile_starts_one_loop(self):
         # Real 37s sleep for the loop only (the fake sleep returns at once).
         (self.bin / "sleep").write_text('#!/bin/sh\n[ "$1" = 37 ] && exec /bin/sleep 37\nexit 0\n')

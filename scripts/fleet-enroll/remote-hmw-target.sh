@@ -22,7 +22,7 @@ if ! command -v herdr >/dev/null 2>&1 && [[ ! -x "$bin/herdr" ]]; then
 fi
 echo "herdr: $("$bin/herdr" --version 2>/dev/null | head -1 || herdr --version | head -1)"
 
-for s in hermes-workspace hermes-pane hermes-host-resolve hermes-terminal-reset herdr-new-agent hermes-exit; do
+for s in hermes-workspace hermes-pane hermes-host-resolve hermes-terminal-reset herdr-new-agent hermes-exit hmw-ledger; do
   [[ -f "$base/scripts/$s" ]] || { echo "missing $base/scripts/$s"; exit 1; }
   chmod +x "$base/scripts/$s"
   ln -sfn "$base/scripts/$s" "$bin/$s"

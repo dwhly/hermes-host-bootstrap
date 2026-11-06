@@ -1654,7 +1654,29 @@ hmw_snapshot_loop() {
     read -r pid start token 2>/dev/null < "$pidfile" || return 0
     [ "$token" = "${HMW_LOOP_TOKEN:-}" ] || return 0
     hmw_snapshot_once || :
+    hmw_ledger_tick || :
   done
+}
+
+# The tab ledger (scripts/hmw-ledger) is the durable record of every tab: it
+# keeps tabs herdr forgot, brings back tabs lost to a server restart, and
+# carries the unseen-work dot across one. Best effort and bounded: a ledger
+# failure never stops the snapshot loop. HMW_LEDGER=0 turns it off.
+hmw_ledger_tick() {
+  [ "${HMW_LEDGER:-1}" != 0 ] || return 0
+  local bin log="$HMW_STATE_DIR/$SESSION.ledger.log"
+  bin="${HMW_LEDGER_BIN:-}"
+  if [ -z "$bin" ]; then
+    bin="$(python3 -c 'import os, sys; print(os.path.join(os.path.dirname(os.path.realpath(sys.argv[1])), "hmw-ledger"))' \
+      "${BASH_SOURCE[0]}" 2>/dev/null)" || return 0
+  fi
+  [ -f "$bin" ] || return 0
+  # Keep the log small: it only ever carries restore lines and errors.
+  if [ -f "$log" ] && [ "$(wc -c < "$log")" -gt 262144 ]; then
+    tail -c 65536 "$log" > "$log.tmp" 2>/dev/null && mv -f "$log.tmp" "$log"
+  fi
+  hmw_bounded 900 env HERDR_SESSION="$SESSION" HMW_STATE_DIR="$HMW_STATE_DIR" \
+    python3 "$bin" update --auto </dev/null >>"$log" 2>&1
 }
 
 # Herdr-native restore launch: `agent start` refuses a pane that is not at its
