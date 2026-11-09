@@ -1065,8 +1065,14 @@ def interactive_chat(args):
     return True
 '
 
+# herdr_agent_pane_ready PANE LABEL [MODE]
+# MODE "ready" (default): Hermes can take input now -- required before hmw types
+#   into or resumes the pane.
+# MODE "present": a live interactive Hermes owns the pane, in any state (idle,
+#   mid-turn, waiting on a question). Enough to attach to an existing slot, where
+#   hmw only focuses the tab and never sends input.
 herdr_agent_pane_ready() {
-  local pane_id=$1 label=$2 pane_json visible process_json
+  local pane_id=$1 label=$2 mode=${3:-ready} pane_json visible process_json
 
   # Read only the current viewport, then check the live foreground job. A
   # retained composer in scrollback (or on screen after exit) is not liveness.
@@ -1074,7 +1080,7 @@ herdr_agent_pane_ready() {
   process_json="$("${HERDR[@]}" pane process-info --pane "$pane_id" 2>/dev/null)" || return
   pane_json="$("${HERDR[@]}" pane get "$pane_id" 2>/dev/null)" || return
   printf '%s' "$pane_json" | herdr_pane_matches_slot "$pane_id" "$label" || return
-  HMW_PANE_JSON="$pane_json" HMW_PROCESS_JSON="$process_json" HMW_VISIBLE="$visible" python3 -c "$HMW_PY_HERMES_ARGV"'import json, os, re, sys
+  HMW_PANE_JSON="$pane_json" HMW_PROCESS_JSON="$process_json" HMW_VISIBLE="$visible" HMW_READY_MODE="$mode" python3 -c "$HMW_PY_HERMES_ARGV"'import json, os, re, sys
 try:
     pane = json.loads(os.environ["HMW_PANE_JSON"])["result"]["pane"]
     process = json.loads(os.environ["HMW_PROCESS_JSON"])["result"]["process_info"]
@@ -1101,6 +1107,8 @@ try:
             live = True
     if not live:
         raise ValueError
+    if os.environ.get("HMW_READY_MODE") == "present":
+        raise SystemExit(0)            # a live Hermes, busy or not: attaching is safe
     # Semantic detection remains authoritative when present. For panes with
     # no identity (0.8.2, or a 0.21 managed launcher whose process is named
     # python3), require BOTH a live Hermes executable and a ready front end:
@@ -1124,12 +1132,12 @@ except (ValueError, KeyError, TypeError, AttributeError):
 }
 
 herdr_wait_for_agent_pane() {
-  local pane_id=$1 label=$2 seconds=${3:-3} attempt limit
+  local pane_id=$1 label=$2 seconds=${3:-3} mode=${4:-ready} attempt limit
 
   limit=$((seconds * 10))
   attempt=1
   while [ "$attempt" -le "$limit" ]; do
-    if herdr_agent_pane_ready "$pane_id" "$label"; then
+    if herdr_agent_pane_ready "$pane_id" "$label" "$mode"; then
       return 0
     fi
     if [ "$attempt" -eq 1 ] && [ "$seconds" -gt 3 ]; then
@@ -1960,8 +1968,11 @@ ensure_herdr_workspace() {
       continue
     fi
     target="$(herdr_target_for_label "$label")" || return
-    if ! herdr_wait_for_agent_pane "$target" "$label" "${HMW_HERDR_READY_TIMEOUT:-30}"; then
-      hmw_errf "hermes-workspace: Hermes is not ready in existing pane %s for %s in session '%s'; inspect the pane and relaunch Hermes there (no duplicate was created)\n" "$target" "$label" "$SESSION"
+    # Attaching only focuses the slot, so a busy Hermes (mid-turn, or waiting on
+    # a question) is fine; what must not happen is attaching to a pane that has
+    # no Hermes at all, or starting a second one beside it.
+    if ! herdr_wait_for_agent_pane "$target" "$label" "${HMW_HERDR_READY_TIMEOUT:-30}" present; then
+      hmw_errf "hermes-workspace: no live Hermes in existing pane %s for %s in session '%s'; inspect the pane and relaunch Hermes there (no duplicate was created)\n" "$target" "$label" "$SESSION"
       return 1
     fi
     number=$((number + 1))

@@ -983,21 +983,63 @@ class Herdr082Tests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_no_launch()
 
-    def test_resumed_tui_lookalikes_fail_closed(self):
-        hermes = [STORE_PY, "-I", "-c", launcher_script("hermes_cli.main"), "--resume", "20260925_051119_02a67f"]
-        cases = {
-            "no gateway": (hermes, self.RESUMED_TUI, False),
-            "still starting": (hermes, " ─ summoning hermes… │                ─ ~\n ❯\n", True),
-            "no prompt": (hermes, " ─ ready │ opus late ─  title\n", True),
-            "ready only above the bottom six lines": (hermes, " ─ ready │ opus ─ t\n" + "".join(f"line {n}\n" for n in range(6)) + " ❯\n", True),
-            "not chat": ([STORE_PY, "-I", "-c", launcher_script("hermes_cli.main"), "update"], self.RESUMED_TUI, True),
-            "not hermes": ([STORE_PY, "-I", "-c", launcher_script("acp_adapter.entry")], self.RESUMED_TUI, True),
-        }
-        for name, (argv, visible, gateway) in cases.items():
+    # h-mini2 (herdr 0.9.3, no Hermes identity): H1 mid-turn, waiting on a clarify question.
+    BUSY_TUI = (" ▸ What's the receipt file called on h-air2 (or which folder is it in)?\n"
+                "   >\n"
+                " 0/1 answered · ↑/↓ select · Enter confirm and continue · Tab/Shift+Tab\n"
+                " ─ ( •_•)>⌐■-■ analyzing…     · 2h 19m │ opus latest │ 250.2k/1 ─  Fin…\n")
+    LAUNCHER = [STORE_PY, "-I", "-c", launcher_script("hermes_cli.main"), "--resume", "20260925_051119_02a67f"]
+    NOT_READY = {
+        "busy: waiting on a question": (BUSY_TUI, True),
+        "no gateway": (RESUMED_TUI, False),
+        "still starting": (" ─ summoning hermes… │                ─ ~\n ❯\n", True),
+        "no prompt": (" ─ ready │ opus late ─  title\n", True),
+        "ready only above the bottom six lines": (" ─ ready │ opus ─ t\n" + "".join(f"line {n}\n" for n in range(6)) + " ❯\n", True),
+    }
+
+    def test_attach_accepts_a_live_hermes_in_any_state(self):
+        # Attaching only focuses the slot; a busy Hermes must not block it, and no
+        # second Hermes may be started beside it.
+        for name, (visible, gateway) in self.NOT_READY.items():
             with self.subTest(name):
-                self.write(panes=[self.pane("H1")], visible=visible, process=self.tui_process(argv, gateway))
-                self.assert_failed(self.run_core())
+                self.write(panes=[self.pane("H1")], visible=visible, process=self.tui_process(self.LAUNCHER, gateway))
+                result = self.run_core()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("no live Hermes", result.stderr)
                 self.assert_no_launch()
+
+    def test_attach_still_refuses_a_pane_without_live_hermes(self):
+        cases = {
+            "not chat": [STORE_PY, "-I", "-c", launcher_script("hermes_cli.main"), "update"],
+            "not hermes": [STORE_PY, "-I", "-c", launcher_script("acp_adapter.entry")],
+        }
+        for name, argv in cases.items():
+            with self.subTest(name):
+                self.write(panes=[self.pane("H1")], visible=self.BUSY_TUI, process=self.tui_process(argv))
+                result = self.run_core()
+                self.assert_failed(result)
+                self.assertIn("no live Hermes in existing pane w1:p1 for H1", result.stderr)
+                self.assert_no_launch()
+
+    def test_new_slot_still_waits_for_a_ready_hermes(self):
+        # hmw types `hermes-pane H2` into a pane it creates, so that path keeps the
+        # strict check: a live but not-ready Hermes there is a failure, never a retry.
+        for name, (visible, gateway) in self.NOT_READY.items():
+            with self.subTest(name):
+                self.log.write_text("")               # count this case's launches only
+                self.write(panes=[self.pane("H1", agent="hermes")], visible=visible,
+                           launched_state={"process": self.tui_process(self.LAUNCHER, gateway)})
+                result = self.run_core(2)
+                self.assert_failed(result)
+                self.assertIn("did not become ready in pane w1:p2 for H2", result.stderr)
+                self.assertEqual(len(self.pane_runs()), 1, "exactly one launch, no duplicate")
+
+    def test_new_slot_ready_tui_succeeds(self):
+        self.write(panes=[self.pane("H1", agent="hermes")], visible=self.RESUMED_TUI,
+                   launched_state={"process": self.tui_process(self.LAUNCHER)})
+        result = self.run_core(2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.pane_runs()), 1)
 
     def test_managed_launcher_lookalikes_fail_closed(self):
         for argv in ([STORE_PY, "-I", "-c", launcher_script("acp_adapter.entry")],
