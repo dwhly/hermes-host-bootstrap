@@ -838,9 +838,13 @@ class Herdr082Tests(unittest.TestCase):
         self.assert_failed(self.run_core())
         self.assert_no_launch()
 
-    def test_process_title_alone_is_not_readiness(self):
+    def test_process_title_alone_is_not_readiness_but_live_hermes_attaches(self):
+        # A live Hermes still loading is not *ready* (new panes wait for that:
+        # test_new_slot_still_waits_for_a_ready_hermes), but an existing slot that
+        # holds it is attached as is -- and nothing is launched beside it.
         self.write(panes=[self.pane("H1")], process=LIVE, visible="loading...", recent=COMPOSER)
-        self.assert_failed(self.run_core())
+        result = self.run_core()
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_no_launch()
 
     def test_other_foreground_process_with_stale_composer_is_not_ready(self):
@@ -1007,6 +1011,25 @@ class Herdr082Tests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertNotIn("no live Hermes", result.stderr)
                 self.assert_no_launch()
+
+    INPUT_CALLS = (["pane", "run"], ["pane", "send-keys"], ["pane", "send-text"], ["pane", "split"],
+                   ["agent", "prompt"], ["agent", "send-keys"], ["workspace", "create"])
+
+    def test_live_attach_to_busy_hermes_sends_it_nothing(self):
+        # The real (non-verify) attach: hmw reaches the interactive `herdr` call and
+        # never types into, prompts, starts or duplicates the busy Hermes.
+        for name, (visible, gateway) in self.NOT_READY.items():
+            with self.subTest(name):
+                self.log.write_text("")
+                self.write(panes=[self.pane("H1")], visible=visible, process=self.tui_process(self.LAUNCHER, gateway))
+                result = self.run_live()
+                self.assertNotIn("no live Hermes", result.stderr)
+                calls = [c for c in self.calls() if isinstance(c, list)]
+                self.assertIn([], calls, "hmw went on to attach")
+                for c in calls:
+                    self.assertNotIn(c[:2], [list(x) for x in self.INPUT_CALLS], c)
+                    if c[:2] == ["agent", "start"]:
+                        self.assertEqual(c[2:], ["--help"], c)
 
     def test_attach_still_refuses_a_pane_without_live_hermes(self):
         cases = {
