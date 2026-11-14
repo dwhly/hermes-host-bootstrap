@@ -9,7 +9,7 @@
 # module makes it a first-class systemd unit (Restart=always, ordered after
 # tailscaled) so the wiki is always reachable. macOS/client hosts skip it.
 #
-# Serves: http://<tailnet-ip>:8765  (custom /wiki/, mkdocs /wiki-mkdocs/, reports)
+# Serves: http://<tailnet-ip>:8765  (wiki /wiki/ = MkDocs; /wiki-mkdocs/ = redirects; reports)
 # Skip key: wiki-server.
 
 set -euo pipefail
