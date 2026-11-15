@@ -48,10 +48,22 @@ PATTERNS = {
                          rb"([^\s\"'`,;)}\]]{12,512})",
 }
 RX = {k: re.compile(v) for k, v in PATTERNS.items()}
-# A captured value that is plainly a placeholder or a reference is not a secret.
-PLACEHOLDER = re.compile(rb"^(?:<.*|\$\{?[A-Za-z_]\w*.*|op://.*|\{\{.*|%\(.*|x{6,}.*|\*{3,}.*|\.{3,}.*|"
-                         rb"(?i:your[_-].*|example.*|placeholder.*|redacted.*|changeme.*|"
-                         rb"os\.environ.*|process\.env.*|getenv.*|env\[.*|[a-z_][\w]*\(.*|[a-z_][\w]*(?:\.[a-z_][\w]*)+.*))$")
+# Shapes of a captured value that is plainly NOT a literal secret (see not_a_literal). Kept narrow on purpose:
+# a real secret with digits or symbols must still be caught.
+NOT_LITERAL = [re.compile(x) for x in (
+    rb"^<[A-Za-z_ -]{1,80}>?$",                            # <your key here>, <OPENROUTER_API_KEY>
+    rb"^\$|\$\{|\$\(",                                      # $VAR, ${VAR}, $(cmd): a reference, not a value
+    rb"\{\{|\}\}|%\(",                                      # templates
+    rb"^op://",                                            # 1Password reference
+    rb"\[\^|\\[()1-9dwsS.]|\.\*|\(\?",                       # a regex
+    rb"(?i)x{4,}|\.{3}|\*{3}",                              # xxxx / ... / *** placeholders
+    rb"^[A-Za-z_][A-Za-z_.]*\[[A-Za-z_., \]]*$",               # a type annotation: Optional[str] (no digits)
+    rb"^[A-Za-z_][\w.]*\(",                                 # a call: getenv('X'), os.environ.get(
+    rb"^(?i:os\.environ|process\.env|env)\b",              # environment lookups
+)]
+UPPER_NAME = re.compile(rb"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")  # COMFY_CLOUD_API_KEY: an env var NAME
+DOTTED = re.compile(rb"^[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)+$")  # self.token, config.api_key
+WORDS = re.compile(rb"(?i)^[a-z]+(?:[-_][a-z]+)+$")         # your-key-here (digitless words)
 CACHE_DIRS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules", ".git"}
 EXCL_FILES = re.compile(r"^(?:\.env|\.env\..*|.*\.pem|.*\.key|.*\.p12|.*\.pfx|\.DS_Store|.*\.pyc|.*\.pyo)$")
 EXCL_TOP = {".archive", ".curator_backups", ".locks", ".usage.json", ".usage.json.lock", ".curator_state",
@@ -64,7 +76,32 @@ def redact(text):
     s = re.sub(r"([a-zA-Z][a-zA-Z0-9+.-]{0,30}://)[^/\s@]{1,512}@", r"\1***@", s)
     for r in TOKEN_RX:
         s = re.sub(r.pattern.decode(), "***", s)
-    return s
+    b = s.encode("utf-8", "surrogateescape")
+    m = list(RX["secret-assignment"].finditer(b))
+    for x in reversed(m):
+        b = b[:x.start(1)] + b"***" + b[x.end(1):]
+    return b.decode("utf-8", "surrogateescape")
+
+
+def redact_all(obj):
+    if isinstance(obj, str):
+        return redact(obj)
+    if isinstance(obj, list):
+        return [redact_all(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: redact_all(v) for k, v in obj.items()}
+    return obj
+
+
+def safe_write(path, text):
+    """Write a report file without ever following a planted symlink: create a fresh file exclusively, then rename."""
+    tmp = path.with_name(path.name + ".tmp")
+    if tmp.is_symlink() or tmp.exists():
+        tmp.unlink()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)                                  # replaces a symlink itself, never its target
 
 
 class Blocked(Exception):
@@ -83,7 +120,7 @@ def last_line(p):
 
 
 def git(work, *args, check=True):
-    p = subprocess.run(["git", "-C", str(work), *args], capture_output=True, text=True)
+    p = subprocess.run(["git", "-C", str(work), "-c", "core.hooksPath=/dev/null", *args], capture_output=True, text=True)
     if check and p.returncode != 0:
         raise Blocked("error", f"git {args[0]} failed: {last_line(p)}")
     return p
@@ -166,13 +203,11 @@ def bundled_unmodified(src, bundled):
 
 
 def not_a_literal(v):
-    """True when a captured assignment/userinfo value is plainly not a literal secret: a placeholder, a reference,
-    an expression or a regex. Real tokens are random: they have digits and none of these shapes."""
-    return bool(PLACEHOLDER.match(v)
-                or re.search(rb"[\[\](){}*\\$<>|^]", v)                 # regex, template or expression
-                or re.search(rb"(?i)x{4,}|\.{3}|\*{3}", v)                  # xxxx / ... / *** placeholders
-                or re.fullmatch(rb"[A-Z][A-Z0-9_]{3,}", v)                   # an env var NAME, not its value
-                or re.fullmatch(rb"(?i)[a-z]+(?:[-_][a-z]+)+", v))           # word-words, no digits ("your-key-here")
+    """True when a captured assignment/userinfo value is plainly not a literal secret."""
+    if any(r.search(v) for r in NOT_LITERAL):
+        return True
+    digits = sum(c in b"0123456789" for c in v)
+    return bool((UPPER_NAME.match(v) and digits <= 2) or (DOTTED.match(v) and not digits) or WORDS.match(v))
 
 
 def scan(rel, data):
@@ -188,8 +223,26 @@ def scan(rel, data):
     return hits
 
 
-def check_no_rewrite(repo):
-    p = subprocess.run(["git", "config", "--get-regexp", r"^url\..*\.(insteadof|pushinsteadof)$"],
+def scan_index(work):
+    """Scan every blob in the index (what would be committed), by path."""
+    ls = git(work, "ls-files", "-s", "-z").stdout.split("\0")
+    entries = [(x.split("\t", 1)[1], x.split()[1]) for x in ls if x]
+    if not entries:
+        return []
+    p = subprocess.run(["git", "-C", str(work), "cat-file", "--batch"], input=b"".join(e[1].encode() + b"\n" for e in entries),
+                       capture_output=True, check=True)
+    out, hits, i = p.stdout, [], 0
+    for path, _ in entries:
+        nl = out.index(b"\n", i)
+        size = int(out[i:nl].split()[2])
+        hits += scan(path, out[nl + 1:nl + 1 + size])
+        i = nl + 1 + size + 1
+    return hits
+
+
+def check_no_rewrite(work, repo):
+    """Checked in the work repo itself, so conditional includes (includeIf gitdir:) that apply there are seen."""
+    p = subprocess.run(["git", "-C", str(work), "config", "--get-regexp", r"^url\..*\.(insteadof|pushinsteadof)$"],
                        capture_output=True, text=True)
     for line in p.stdout.splitlines():
         key, _, val = line.partition(" ")
@@ -200,13 +253,12 @@ def check_no_rewrite(repo):
 def run(a, rec, state):
     if not re.fullmatch(r"[A-Za-z0-9._/-]+", a.branch):
         raise Blocked("error", "bad branch name")
-    src = Path(a.skills).resolve(strict=True)
+    src = Path(a.skills).resolve(strict=False)
     st_real = state.resolve(strict=True)
     if not src.is_dir():
-        raise Blocked("error", "skills dir is not a directory")
+        raise Blocked("error", f"skills dir not found: {a.skills}")
     if st_real == src or src in st_real.parents or st_real in src.parents:
-        raise Blocked("error", "--state and --skills overlap; refusing (the skills dir is read-only to this tool)")
-    check_no_rewrite(a.repo)
+        raise Blocked("error", "--state and --skills overlap; refusing")
     # 1. rebuild the disposable working copy on the remote tip
     work = st_real / "work"
     if work.is_symlink() or work.is_file():
@@ -215,6 +267,7 @@ def run(a, rec, state):
         shutil.rmtree(work)
     work.mkdir()
     git(work, "init", "-q", "-b", a.branch)
+    check_no_rewrite(work, a.repo)
     p = git(work, "fetch", "-q", "--no-tags", a.repo, f"+refs/heads/{a.branch}:refs/remotes/capture/{a.branch}",
             check=False)
     if p.returncode == 0:
@@ -227,10 +280,11 @@ def run(a, rec, state):
     # 2. fresh copy of the skills tree (full content every run; nothing depends on mtimes)
     files, links = walk_source(src)
     excluded = bundled_unmodified(src, a.bundled)
-    rec["excluded_bundled"], rec["skipped_links"] = len(excluded), links[:200]
+    rec["excluded_bundled"], rec["skipped_links"] = len(excluded), links[:200]   # redacted when written
     dest = work / "skills"
     if dest.exists():
         shutil.rmtree(dest)
+    dest.mkdir()
     hits, n, limit = [], 0, a.max_file_mb * 1024 * 1024
     for rel, p, mode in files:
         if any(rel == e or rel.startswith(e + "/") for e in excluded):
@@ -250,14 +304,20 @@ def run(a, rec, state):
         n += 1
     rec["captured_files"] = n
     hits_file = st_real / "scan-hits.txt"
-    if hits:
-        hits_file.write_text("\n".join(hits) + "\n")
-        shutil.rmtree(work)
-        raise Blocked("blocked-secret", f"credential pattern in {len(hits)} place(s); see {hits_file} "
-                                        "(file:line: pattern, never values)")
-    hits_file.unlink(missing_ok=True)
-    # 3. stage the whole inventory explicitly (-f: ignore rules can't hide a file), commit, push
-    git(work, "add", "-A", "-f", "--", "skills")
+
+    def block_if(hits):
+        if hits:
+            safe_write(hits_file, "\n".join(hits) + "\n")
+            shutil.rmtree(work)
+            raise Blocked("blocked-secret", f"credential pattern in {len(hits)} place(s); see {hits_file} "
+                                            "(file:line: pattern, never values)")
+    block_if(hits)
+    # 3. stage the whole inventory explicitly (-f: ignore rules can't hide a file), then scan what git actually
+    #    staged: attributes/filters (working-tree-encoding, clean filters) can change bytes between disk and blob.
+    git(work, "add", "-A", "-f", "--", ".")
+    block_if(scan_index(work))
+    if hits_file.is_symlink() or hits_file.exists():
+        hits_file.unlink()
     changed = [x for x in git(work, "diff", "--cached", "--name-only").stdout.splitlines() if x]
     rec["changed_paths"] = len(changed)
     if not changed:
@@ -281,12 +341,24 @@ def run(a, rec, state):
     return 0
 
 
+def pull(spec, into):
+    """--pull/--pull-bundled: refresh a local mirror from another host, read-only on that host (rsync --checksum)."""
+    into.mkdir(parents=True, exist_ok=True)
+    p = subprocess.run(["rsync", "-a", "--checksum", "--delete", "--", spec.rstrip("/") + "/", str(into) + "/"],
+                       capture_output=True, text=True, timeout=900)
+    if p.returncode != 0:
+        raise Blocked("error", f"pull from {spec} failed: {last_line(p)}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Capture a node's Hermes skills into the company's private skills repo.")
     ap.add_argument("--skills", required=True)
     ap.add_argument("--repo", required=True)
     ap.add_argument("--state", required=True)
     ap.add_argument("--bundled", default="")
+    ap.add_argument("--pull", default="", help="rsync source to mirror into --skills first (then --skills is owned "
+                                               "by this tool)")
+    ap.add_argument("--pull-bundled", default="", help="rsync source to mirror into --bundled first")
     ap.add_argument("--branch", default="main")
     ap.add_argument("--host", default=socket.gethostname().split(".")[0])
     ap.add_argument("--alert-cmd", default="")
@@ -295,53 +367,73 @@ def main(argv=None):
     a = ap.parse_args(argv)
     os.umask(0o077)
     state = Path(a.state)
-    # Overlap is checked before anything is written: state inside the skills dir (or the reverse) would mean
-    # writing into, or deleting from, the tree this tool must only read. Nothing is written, not even status.
-    try:
-        src_real, st_real = Path(a.skills).resolve(strict=True), state.resolve(strict=False)
-    except OSError as e:
-        print(f"ERROR: skills dir: {e}", file=sys.stderr)
-        return 2
-    if st_real == src_real or src_real in st_real.parents or st_real in src_real.parents:
-        print("ERROR: --state and --skills overlap; refusing (the skills dir is read-only to this tool)", file=sys.stderr)
-        return 2
-    state.mkdir(parents=True, exist_ok=True)
-    rec = {"at": now(), "host": a.host, "skills": a.skills, "repo": redact(a.repo), "result": None,
+    rec = {"at": now(), "host": a.host, "skills": a.skills, "repo": a.repo, "result": None,
            "changed_paths": 0, "captured_files": 0, "excluded_bundled": 0, "skipped_links": [], "commit": None,
            "error": None, "alert_error": None}
-    lockf = open(state / ".lock", "w")
+
+    def send_alert(text):
+        if not (text and a.alert_cmd and not a.dry_run):
+            return
+        try:
+            p = subprocess.run(shlex.split(a.alert_cmd), input=redact(text), text=True, capture_output=True, timeout=60)
+            if p.returncode != 0:
+                rec["alert_error"] = last_line(p)[:200]
+        except Exception as e:  # noqa: BLE001
+            rec["alert_error"] = redact(e)[:200]
+
+    # Overlap is checked before anything is written: state inside a tree this tool reads (or the reverse) could
+    # write into or delete from it. Nothing is written, not even status; the alert still goes out.
+    st_real = state.resolve(strict=False)
+    for label, d in (("--skills", a.skills), ("--bundled", a.bundled)):
+        if not d:
+            continue
+        dr = Path(d).resolve(strict=False)
+        if st_real == dr or dr in st_real.parents or st_real in dr.parents:
+            msg = f"--state and {label} overlap; refusing (nothing written)"
+            print(f"ERROR: {msg}", file=sys.stderr)
+            send_alert(f"Skills capture ({a.host}) FAILED, nothing pushed: {msg}")
+            return 2
+    state.mkdir(parents=True, exist_ok=True)
+    lock_path = state / ".lock"
     try:
-        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lfd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)   # never truncates, never follows
+    except OSError as e:
+        print(f"ERROR: lock {lock_path}: {e.strerror}", file=sys.stderr)
+        send_alert(f"Skills capture ({a.host}) FAILED, nothing pushed: cannot open the lock ({e.strerror})")
+        return 1
+    try:
+        fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
+        os.close(lfd)
         print("another capture is running", file=sys.stderr)
         return 4
     rc = 1
     try:
+        if a.pull:
+            pull(a.pull, Path(a.skills))
+        if a.pull_bundled:
+            if not a.bundled:
+                raise Blocked("error", "--pull-bundled needs --bundled")
+            pull(a.pull_bundled, Path(a.bundled))
         rc = run(a, rec, state)
     except Blocked as e:
-        rec.update(result=e.result, error=redact(e))
-        rec["_alert"] = f"Skills capture ({a.host}) FAILED, nothing pushed: {e.result}: {redact(e)}"
+        rec.update(result=e.result, error=str(e))
+        rec["_alert"] = f"Skills capture ({a.host}) FAILED, nothing pushed: {e.result}: {e}"
         print(f"{e.result.upper()}: {redact(e)}", file=sys.stderr)
         rc = 3 if e.result.startswith("blocked") else 1
-    except Exception as e:  # noqa: BLE001 - every failure must reach status.json
-        rec.update(result="error", error=redact(f"{type(e).__name__}: {e}")[:500])
+    except Exception as e:  # noqa: BLE001 - every failure must reach status.json and the alert
+        rec.update(result="error", error=f"{type(e).__name__}: {e}"[:500])
         rec["_alert"] = f"Skills capture ({a.host}) FAILED, nothing pushed: {rec['error']}"
-        print(f"ERROR: {rec['error']}", file=sys.stderr)
+        print(f"ERROR: {redact(rec['error'])}", file=sys.stderr)
         rc = 1
     finally:
-        text = rec.pop("_alert", None)
-        if text and a.alert_cmd and not a.dry_run:
-            try:
-                p = subprocess.run(shlex.split(a.alert_cmd), input=redact(text), text=True, capture_output=True,
-                                   timeout=60)
-                if p.returncode != 0:
-                    rec["alert_error"] = last_line(p)[:200]
-            except Exception as e:  # noqa: BLE001
-                rec["alert_error"] = redact(e)[:200]
-        tmp = state / "status.json.tmp"
-        tmp.write_text(json.dumps(rec, indent=1))
-        os.replace(tmp, state / "status.json")
-        lockf.close()
+        send_alert(rec.pop("_alert", None))
+        try:
+            safe_write(state / "status.json", json.dumps(redact_all(rec), indent=1))
+        except OSError as e:
+            print(f"ERROR: status.json: {e.strerror}", file=sys.stderr)
+            rc = rc or 1
+        os.close(lfd)
     return rc
 
 

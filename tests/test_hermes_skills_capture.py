@@ -205,7 +205,8 @@ class Capture(unittest.TestCase):
             "password: <your password here>\napi_key = getenv('K')\nsecret: ${{ secrets.X }}\nuse op://Fleet/x/password\n"
             "export COMFY_API_KEY=\"comfyui-xxxxxxxxxxxx\"\nENV_KEY = \"COMFY_CLOUD_API_KEY\"\n"
             "def f(self, api_key: Optional[str] = None):\nsecret: \"generate-a-long-random-string\"\n"
-            "sed 's|https://[^:]*:\\([^@]*\\)@.*|\\1|'\n")
+            "sed 's|https://[^:]*:\\([^@]*\\)@.*|\\1|'\n"
+            "set `ANTHROPIC_AUTH_TOKEN=<OPENROUTER_API_KEY` first\n    api_key = os.environ.get('K')\n")
         self.assertEqual(self.run_cap(), 0)
         self.assertEqual(self.status()["result"], "pushed")
 
@@ -346,6 +347,83 @@ class Capture(unittest.TestCase):
         st = self.status()
         self.assertEqual(st["result"], "pushed")
         self.assertTrue(st["alert_error"])
+
+    # ── r2 review counterexamples ──
+    def test_conditional_include_rewrite_is_refused(self):
+        other = self.t / "other.git"
+        sh("git", "init", "-q", "--bare", "-b", "main", str(other))
+        inc = self.t / "inc.cfg"
+        inc.write_text(f'[url "{other}"]\n\tpushInsteadOf = {self.remote}\n')
+        with open(os.environ["GIT_CONFIG_GLOBAL"], "a") as f:
+            f.write(f'[includeIf "gitdir:{self.state.resolve()}/work/"]\n\tpath = {inc}\n')
+        self.state.mkdir()
+        self.assertEqual(self.run_cap(), 1)
+        self.assertIn("rewrite", self.status()["error"])
+        self.assertIsNone(self.tip())
+        self.assertEqual(sh("git", "--git-dir", str(other), "rev-parse", "-q", "--verify", "main", check=False).stdout, "")
+
+    def test_working_tree_encoding_cannot_smuggle_a_token(self):
+        (self.src / ".gitattributes").write_text("*.txt working-tree-encoding=UTF-16LE\n")
+        (self.src / "alpha" / "enc.txt").write_bytes(("token: " + TOK + "\n").encode("utf-16-le"))
+        self.assertEqual(self.run_cap(), 3)
+        self.assertEqual(self.status()["result"], "blocked-secret")
+        self.assertIsNone(self.tip())
+        self.assertIn("enc.txt", (self.state / "scan-hits.txt").read_text())
+
+    def test_planted_state_symlinks_never_touch_the_source(self):
+        before = self.snapshot()
+        self.state.mkdir()
+        target = self.src / "alpha" / "SKILL.md"
+        for name in (".lock", "status.json", "status.json.tmp", "scan-hits.txt", "scan-hits.txt.tmp"):
+            os.symlink(target, self.state / name)
+        (self.src / "alpha" / "leak.md").write_text(TOK)             # forces a scan-hits write too
+        self.run_cap()
+        (self.src / "alpha" / "leak.md").unlink()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_digit_secrets_are_not_placeholders(self):
+        for i, line in enumerate((b'password="R4nd0m$Value9876"\n', b'password="Q7V9M2K8N4R6P3T5"\n',
+                                  b"url: postgresql://app:Q7V9M2K8N4R6P3T5@db.internal/x\n")):
+            with self.subTest(line=line):
+                self.assert_blocked(f"alpha/s{i}.md", line)
+
+    def test_assignment_in_a_filename_is_redacted(self):
+        self.assert_blocked("alpha/password=hunter2hunter2xyz.md", b"x\n")
+
+    def test_link_named_like_a_token_is_redacted(self):
+        os.symlink("/etc/hostname", self.src / "alpha" / TOK)
+        self.assertEqual(self.run_cap(), 0)
+        raw = (self.state / "status.json").read_text()
+        self.assertNotIn(TOK, raw)
+        self.assertEqual(len(self.status()["skipped_links"]), 1)
+
+    def test_missing_skills_dir_reports_and_alerts(self):
+        out = self.t / "alerts.txt"
+        rc = self.run_cap("--alert-cmd", f"sh -c 'cat >> {out}'", skills=self.t / "nope")
+        self.assertEqual(rc, 1)
+        self.assertIn("skills dir not found", self.status()["error"])
+        self.assertIn("FAILED", out.read_text())
+
+    def test_pull_mirrors_then_captures_and_reports_pull_failure(self):
+        mirror = self.t / "mirror" / "skills"
+        self.assertEqual(self.run_cap("--pull", str(self.src), skills=mirror), 0)
+        self.assertIn("skills/alpha/SKILL.md", self.files())
+        out = self.t / "alerts.txt"
+        rc = self.run_cap("--pull", str(self.t / "no-such-src"), "--alert-cmd", f"sh -c 'cat >> {out}'", skills=mirror)
+        self.assertEqual(rc, 1)
+        self.assertIn("pull from", self.status()["error"])
+        self.assertIn("FAILED", out.read_text())
+
+    def test_empty_inventory_is_a_no_op_and_full_deletion_is_captured(self):
+        empty = self.t / "empty"
+        (empty / "x").mkdir(parents=True)
+        (empty / "x" / ".env").write_text("only excluded\n")
+        self.assertEqual(self.run_cap(skills=empty), 0)
+        self.assertEqual(self.status()["result"], "unchanged")
+        self.assertEqual(self.run_cap(), 0)
+        self.assertTrue(self.files())
+        self.assertEqual(self.run_cap(skills=empty), 0)
+        self.assertEqual((self.status()["result"], self.files()), ("pushed", set()))
 
 
 if __name__ == "__main__":
