@@ -372,18 +372,53 @@ class Capture(unittest.TestCase):
 
     def test_planted_state_symlinks_never_touch_the_source(self):
         before = self.snapshot()
-        self.state.mkdir()
         target = self.src / "alpha" / "SKILL.md"
         for name in (".lock", "status.json", "status.json.tmp", "scan-hits.txt", "scan-hits.txt.tmp"):
-            os.symlink(target, self.state / name)
-        (self.src / "alpha" / "leak.md").write_text(TOK)             # forces a scan-hits write too
-        self.run_cap()
-        (self.src / "alpha" / "leak.md").unlink()
-        self.assertEqual(self.snapshot(), before)
+            with self.subTest(alias=name):
+                shutil.rmtree(self.state, ignore_errors=True)
+                self.state.mkdir()
+                os.symlink(target, self.state / name)
+                (self.src / "alpha" / "leak.md").write_text(TOK)     # reaches scanning and the hits report
+                rc = self.run_cap()
+                (self.src / "alpha" / "leak.md").unlink()
+                self.assertEqual(self.snapshot(), before)
+                if name == ".lock":
+                    self.assertEqual(rc, 1)                          # refuses to follow the planted lock
+                else:
+                    self.assertEqual(rc, 3)
+                    self.assertFalse((self.state / "status.json").is_symlink())
+                    self.assertEqual(self.status()["result"], "blocked-secret")
+                    self.assertFalse((self.state / "scan-hits.txt").is_symlink())
+
+    def test_unicode_path_token_is_redacted(self):
+        self.assert_blocked(f"alpha/é{TOK}.md", b"x\n")
+
+    def test_empty_prefix_rewrite_is_refused(self):
+        sh("git", "config", "--global", "url.https://other.invalid/.insteadOf", "")
+        self.assertEqual(self.run_cap(), 1)
+        self.assertIn("rewrite", self.status()["error"])
+
+    def test_setup_failure_still_alerts(self):
+        out = self.t / "alerts.txt"
+        blocker = self.t / "file"
+        blocker.write_text("x")
+        rc = self.run_cap("--alert-cmd", f"sh -c 'cat >> {out}'", state=blocker / "state")
+        self.assertEqual(rc, 1)
+        self.assertIn("setup failed", out.read_text())
+
+    def test_large_inventory_streams(self):
+        big = self.src / "big"
+        big.mkdir()
+        for i in range(6):
+            (big / f"f{i}.bin").write_bytes(os.urandom(3 * 1024 * 1024))
+        self.assertEqual(self.run_cap(), 0)
+        self.assertEqual(self.status()["result"], "pushed")
 
     def test_digit_secrets_are_not_placeholders(self):
         for i, line in enumerate((b'password="R4nd0m$Value9876"\n', b'password="Q7V9M2K8N4R6P3T5"\n',
-                                  b"url: postgresql://app:Q7V9M2K8N4R6P3T5@db.internal/x\n")):
+                                  b"url: postgresql://app:Q7V9M2K8N4R6P3T5@db.internal/x\n",
+                                  b'password="$9x7K4m2P8z6Q1r3T"\n', b'password="R4nd0m(Valu3_9876"\n',
+                                  b"url: postgresql://app:$9x7K4m2P8z6Q1r3T@db/x\n")):
             with self.subTest(line=line):
                 self.assert_blocked(f"alpha/s{i}.md", line)
 

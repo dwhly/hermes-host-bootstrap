@@ -52,13 +52,13 @@ RX = {k: re.compile(v) for k, v in PATTERNS.items()}
 # a real secret with digits or symbols must still be caught.
 NOT_LITERAL = [re.compile(x) for x in (
     rb"^<[A-Za-z_ -]{1,80}>?$",                            # <your key here>, <OPENROUTER_API_KEY>
-    rb"^\$|\$\{|\$\(",                                      # $VAR, ${VAR}, $(cmd): a reference, not a value
+    rb"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$|\$\{[A-Za-z_][A-Za-z0-9_]*\}|^\$\([a-z]",  # $VAR, ${VAR}, $(cmd …): references
     rb"\{\{|\}\}|%\(",                                      # templates
     rb"^op://",                                            # 1Password reference
     rb"\[\^|\\[()1-9dwsS.]|\.\*|\(\?",                       # a regex
     rb"(?i)x{4,}|\.{3}|\*{3}",                              # xxxx / ... / *** placeholders
     rb"^[A-Za-z_][A-Za-z_.]*\[[A-Za-z_., \]]*$",               # a type annotation: Optional[str] (no digits)
-    rb"^[A-Za-z_][\w.]*\(",                                 # a call: getenv('X'), os.environ.get(
+    rb"^[A-Za-z_][A-Za-z_.]*\(",                             # a call: getenv('X'), os.environ.get( (no digits)
     rb"^(?i:os\.environ|process\.env|env)\b",              # environment lookups
 )]
 UPPER_NAME = re.compile(rb"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")  # COMFY_CLOUD_API_KEY: an env var NAME
@@ -72,13 +72,12 @@ TOKEN_RX = [r for k, r in RX.items() if k not in ("url-userinfo", "secret-assign
 
 
 def redact(text):
-    s = str(text)
-    s = re.sub(r"([a-zA-Z][a-zA-Z0-9+.-]{0,30}://)[^/\s@]{1,512}@", r"\1***@", s)
+    """Mask secrets in a report string with the SAME byte patterns the scanner uses, so what is detected is masked."""
+    b = str(text).encode("utf-8", "surrogateescape")
+    b = re.sub(rb"([a-zA-Z][a-zA-Z0-9+.-]{0,30}://)[^/\s@]{1,512}@", rb"\1***@", b)
     for r in TOKEN_RX:
-        s = re.sub(r.pattern.decode(), "***", s)
-    b = s.encode("utf-8", "surrogateescape")
-    m = list(RX["secret-assignment"].finditer(b))
-    for x in reversed(m):
+        b = r.sub(b"***", b)
+    for x in reversed(list(RX["secret-assignment"].finditer(b))):
         b = b[:x.start(1)] + b"***" + b[x.end(1):]
     return b.decode("utf-8", "surrogateescape")
 
@@ -224,19 +223,29 @@ def scan(rel, data):
 
 
 def scan_index(work):
-    """Scan every blob in the index (what would be committed), by path."""
+    """Scan every blob in the index (what would be committed), by path, one blob in memory at a time."""
     ls = git(work, "ls-files", "-s", "-z").stdout.split("\0")
     entries = [(x.split("\t", 1)[1], x.split()[1]) for x in ls if x]
+    hits = []
     if not entries:
-        return []
-    p = subprocess.run(["git", "-C", str(work), "cat-file", "--batch"], input=b"".join(e[1].encode() + b"\n" for e in entries),
-                       capture_output=True, check=True)
-    out, hits, i = p.stdout, [], 0
-    for path, _ in entries:
-        nl = out.index(b"\n", i)
-        size = int(out[i:nl].split()[2])
-        hits += scan(path, out[nl + 1:nl + 1 + size])
-        i = nl + 1 + size + 1
+        return hits
+    proc = subprocess.Popen(["git", "-C", str(work), "cat-file", "--batch"], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE)
+    try:
+        for path, sha in entries:
+            proc.stdin.write(sha.encode() + b"\n")
+            proc.stdin.flush()
+            header = proc.stdout.readline().split()
+            if len(header) != 3:
+                raise Blocked("error", f"cat-file failed for {redact(path)}")
+            size = int(header[2])
+            data = proc.stdout.read(size)
+            proc.stdout.read(1)                                  # trailing newline
+            hits += scan(path, data)
+    finally:
+        proc.stdin.close()
+        proc.stdout.close()
+        proc.wait()
     return hits
 
 
@@ -246,7 +255,7 @@ def check_no_rewrite(work, repo):
                        capture_output=True, text=True)
     for line in p.stdout.splitlines():
         key, _, val = line.partition(" ")
-        if val and repo.startswith(val):
+        if repo.startswith(val):                           # an empty prefix rewrites every URL
             raise Blocked("error", f"git config {redact(key)} would rewrite the capture repo URL; refusing")
 
 
@@ -383,24 +392,21 @@ def main(argv=None):
 
     # Overlap is checked before anything is written: state inside a tree this tool reads (or the reverse) could
     # write into or delete from it. Nothing is written, not even status; the alert still goes out.
-    st_real = state.resolve(strict=False)
-    for label, d in (("--skills", a.skills), ("--bundled", a.bundled)):
-        if not d:
-            continue
-        dr = Path(d).resolve(strict=False)
-        if st_real == dr or dr in st_real.parents or st_real in dr.parents:
-            msg = f"--state and {label} overlap; refusing (nothing written)"
-            print(f"ERROR: {msg}", file=sys.stderr)
-            send_alert(f"Skills capture ({a.host}) FAILED, nothing pushed: {msg}")
-            return 2
-    state.mkdir(parents=True, exist_ok=True)
-    lock_path = state / ".lock"
     try:
-        lfd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)   # never truncates, never follows
-    except OSError as e:
-        print(f"ERROR: lock {lock_path}: {e.strerror}", file=sys.stderr)
-        send_alert(f"Skills capture ({a.host}) FAILED, nothing pushed: cannot open the lock ({e.strerror})")
-        return 1
+        st_real = state.resolve(strict=False)
+        for label, d in (("--skills", a.skills), ("--bundled", a.bundled)):
+            if not d:
+                continue
+            dr = Path(d).resolve(strict=False)
+            if st_real == dr or dr in st_real.parents or st_real in dr.parents:
+                raise Blocked("error", f"--state and {label} overlap; refusing (nothing written)")
+        state.mkdir(parents=True, exist_ok=True)
+        lfd = os.open(state / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)  # never truncates/follows
+    except Exception as e:  # noqa: BLE001 - setup failures: no status possible, the alert still goes out
+        msg = str(e) if isinstance(e, Blocked) else f"setup failed: {type(e).__name__}: {e}"
+        print(f"ERROR: {redact(msg)}", file=sys.stderr)
+        send_alert(f"Skills capture ({a.host}) FAILED, nothing pushed: {msg}")
+        return 2 if isinstance(e, Blocked) else 1
     try:
         fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
