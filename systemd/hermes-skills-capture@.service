@@ -1,0 +1,21 @@
+# Nightly capture of a company's Hermes skills into its private skills repo (EDD-fleet-architecture §7.3).
+# Instance = company (amforge, btp). Each install adds a drop-in, e.g. on h-af
+# /etc/systemd/system/hermes-skills-capture@amforge.service.d/args.conf:
+#   [Service]
+#   Environment="SKILLS_CAPTURE_ARGS=--skills /root/.hermes/skills --repo https://github.com/amforge/operating-skills.git --host h-af"
+# Interim for BTP (h-btp's credential cannot reach the repo): run on h-do1 and pull the tree first, read-only:
+#   ExecStartPre=/usr/bin/rsync -a --delete root@h-btp:/home/hermes/.hermes/skills/ /var/lib/hermes-skills-capture/btp/src/
+# A failed run (credential pattern found, push rejected, clone/fetch error) leaves the unit failed: that is the
+# alert; the reason is in /var/lib/hermes-skills-capture/<instance>/status.json.
+[Unit]
+Description=Capture %i Hermes skills into the company skills repo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/hermes-skills-capture --state /var/lib/hermes-skills-capture/%i $SKILLS_CAPTURE_ARGS
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=400M
+TimeoutStartSec=20min
