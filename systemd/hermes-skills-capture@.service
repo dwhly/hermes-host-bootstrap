@@ -1,0 +1,28 @@
+# Nightly capture of a company's Hermes skills into its private skills repo (EDD-fleet-architecture §7.3).
+# Instance = company (amforge, btp). Each install adds a drop-in with the arguments, e.g. on h-af
+# /etc/systemd/system/hermes-skills-capture@amforge.service.d/args.conf:
+#   [Service]
+#   Environment="SKILLS_CAPTURE_ARGS=--skills /root/.hermes/skills --bundled /usr/local/lib/hermes-agent/skills --repo https://github.com/amforge/operating-skills.git --host h-af"
+#   Environment="SKILLS_CAPTURE_ALERT=hermes send -q -t slack:hermes-cronjobs -f -"
+# Interim for BTP (h-btp's credential can't reach the repo): runs on h-do1 and mirrors the trees read-only first,
+# inside the tool so a failed pull is reported and alerted like any other failure:
+#   Environment="SKILLS_CAPTURE_ARGS=--pull root@h-btp:/home/hermes/.hermes/skills --skills /var/lib/hermes-skills-capture-src/btp/skills --pull-bundled root@h-btp:/home/hermes/.hermes/hermes-agent/skills --bundled /var/lib/hermes-skills-capture-src/btp/bundled --repo https://github.com/BTPAutomation/operating-skills.git --host h-btp"
+# The diff alert: SKILLS_CAPTURE_ALERT gets a line for every pushed change and every failure; a failure also leaves
+# the unit failed. Details: /var/lib/hermes-skills-capture/<instance>/status.json.
+[Unit]
+Description=Capture %i Hermes skills into the company skills repo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+StateDirectory=hermes-skills-capture/%i hermes-skills-capture-src/%i
+StateDirectoryMode=0700
+Environment=HOME=/root
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=SKILLS_CAPTURE_ALERT=
+ExecStart=/usr/local/sbin/hermes-skills-capture --state /var/lib/hermes-skills-capture/%i --alert-cmd ${SKILLS_CAPTURE_ALERT} $SKILLS_CAPTURE_ARGS
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=600M
+TimeoutStartSec=20min

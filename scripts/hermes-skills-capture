@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+"""hermes-skills-capture — nightly capture of a node's Hermes skills into the company's private skills repo.
+
+EDD-fleet-architecture §7.3 step 1 ("Now: capture every node's skills into private repos as they are, with a nightly
+automatic capture and a diff alert until convergence owns them"); §7.2: amforge/operating-skills,
+BTPAutomation/operating-skills; "Hermes's bundled skills are not copied".
+
+Usage:
+  hermes-skills-capture --skills DIR --repo URL --state DIR [--bundled DIR] [--branch main] [--host NAME]
+                        [--alert-cmd CMD] [--max-file-mb 20] [--dry-run]
+
+Guarantees (each fails closed: no commit, no push, non-zero exit, reason in <state>/status.json):
+  * The skills dir is only READ. --state must not overlap it (checked on resolved paths, both directions).
+  * Every run rebuilds <state>/work from the remote tip plus a fresh full copy of the skills tree, so an interrupted
+    or failed earlier run (dirty tree, stale lock, unpushed commit) can't make a run report "unchanged" wrongly.
+  * Every outgoing file is scanned in full (all bytes, binary included) together with its path; a file that can't be
+    read, a non-regular file, a file over --max-file-mb, or a credential pattern blocks the whole run. Symlinks are
+    never exported (listed in status as skipped). The scan catches known token formats, URL userinfo, auth headers
+    and literal secret assignments: a guard for a private repo, not a proof that no secret exists.
+  * Excluded: caches, .env/key files, Hermes runtime state (usage, curator, locks, archive), and a bundled skill ONLY
+    when --bundled holds the same package byte for byte (same files, contents and exec bits). Anything uncertain (hub
+    installs, edited bundled skills, no --bundled) is captured: over-capture, never under-capture.
+  * Fetch and push go to --repo explicitly; a url.*.insteadOf / pushInsteadOf rewrite that would redirect it is
+    refused. No force push. A push rejected because someone else pushed fails this run; the next run rebuilds on
+    their tip.
+  * status.json and every message are redacted (URL userinfo and token patterns removed).
+  * --alert-cmd (e.g. "hermes send -q -t slack:hermes-cronjobs -f -") gets a short text on stdin for every pushed
+    change and every failure: that is the diff alert. A failed alert is recorded in status, never fatal.
+"""
+import argparse, datetime, fcntl, json, os, re, shlex, shutil, socket, stat, subprocess, sys
+from pathlib import Path
+
+PATTERNS = {
+    "private-key": rb"-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----",
+    "github-token": rb"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}|\bgithub_pat_[A-Za-z0-9_]{40,}",
+    "slack-token": rb"\bxox[abposr]-[A-Za-z0-9-]{10,}",
+    "aws-key": rb"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
+    "openai-like-key": rb"\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{32,}",
+    "google-api-key": rb"\bAIza[0-9A-Za-z_-]{35}",
+    "notion-token": rb"\b(?:secret|ntn)_[A-Za-z0-9]{40,}",
+    "1password-sa-token": rb"\bops_[A-Za-z0-9_-]{40,}",
+    "stripe-key": rb"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{20,}",
+    "jwt": rb"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+    "url-userinfo": rb"[a-zA-Z][a-zA-Z0-9+.-]{0,30}://[^/\s:@'\"<>]{1,256}:([^/\s@'\"<>]{1,256})@",
+    "auth-header": rb"(?i)authorization:\s*(?:bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{16,}",
+    "secret-assignment": rb"(?i)(?:password|passwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token|"
+                         rb"client[_-]?secret|private[_-]?key)[\w.-]{0,40}[\"']?[ \t]{0,8}[:=][ \t]{0,8}[\"']?"
+                         rb"([^\s\"'`,;)}\]]{12,512})",
+}
+RX = {k: re.compile(v) for k, v in PATTERNS.items()}
+# Shapes of a captured value that is plainly NOT a literal secret (see not_a_literal). Kept narrow on purpose:
+# a real secret with digits or symbols must still be caught.
+NOT_LITERAL = [re.compile(x) for x in (
+    rb"^<[A-Za-z_ -]{1,80}>?$",                            # <your key here>, <OPENROUTER_API_KEY>
+    rb"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$|\$\{[A-Za-z_][A-Za-z0-9_]*\}|^\$\([a-z]",  # $VAR, ${VAR}, $(cmd …): references
+    rb"\{\{|\}\}|%\(",                                      # templates
+    rb"^op://",                                            # 1Password reference
+    rb"\[\^|\\[()1-9dwsS.]|\.\*|\(\?",                       # a regex
+    rb"(?i)x{4,}|\.{3}|\*{3}",                              # xxxx / ... / *** placeholders
+    rb"^[A-Za-z_][A-Za-z_.]*\[[A-Za-z_., \]]*$",               # a type annotation: Optional[str] (no digits)
+    rb"^[A-Za-z_][A-Za-z_.]*\(",                             # a call: getenv('X'), os.environ.get( (no digits)
+    rb"^(?i:os\.environ|process\.env|env)\b",              # environment lookups
+)]
+UPPER_NAME = re.compile(rb"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")  # COMFY_CLOUD_API_KEY: an env var NAME
+DOTTED = re.compile(rb"^[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)+$")  # self.token, config.api_key
+WORDS = re.compile(rb"(?i)^[a-z]+(?:[-_][a-z]+)+$")         # your-key-here (digitless words)
+CACHE_DIRS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules", ".git"}
+EXCL_FILES = re.compile(r"^(?:\.env|\.env\..*|.*\.pem|.*\.key|.*\.p12|.*\.pfx|\.DS_Store|.*\.pyc|.*\.pyo)$")
+EXCL_TOP = {".archive", ".curator_backups", ".locks", ".usage.json", ".usage.json.lock", ".curator_state",
+            ".curator_ledger.jsonl"}
+TOKEN_RX = [r for k, r in RX.items() if k not in ("url-userinfo", "secret-assignment")]
+
+
+def redact(text):
+    """Mask secrets in a report string with the SAME byte patterns the scanner uses, so what is detected is masked."""
+    b = str(text).encode("utf-8", "surrogateescape")
+    b = re.sub(rb"([a-zA-Z][a-zA-Z0-9+.-]{0,30}://)[^/\s@]{1,512}@", rb"\1***@", b)
+    for r in TOKEN_RX:
+        b = r.sub(b"***", b)
+    for x in reversed(list(RX["secret-assignment"].finditer(b))):
+        b = b[:x.start(1)] + b"***" + b[x.end(1):]
+    return b.decode("utf-8", "surrogateescape")
+
+
+def redact_all(obj):
+    if isinstance(obj, str):
+        return redact(obj)
+    if isinstance(obj, list):
+        return [redact_all(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: redact_all(v) for k, v in obj.items()}
+    return obj
+
+
+def safe_write(path, text):
+    """Write a report file without ever following a planted symlink: create a fresh file exclusively, then rename."""
+    tmp = path.with_name(path.name + ".tmp")
+    if tmp.is_symlink() or tmp.exists():
+        tmp.unlink()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)                                  # replaces a symlink itself, never its target
+
+
+class Blocked(Exception):
+    def __init__(self, result, msg):
+        super().__init__(msg)
+        self.result = result
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def last_line(p):
+    lines = (p.stderr or p.stdout or "").strip().splitlines()
+    return redact(lines[-1]) if lines else f"exit {p.returncode}"
+
+
+def git(work, *args, check=True):
+    p = subprocess.run(["git", "-C", str(work), "-c", "core.hooksPath=/dev/null", *args], capture_output=True, text=True)
+    if check and p.returncode != 0:
+        raise Blocked("error", f"git {args[0]} failed: {last_line(p)}")
+    return p
+
+
+def walk_source(src):
+    """(files, links): files = [(rel, path, mode)] to capture; links = [rel] never exported. Unreadable -> Blocked."""
+    files, links = [], []
+
+    def onerror(e):
+        raise Blocked("blocked-unreadable", f"cannot read {e.filename}: {e.strerror}")
+    for root, dirs, names in os.walk(src, onerror=onerror, followlinks=False):
+        r = Path(root)
+        rel_root = r.relative_to(src)
+        top = rel_root == Path(".")
+        keep = []
+        for d in sorted(dirs):
+            rel = (rel_root / d).as_posix()
+            if d in CACHE_DIRS or (top and d in EXCL_TOP):
+                continue
+            if (r / d).is_symlink():
+                links.append(rel)
+                continue
+            keep.append(d)
+        dirs[:] = keep
+        for n in sorted(names):
+            rel = (rel_root / n).as_posix()
+            p = r / n
+            if EXCL_FILES.match(n) or (top and n in EXCL_TOP):
+                continue
+            st = os.lstat(p)
+            if stat.S_ISLNK(st.st_mode):
+                links.append(rel)
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                raise Blocked("blocked-unreadable", f"not a regular file: {rel}")
+            files.append((rel, p, st.st_mode))
+    return files, links
+
+
+def _inventory(d):
+    out = {}
+    for root, dirs, names in os.walk(d, followlinks=False):
+        dirs[:] = [x for x in dirs if x not in CACHE_DIRS]
+        for n in names:
+            if n.endswith((".pyc", ".pyo")):
+                continue
+            p = Path(root) / n
+            st = os.lstat(p)
+            if not stat.S_ISREG(st.st_mode):
+                return None
+            out[p.relative_to(d).as_posix()] = (bool(st.st_mode & 0o111), p)
+    return out
+
+
+def package_identical(a, b):
+    """True only when package dirs a and b have the same files, bytes and exec bits (caches ignored)."""
+    try:
+        ia, ib = _inventory(a), _inventory(b)
+        if ia is None or ib is None or set(ia) != set(ib):
+            return False
+        return all(ia[k][0] == ib[k][0] and ia[k][1].read_bytes() == ib[k][1].read_bytes() for k in ia)
+    except OSError:
+        return False
+
+
+def bundled_unmodified(src, bundled):
+    out = []
+    if not bundled or not Path(bundled).is_dir():
+        return out
+    for md in sorted(Path(src).rglob("SKILL.md")):
+        d = md.parent
+        rel = d.relative_to(src).as_posix()
+        if rel == "." or rel.startswith(".") or "/." in rel or any(x in CACHE_DIRS for x in Path(rel).parts):
+            continue
+        b = Path(bundled) / rel
+        if (b / "SKILL.md").is_file() and not b.is_symlink() and package_identical(d, b):
+            out.append(rel)
+    return out
+
+
+def not_a_literal(v):
+    """True when a captured assignment/userinfo value is plainly not a literal secret."""
+    if any(r.search(v) for r in NOT_LITERAL):
+        return True
+    digits = sum(c in b"0123456789" for c in v)
+    return bool((UPPER_NAME.match(v) and digits <= 2) or (DOTTED.match(v) and not digits) or WORDS.match(v))
+
+
+def scan(rel, data):
+    blob = rel.encode() + b"\n" + data
+    hits = []
+    for name, r in RX.items():
+        for m in r.finditer(blob):
+            if m.re.groups and not_a_literal(m.group(1)):
+                continue
+            line = blob[:m.start()].count(b"\n")
+            hits.append(f"{redact(rel)}:{line if line else 'path'}: {name}")
+            break
+    return hits
+
+
+def scan_index(work):
+    """Scan every blob in the index (what would be committed), by path, one blob in memory at a time."""
+    ls = git(work, "ls-files", "-s", "-z").stdout.split("\0")
+    entries = [(x.split("\t", 1)[1], x.split()[1]) for x in ls if x]
+    hits = []
+    if not entries:
+        return hits
+    proc = subprocess.Popen(["git", "-C", str(work), "cat-file", "--batch"], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE)
+    try:
+        for path, sha in entries:
+            proc.stdin.write(sha.encode() + b"\n")
+            proc.stdin.flush()
+            header = proc.stdout.readline().split()
+            if len(header) != 3:
+                raise Blocked("error", f"cat-file failed for {redact(path)}")
+            size = int(header[2])
+            data = proc.stdout.read(size)
+            if len(data) != size or proc.stdout.read(1) != b"\n":   # a truncated body is never "scanned"
+                raise Blocked("error", f"cat-file returned a truncated blob for {redact(path)}")
+            hits += scan(path, data)
+    finally:
+        proc.stdin.close()
+        proc.stdout.close()
+        rc = proc.wait()
+    if rc != 0:
+        raise Blocked("error", f"cat-file exited {rc}")
+    return hits
+
+
+def check_no_rewrite(work, repo):
+    """Checked in the work repo itself, so conditional includes (includeIf gitdir:) that apply there are seen."""
+    p = subprocess.run(["git", "-C", str(work), "config", "--get-regexp", r"^url\..*\.(insteadof|pushinsteadof)$"],
+                       capture_output=True, text=True)
+    for line in p.stdout.splitlines():
+        key, _, val = line.partition(" ")
+        if repo.startswith(val):                           # an empty prefix rewrites every URL
+            raise Blocked("error", f"git config {redact(key)} would rewrite the capture repo URL; refusing")
+
+
+def run(a, rec, state):
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", a.branch):
+        raise Blocked("error", "bad branch name")
+    src = Path(a.skills).resolve(strict=False)
+    st_real = state.resolve(strict=True)
+    if not src.is_dir():
+        raise Blocked("error", f"skills dir not found: {a.skills}")
+    if st_real == src or src in st_real.parents or st_real in src.parents:
+        raise Blocked("error", "--state and --skills overlap; refusing")
+    # 1. rebuild the disposable working copy on the remote tip
+    work = st_real / "work"
+    if work.is_symlink() or work.is_file():
+        work.unlink()
+    elif work.exists():
+        shutil.rmtree(work)
+    work.mkdir()
+    git(work, "init", "-q", "-b", a.branch)
+    check_no_rewrite(work, a.repo)
+    p = git(work, "fetch", "-q", "--no-tags", a.repo, f"+refs/heads/{a.branch}:refs/remotes/capture/{a.branch}",
+            check=False)
+    if p.returncode == 0:
+        git(work, "reset", "-q", "--hard", f"refs/remotes/capture/{a.branch}")
+        base = git(work, "rev-parse", "HEAD").stdout.strip()
+    elif "couldn't find remote ref" in (p.stderr or "").lower():
+        base = None                                   # empty repo: the first capture
+    else:
+        raise Blocked("error", f"fetch failed: {last_line(p)}")
+    # 2. fresh copy of the skills tree (full content every run; nothing depends on mtimes)
+    files, links = walk_source(src)
+    excluded = bundled_unmodified(src, a.bundled)
+    rec["excluded_bundled"], rec["skipped_links"] = len(excluded), links[:200]   # redacted when written
+    dest = work / "skills"
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir()
+    hits, n, limit = [], 0, a.max_file_mb * 1024 * 1024
+    for rel, p, mode in files:
+        if any(rel == e or rel.startswith(e + "/") for e in excluded):
+            continue
+        try:
+            if os.lstat(p).st_size > limit:
+                raise Blocked("blocked-unreadable", f"{rel} is over {a.max_file_mb} MB")
+            with open(p, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            raise Blocked("blocked-unreadable", f"cannot read {rel}: {e.strerror}")
+        hits += scan("skills/" + rel, data)
+        t = dest / rel
+        t.parent.mkdir(parents=True, exist_ok=True)
+        t.write_bytes(data)
+        os.chmod(t, 0o755 if mode & 0o111 else 0o644)
+        n += 1
+    rec["captured_files"] = n
+    hits_file = st_real / "scan-hits.txt"
+
+    def block_if(hits):
+        if hits:
+            safe_write(hits_file, "\n".join(hits) + "\n")
+            shutil.rmtree(work)
+            raise Blocked("blocked-secret", f"credential pattern in {len(hits)} place(s); see {hits_file} "
+                                            "(file:line: pattern, never values)")
+    block_if(hits)
+    # 3. stage the whole inventory explicitly (-f: ignore rules can't hide a file), then scan what git actually
+    #    staged: attributes/filters (working-tree-encoding, clean filters) can change bytes between disk and blob.
+    git(work, "add", "-A", "-f", "--", ".")
+    block_if(scan_index(work))
+    if hits_file.is_symlink() or hits_file.exists():
+        hits_file.unlink()
+    changed = [x for x in git(work, "diff", "--cached", "--name-only").stdout.splitlines() if x]
+    rec["changed_paths"] = len(changed)
+    if not changed:
+        rec.update(result="unchanged", commit=base)
+        return 0
+    if a.dry_run:
+        rec["result"] = "dry-run"
+        print(f"dry run: {len(changed)} paths would change; {n} files captured, {len(excluded)} bundled skills "
+              f"excluded, {len(links)} links skipped")
+        return 0
+    git(work, "-c", f"user.name=Hermes skills capture ({a.host})", "-c", f"user.email=hermes-skills-capture@{a.host}",
+        "commit", "-q", "-m", f"capture {a.host} skills {rec['at']} ({len(changed)} paths)",
+        "-m", f"Source: {a.host}:{a.skills} (nightly capture, EDD-fleet-architecture §7.3)")
+    head = git(work, "rev-parse", "HEAD").stdout.strip()
+    git(work, "push", "-q", a.repo, f"HEAD:refs/heads/{a.branch}")
+    rec.update(result="pushed", commit=head)
+    dirs = sorted({"/".join(c.split("/")[1:3]) for c in changed})
+    rec["_alert"] = (f"Skills capture ({a.host}): {len(changed)} files changed in {len(dirs)} skill dirs, "
+                     f"commit {head[:10]}\n" + ", ".join(dirs[:12]) + (" …" if len(dirs) > 12 else ""))
+    print(f"pushed {len(changed)} paths: {head[:10]}")
+    return 0
+
+
+def pull(spec, into):
+    """--pull/--pull-bundled: refresh a local mirror from another host, read-only on that host (rsync --checksum)."""
+    into.mkdir(parents=True, exist_ok=True)
+    p = subprocess.run(["rsync", "-a", "--checksum", "--delete", "--", spec.rstrip("/") + "/", str(into) + "/"],
+                       capture_output=True, text=True, timeout=900)
+    if p.returncode != 0:
+        raise Blocked("error", f"pull from {spec} failed: {last_line(p)}")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Capture a node's Hermes skills into the company's private skills repo.")
+    ap.add_argument("--skills", required=True)
+    ap.add_argument("--repo", required=True)
+    ap.add_argument("--state", required=True)
+    ap.add_argument("--bundled", default="")
+    ap.add_argument("--pull", default="", help="rsync source to mirror into --skills first (then --skills is owned "
+                                               "by this tool)")
+    ap.add_argument("--pull-bundled", default="", help="rsync source to mirror into --bundled first")
+    ap.add_argument("--branch", default="main")
+    ap.add_argument("--host", default=socket.gethostname().split(".")[0])
+    ap.add_argument("--alert-cmd", default="")
+    ap.add_argument("--max-file-mb", type=int, default=20)
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args(argv)
+    os.umask(0o077)
+    state = Path(a.state)
+    rec = {"at": now(), "host": a.host, "skills": a.skills, "repo": a.repo, "result": None,
+           "changed_paths": 0, "captured_files": 0, "excluded_bundled": 0, "skipped_links": [], "commit": None,
+           "error": None, "alert_error": None}
+
+    def send_alert(text):
+        if not (text and a.alert_cmd and not a.dry_run):
+            return
+        try:
+            p = subprocess.run(shlex.split(a.alert_cmd), input=redact(text), text=True, capture_output=True, timeout=60)
+            if p.returncode != 0:
+                rec["alert_error"] = last_line(p)[:200]
+        except Exception as e:  # noqa: BLE001
+            rec["alert_error"] = redact(e)[:200]
+
+    # Overlap is checked before anything is written: state inside a tree this tool reads (or the reverse) could
+    # write into or delete from it. Nothing is written, not even status; the alert still goes out.
+    try:
+        st_real = state.resolve(strict=False)
+        for label, d in (("--skills", a.skills), ("--bundled", a.bundled)):
+            if not d:
+                continue
+            dr = Path(d).resolve(strict=False)
+            if st_real == dr or dr in st_real.parents or st_real in dr.parents:
+                raise Blocked("error", f"--state and {label} overlap; refusing (nothing written)")
+        state.mkdir(parents=True, exist_ok=True)
+        lfd = os.open(state / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)  # never truncates/follows
+    except Exception as e:  # noqa: BLE001 - setup failures: no status possible, the alert still goes out
+        msg = str(e) if isinstance(e, Blocked) else f"setup failed: {type(e).__name__}: {e}"
+        print(f"ERROR: {redact(msg)}", file=sys.stderr)
+        send_alert(f"Skills capture ({a.host}) FAILED, nothing pushed: {msg}")
+        return 2 if isinstance(e, Blocked) else 1
+    try:
+        fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(lfd)
+        print("another capture is running", file=sys.stderr)
+        return 4
+    rc = 1
+    try:
+        if a.pull:
+            pull(a.pull, Path(a.skills))
+        if a.pull_bundled:
+            if not a.bundled:
+                raise Blocked("error", "--pull-bundled needs --bundled")
+            pull(a.pull_bundled, Path(a.bundled))
+        rc = run(a, rec, state)
+    except Blocked as e:
+        rec.update(result=e.result, error=str(e))
+        rec["_alert"] = f"Skills capture ({a.host}) FAILED, nothing pushed: {e.result}: {e}"
+        print(f"{e.result.upper()}: {redact(e)}", file=sys.stderr)
+        rc = 3 if e.result.startswith("blocked") else 1
+    except Exception as e:  # noqa: BLE001 - every failure must reach status.json and the alert
+        rec.update(result="error", error=f"{type(e).__name__}: {e}"[:500])
+        rec["_alert"] = f"Skills capture ({a.host}) FAILED, nothing pushed: {rec['error']}"
+        print(f"ERROR: {redact(rec['error'])}", file=sys.stderr)
+        rc = 1
+    finally:
+        send_alert(rec.pop("_alert", None))
+        try:
+            safe_write(state / "status.json", json.dumps(redact_all(rec), indent=1))
+        except OSError as e:
+            print(f"ERROR: status.json: {e.strerror}", file=sys.stderr)
+            rc = rc or 1
+        os.close(lfd)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly %i Hermes skills capture
+
+[Timer]
+OnCalendar=*-*-* 07:40:00 UTC
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
