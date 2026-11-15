@@ -354,9 +354,11 @@ class Capture(unittest.TestCase):
         real_git = shutil.which("git")
         for mode in ("truncate", "exit"):
             with self.subTest(mode=mode):
-                body = ("python3 -c 'import sys; l=sys.stdin.readline().split()[0]; "
-                        "sys.stdout.buffer.write(l.encode()+b\\\" blob 100\\\\n\\\"+b\\\"x\\\"*16)'"
-                        if mode == "truncate" else f"{real_git} \"$@\"; exit 7")
+                trunc = shim / "trunc.py"
+                trunc.write_text("import sys\n"
+                                 "sha = sys.stdin.readline().split()[0]\n"
+                                 "sys.stdout.buffer.write(sha.encode() + b' blob 100\\n' + b'x' * 16)\n")
+                body = f"python3 {trunc}" if mode == "truncate" else f'{real_git} "$@"; exit 7'
                 (shim / "git").write_text(
                     f'#!/bin/sh\nfor a in "$@"; do [ "$a" = "--batch" ] && {{ {body}; exit $?; }}; done\n'
                     f'exec {real_git} "$@"\n')
@@ -368,7 +370,7 @@ class Capture(unittest.TestCase):
                 finally:
                     os.environ["PATH"] = env_path
                 self.assertEqual(rc, 1)
-                self.assertIn("cat-file", self.status()["error"])
+                self.assertIn("truncated blob" if mode == "truncate" else "cat-file exited 7", self.status()["error"])
                 self.assertIsNone(self.tip())
 
     # ── r2 review counterexamples ──
