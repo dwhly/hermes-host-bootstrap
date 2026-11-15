@@ -184,12 +184,27 @@ def native_prune(hermes_home, src_ok):
             "retention_days": days if isinstance(days, int) and not isinstance(days, bool) else None}
 
 
+DF = ("json_extract(CASE WHEN json_valid(model_config) THEN model_config ELSE json_object() END, "
+      "'$._delegate_from')")
+
+
 def delegate_children(conn, sid):
-    import hermes_state_sessions as hss
-    fn = getattr(hss, "_collect_delegate_child_ids", None)
-    if fn is None:
-        raise Refuse("this Hermes has no _collect_delegate_child_ids; can't fence the cascade")
-    return set(fn(conn, [sid]))
+    """The delegate sessions Hermes's delete_session cascades with *sid* (same rule as Hermes's
+    _collect_delegate_child_ids, in plain SQL so plan mode imports no Hermes code). On apply, Hermes re-checks this
+    set itself inside its write transaction (expected_delete_ids), so a divergence refuses the delete."""
+    found, frontier = {sid}, [sid]
+    while frontier:
+        nxt = []
+        for i in range(0, len(frontier), 400):
+            chunk = frontier[i:i + 400]
+            ph = ",".join("?" * len(chunk))
+            for row in conn.execute(f"SELECT id FROM sessions WHERE {DF} IN ({ph}) "
+                                    f"OR (parent_session_id IN ({ph}) AND {DF} IS NOT NULL)", chunk + chunk):
+                if row[0] not in found:
+                    found.add(row[0])
+                    nxt.append(row[0])
+        frontier = nxt
+    return found - {sid}
 
 
 def plan(args, now):
@@ -321,13 +336,15 @@ def main(argv=None):
     args.src_ok = (src / "hermes_state.py").is_file()
     if args.src_ok and str(src) not in sys.path:
         sys.path.insert(0, str(src))
-    lock_path = Path(args.hermes_home) / ".fleet-trace-retention.lock"
-    try:
-        lock = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as e:
-        print(json.dumps({"error": f"lock {lock_path}: {e.__class__.__name__}"}))
-        return 2
+    lock = None   # plan mode writes nothing, not even a lock file; apply runs one at a time
+    if args.apply:
+        lock_path = Path(args.hermes_home) / ".fleet-trace-retention.lock"
+        try:
+            lock = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            print(json.dumps({"error": f"lock {lock_path}: {e.__class__.__name__}"}))
+            return 2
     try:
         report = plan(args, time.time())
         report["mode"] = "apply" if args.apply else "plan"
@@ -342,7 +359,8 @@ def main(argv=None):
         print(json.dumps({"error": str(e)}))
         return 2
     finally:
-        os.close(lock)
+        if lock is not None:
+            os.close(lock)
     print(json.dumps(report, sort_keys=True, default=sorted))
     if report["copy_store"]["readable"] is False:
         return 4

@@ -260,6 +260,16 @@ class Retention(unittest.TestCase):
         self.assertEqual(out["native_prune"]["enabled"], expect)
         self.assertEqual(rc, 3 if expect else 0)
 
+    def test_plan_writes_nothing_in_the_home(self):
+        # SQLite's own -wal/-shm sidecars may appear when a reader opens a WAL database; nothing else may.
+        names = lambda: sorted(p.name for p in self.home.iterdir() if not p.name.endswith(("-wal", "-shm")))
+        before, digest = names(), self.digest()
+        self.receipt(S1, "j1", 100)
+        rc, out = self.run_tool()
+        self.assertEqual([e["session"] for e in out["eligible"]], [S1])
+        self.assertEqual(names(), before)
+        self.assertEqual(self.digest(), digest)
+
     def test_output_carries_no_message_content(self):
         self.receipt(S1, "j1", 100)
         rc, out = self.run_tool()

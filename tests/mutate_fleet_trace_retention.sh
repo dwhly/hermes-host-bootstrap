@@ -24,10 +24,12 @@ mutate pinned           'if pinned:' 'if False:'
 mutate active_job       'if any(states.get(j) in ACTIVE_JOB_STATES or states.get(j) == "unreadable" for j in jobs):' 'if False:'
 mutate delegates        'if covered != rc["covered"]:' 'if False:'
 mutate min_keep         'if args.keep_days < MIN_KEEP_DAYS:' 'if False:'
-mutate store_unreadable 'if report["copy_store"]["readable"] is False:
-                report["deleted"] = []
-            else:
-                report = apply(args, report)' 'report = apply(args, report)'
+# Not mutated: the apply-time "copy store unreadable" branch. An unreadable store yields no receipts, so nothing is
+# eligible either way; the branch is defence in depth and test_unreadable_copy_store_exit_4_nothing_deleted covers it.
+mutate delegate_sql     'if row[0] not in found:' 'if False:'
+mutate plan_no_lock     'if args.apply:
+        lock_path' 'if True:
+        lock_path'
 mutate password_dsn     'if re.search(r"password\s*=|://[^/@\s]*:[^/@\s]*@", dsn, re.I):' 'if False:'
 mutate native_prune     'np_["at_risk"] = bool(np_["enabled"]) and bool(no_copy)' 'np_["at_risk"] = False'
 mutate hash_version     'or r.get("hash_version") != HASH_VERSION:' ':'
