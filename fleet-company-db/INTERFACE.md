@@ -118,3 +118,5 @@ In one transaction, inside the function:
       (else FG409); key 8..200, kind `^[a-z][a-z0-9_.-]{1,40}$`, max_attempts 1..20, payload object ≤ 64 KiB, task
       must exist (FG404). `job_complete` on an expired lease is FG409. A cancel-requested job whose worker died ends
       `cancelled` (not stranded `running`).
+  11. (T2 review r2) Mutations must run in **READ COMMITTED** (else FG400) in a transaction **younger than 30 s**
+      (else FG503): one call per transaction, as the gate already does.

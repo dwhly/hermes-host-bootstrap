@@ -95,6 +95,26 @@ Backups before the change (standing rule): `/root/legacy-capture/<date>-fleet-co
    at the previous `<sha>` and re-run `fleet-company-db install`.
    Removing packages/data is out of scope for rollback (archive = keep).
 
+## Needs Dan (each with a recommendation)
+1. **"Roll it out"**, per host: a reviewed one-line `ROLLOUT=go` in `config/fleet-company-db/<host>.env`. It
+   creates the `postgres` system user on that node; neither node has one today, and h-af's own `fleet-pages-pg`
+   runs as `fleet-pages-pg` on :55499, so there's no clash. Recommend h-af first (23 GB available). h-btp only
+   after its swap pressure is dealt with: 6.7 GB available but swap 2034/2047 MB used (2026-11-15).
+2. **D4 correction, retention without versioning** (a hard install prerequisite: `BUCKET_PROTECTION` in each
+   host's desired file, `owner-decision-pending` today). R2 has no object versioning and no S3 Object Lock, only
+   prefix Bucket Lock rules, and the node's key is read-write. A lock can only cover what pgBackRest never
+   rewrites: WAL segments are write-once, but `archive.info`, `backup.info` and the in-progress manifests are
+   rewritten. Recommend:
+   - An R2 **Bucket Lock** on prefix `pgbackrest/archive/<stanza>/16-` for 35 days.
+   - Prove it on the real bucket (one archive, one backup, one restore drill), then set
+     `BUCKET_PROTECTION=wal-bucket-lock`.
+   - After the first live drill: pgBackRest-managed expiry (`expire-auto=y`, `repo1-retention-full-type=time`,
+     `repo1-retention-full=35`). No blind R2 lifecycle rule, because R2 can't tell which WAL a kept backup needs.
+   - The alternative is a dated `owner-waiver-YYYY-MM-DD`.
+3. **Owner steps** above, per company: the R2 bucket, the scoped token in the company vault, and the cipher
+   passphrase. h-btp also needs a read-only 1Password service account for the BTP vault: it has none today.
+4. **Drill hosts** (D5) in each company's account, monthly.
+
 ## Evidence
 `tests/fleet-company-db/proto.sh` (h-do1, throwaway containers) — results in
 `/root/code/chief/docs/edd/evidence/fleet-architecture/T2-company-db-proto-2026-11-15.md`.

@@ -211,6 +211,16 @@ END $$;
 CREATE FUNCTION fleet._assert_writable() RETURNS void LANGUAGE plpgsql AS $$
 DECLARE f fleet.write_fence; a record;
 BEGIN
+  -- (review r2 [1]) Every check must see the present, not the transaction's start. Only READ COMMITTED takes
+  -- a fresh snapshot per statement; the archiver statistics are cached per transaction, so clear that cache;
+  -- and a transaction older than 30 s can no longer be admitted (bounds what an outage-spanning one commits).
+  IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'fleet: mutations must run in READ COMMITTED' USING ERRCODE = 'FG400';
+  END IF;
+  IF pg_catalog.clock_timestamp() - pg_catalog.transaction_timestamp() > interval '30 seconds' THEN
+    RAISE EXCEPTION 'fleet: record closed for writes: transaction older than 30 s' USING ERRCODE = 'FG503';
+  END IF;
+  PERFORM pg_catalog.pg_stat_clear_snapshot();
   IF pg_catalog.current_setting('archive_mode') = 'off' THEN
     RAISE EXCEPTION 'fleet: record closed for writes: WAL archiving is off' USING ERRCODE = 'FG503';
   END IF;

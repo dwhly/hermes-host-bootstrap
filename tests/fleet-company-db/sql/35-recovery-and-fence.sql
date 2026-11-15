@@ -56,6 +56,28 @@ SET ROLE fleet_gate;
 SELECT (fleet.update_task('amforge', :task, (SELECT version FROM fleet.tasks WHERE id = :task),
         '{"title":"after reopen"}', :ed, 'fleet-gate', 'req-fence-00002')) IS NOT NULL AS write_after_reopen;
 RESET ROLE;
+-- (review r2 [1]) a transaction can't carry an old view of the fence or the archiver across an outage:
+-- REPEATABLE READ is refused, and so is any mutation in a transaction older than 30 s.
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SET LOCAL ROLE fleet_gate;
+DO $$ BEGIN
+  PERFORM fleet.update_task('amforge', '00000000-0000-4000-8000-00000000a001',
+    (SELECT version FROM fleet.tasks WHERE id = '00000000-0000-4000-8000-00000000a001'),
+    '{"title":"rr"}', '00000000-0000-4000-8000-0000000000e1', 'fleet-gate', 'req-fence-rr-001');
+  RAISE EXCEPTION 'TESTFAIL REPEATABLE READ mutation admitted';
+EXCEPTION WHEN SQLSTATE 'FG400' THEN NULL; END $$;
+ROLLBACK;
+BEGIN;
+SET LOCAL statement_timeout = '45s';
+SELECT pg_sleep(31) IS NOT NULL AS aged_31s;
+SET LOCAL ROLE fleet_gate;
+DO $$ BEGIN
+  PERFORM fleet.update_task('amforge', '00000000-0000-4000-8000-00000000a001',
+    (SELECT version FROM fleet.tasks WHERE id = '00000000-0000-4000-8000-00000000a001'),
+    '{"title":"old"}', '00000000-0000-4000-8000-0000000000e1', 'fleet-gate', 'req-fence-old-01');
+  RAISE EXCEPTION 'TESTFAIL mutation admitted in a 31 s old transaction';
+EXCEPTION WHEN SQLSTATE 'FG503' THEN NULL; END $$;
+ROLLBACK;
 DO $$ BEGIN
   ASSERT (SELECT count(*) FROM fleet.audit WHERE action IN ('record.close', 'record.open')) = 2, 'fence changes audited';
   ASSERT (SELECT title FROM fleet.tasks WHERE id = '00000000-0000-4000-8000-00000000a001') = 'after reopen', 'reopened';
