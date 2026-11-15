@@ -38,5 +38,9 @@ mutate tz_required      'if at.tzinfo is None:
 mutate any_malformed    'store["usable"] = False' 'store["usable"] = store["readable"] is True'
 mutate duplicate        'if pr is None or pr["session_id"] in seen:' 'if pr is None:'
 mutate fresh_job_state  'fresh_states=True)' 'states={j: "done" for j in ctx.bindings.get(session_id, ())})'
+mutate fresh_bindings   'bindings, states = queue_bindings(ctx.queue_dir)
+    else:' '_, states = queue_bindings(ctx.queue_dir)
+        bindings = ctx.bindings
+    else:'
 mutate source_pin       'if digest not in DELETE_SOURCE_SHA256:' 'if False:'
 mutate in_tx_check      'return token if reason is None else None' 'return token'

@@ -277,6 +277,10 @@ class Retention(unittest.TestCase):
         self._changed_after_plan(lambda: (self.q / "j1.status.json").write_text('{"state": "running"}'),
                                  "its card job is queued, running or unreadable")
 
+    def test_new_active_job_naming_the_session_after_plan_kept(self):
+        self._changed_after_plan(lambda: self.job("j4", S1, state="running"),
+                                 "its card job is queued, running or unreadable")
+
     def test_apply_after_plan_deletes_when_unchanged(self):
         self.receipt(S1, "j1", 100)
         ns, args, report, ctx = self.in_process()

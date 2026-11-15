@@ -249,7 +249,11 @@ def check(conn, sid, ctx, fresh_states=False, states=None):
     """(reason or None, info). The single eligibility rule, used by the plan and inside the delete transaction.
     info["verified"] is True when a receipt matches the current content, whatever its age (for the risk report)."""
     info = {"verified": False}
-    jobs = ctx.bindings.get(sid, set())
+    if fresh_states:          # inside the delete transaction: re-read which jobs name the session, and their states
+        bindings, states = queue_bindings(ctx.queue_dir)
+    else:
+        bindings = ctx.bindings
+    jobs = bindings.get(sid, set())
     if not jobs:
         return "no card job names this session", info
     rc = ctx.receipts.get(sid)
@@ -273,8 +277,7 @@ def check(conn, sid, ctx, fresh_states=False, states=None):
             return "session not ended" if c == sid else "a covered delegate session isn't ended", info
         if row[1]:
             return "session pinned" if c == sid else "a covered delegate session is pinned", info
-    st = {j: job_state(ctx.queue_dir, j) for j in jobs} if fresh_states else states
-    if any(st.get(j) in ACTIVE_JOB_STATES or st.get(j) in ("unreadable", "missing", None) for j in jobs):
+    if any(states.get(j) in ACTIVE_JOB_STATES or states.get(j) in ("unreadable", "missing", None) for j in jobs):
         return "its card job is queued, running or unreadable", info
     if rc["copied_at"] > ctx.cutoff:
         return f"copy younger than {ctx.keep_days} days", info
