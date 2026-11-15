@@ -1,0 +1,420 @@
+#!/usr/bin/env bash
+# fleet-company-db: the per-company Postgres record on a company node (EDD-fleet-architecture §9 step 2).
+#
+#   fleet-company-db install --desired <file>   install/converge Postgres 16 + pgBackRest (idempotent)
+#   fleet-company-db migrate                    apply pending migrations, then roles and grants
+#   fleet-company-db status [--json]            versions, archiver, last backup, RPO age; exit 1 if unhealthy
+#   fleet-company-db backup full|diff           pgBackRest backup (the timers call this)
+#   fleet-company-db drill-restore --desired <file> [--target <timestamp>|--latest]
+#                                               on a FRESH drill host: restore, verify, report
+#   fleet-company-db set-password fleet_gate|fleet_worker   rotate a login role's local password
+#
+# Fail-closed rule: no database runs without working backups. `install` refuses to create the
+# cluster until the backup secrets resolve and `pgbackrest check` passes against the bucket.
+# Never deletes data. Secrets are never printed; they live in root:postgres 0640 files.
+set -euo pipefail
+umask 077
+
+PG_MAJOR=16
+SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+PAYLOAD="${FCDB_PAYLOAD:-$(cd "$SELF_DIR/.." && pwd)}"   # dir holding migrations/ sql/ templates/
+STATE_DIR=/var/lib/fleet-company-db
+ETC_DIR=/etc/fleet-company-db
+PGBR_CONF=/etc/pgbackrest/pgbackrest.conf
+PGBR_SECRETS=/etc/pgbackrest/conf.d/50-secrets.conf
+PGDATA="/var/lib/postgresql/$PG_MAJOR/main"
+PGCONF_DIR="/etc/postgresql/$PG_MAJOR/main"
+UNIT="postgresql@$PG_MAJOR-main.service"
+
+say()  { printf '[fleet-company-db] %s\n' "$*"; }
+die()  { printf '[fleet-company-db] ERROR: %s\n' "$*" >&2; exit 1; }
+hold() { printf '[fleet-company-db] HOLD: %s\n' "$*" >&2; exit 3; }   # owner step pending; nothing changed
+
+need_root() { [[ $EUID -eq 0 ]] || die "run as root"; }
+as_pg() { (cd / && runuser -u postgres -- "$@"); }
+psql_su() { as_pg psql -X -q -v ON_ERROR_STOP=1 --no-psqlrc "$@"; }
+
+# ------------------------------------------------------------------ desired state
+# The desired-state file is plain KEY=VALUE (no shell evaluation). Allowed keys only.
+declare -A D=()
+load_desired() {
+  local f="$1" line k v
+  [[ -f "$f" ]] || die "desired-state file $f missing"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || die "bad line in $f: ${line:0:60}"
+    k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
+    v="${v%\"}"; v="${v#\"}"
+    case "$k" in
+      COMPANY|STANZA|S3_ENDPOINT|S3_PORT|S3_BUCKET|S3_REGION|S3_CA_FILE|REPO_PATH|RETENTION_FULL_DAYS|\
+      SHARED_BUFFERS|EFFECTIVE_CACHE_SIZE|WORK_MEM|MAINTENANCE_WORK_MEM|MAX_CONNECTIONS|\
+      MEMORY_HIGH|MEMORY_MAX|ARCHIVE_TIMEOUT|BACKUP_FULL_CALENDAR|BACKUP_DIFF_CALENDAR|\
+      SECRETS_SOURCE|OP_REF_S3_KEY|OP_REF_S3_KEY_SECRET|OP_REF_CIPHER_PASS|OP_TOKEN_FILE|OP_TOKEN_FORMAT) D[$k]="$v" ;;
+      *) die "unknown key $k in $f" ;;
+    esac
+    # Values the owner hasn't supplied yet (bucket, account id, vault) stop the install cleanly.
+    [[ "$v" != *owner-step-pending* ]] || hold "$k in $f is still owner-step-pending (see the owner steps)"
+  done <"$f"
+  [[ "${D[COMPANY]:-}" =~ ^[a-z][a-z0-9-]{1,30}$ ]] || die "COMPANY must match ^[a-z][a-z0-9-]{1,30}$"
+  D[DB_NAME]="fleet_${D[COMPANY]//-/_}"
+  D[STANZA]="${D[STANZA]:-${D[COMPANY]}}"
+  [[ "${D[STANZA]}" =~ ^[a-z][a-z0-9-]{1,30}$ ]] || die "bad STANZA"
+  [[ -n "${D[S3_ENDPOINT]:-}" && -n "${D[S3_BUCKET]:-}" ]] || die "S3_ENDPOINT and S3_BUCKET required"
+  [[ "${D[S3_ENDPOINT]}" =~ ^[A-Za-z0-9.-]+$ ]] || die "S3_ENDPOINT is a bare host name"
+  [[ "${D[S3_BUCKET]}" =~ ^[a-z0-9][a-z0-9-]{2,62}$ ]] || die "bad S3_BUCKET"
+  D[S3_REGION]="${D[S3_REGION]:-auto}"; D[S3_PORT]="${D[S3_PORT]:-443}"
+  D[REPO_PATH]="${D[REPO_PATH]:-/pgbackrest}"
+  D[RETENTION_FULL_DAYS]="${D[RETENTION_FULL_DAYS]:-35}"
+  D[SHARED_BUFFERS]="${D[SHARED_BUFFERS]:-128MB}"; D[EFFECTIVE_CACHE_SIZE]="${D[EFFECTIVE_CACHE_SIZE]:-512MB}"
+  D[WORK_MEM]="${D[WORK_MEM]:-4MB}"; D[MAINTENANCE_WORK_MEM]="${D[MAINTENANCE_WORK_MEM]:-64MB}"
+  D[MAX_CONNECTIONS]="${D[MAX_CONNECTIONS]:-30}"
+  D[MEMORY_HIGH]="${D[MEMORY_HIGH]:-384M}"; D[MEMORY_MAX]="${D[MEMORY_MAX]:-512M}"
+  D[ARCHIVE_TIMEOUT]="${D[ARCHIVE_TIMEOUT]:-60}"
+  D[BACKUP_FULL_CALENDAR]="${D[BACKUP_FULL_CALENDAR]:-Sun *-*-* 03:30:00 UTC}"
+  D[BACKUP_DIFF_CALENDAR]="${D[BACKUP_DIFF_CALENDAR]:-Mon..Sat *-*-* 03:30:00 UTC}"
+  D[SECRETS_SOURCE]="${D[SECRETS_SOURCE]:-1password}"
+  local n
+  for n in RETENTION_FULL_DAYS MAX_CONNECTIONS ARCHIVE_TIMEOUT S3_PORT; do
+    [[ "${D[$n]}" =~ ^[0-9]+$ ]] || die "$n must be an integer"
+  done
+  (( D[ARCHIVE_TIMEOUT] >= 30 && D[ARCHIVE_TIMEOUT] <= 300 )) || die "ARCHIVE_TIMEOUT must be 30..300 (RPO 5 min)"
+  for n in SHARED_BUFFERS EFFECTIVE_CACHE_SIZE WORK_MEM MAINTENANCE_WORK_MEM; do
+    [[ "${D[$n]}" =~ ^[0-9]+(kB|MB|GB)$ ]] || die "$n must look like 128MB"
+  done
+  for n in MEMORY_HIGH MEMORY_MAX; do [[ "${D[$n]}" =~ ^[0-9]+[KMG]$ ]] || die "$n must look like 512M"; done
+  for n in BACKUP_FULL_CALENDAR BACKUP_DIFF_CALENDAR; do
+    [[ "${D[$n]}" =~ ^[A-Za-z0-9\ .:*,/-]+$ ]] || die "$n has unexpected characters"
+  done
+  [[ "${D[REPO_PATH]}" =~ ^/[A-Za-z0-9/_-]+$ ]] || die "bad REPO_PATH"
+  [[ -z "${D[S3_CA_FILE]:-}" || -f "${D[S3_CA_FILE]}" ]] || die "S3_CA_FILE ${D[S3_CA_FILE]} missing"
+  case "${D[SECRETS_SOURCE]}" in 1password|file) ;; *) die "SECRETS_SOURCE must be 1password or file" ;; esac
+}
+
+render() {  # render <template> <dest> <mode> <owner>: replaces @@KEY@@ from D[]; atomic
+  local tpl="$1" dest="$2" mode="$3" owner="$4" tmp k s
+  s="$(cat "$tpl")"
+  for k in "${!D[@]}"; do s="${s//@@$k@@/${D[$k]}}"; done
+  [[ "$s" != *"@@"* ]] || die "unrendered placeholder in $tpl"
+  tmp="$(mktemp "$(dirname "$dest")/.fcdb.XXXXXX")"
+  printf '%s\n' "$s" >"$tmp"; chmod "$mode" "$tmp"; chown "$owner" "$tmp"
+  if [[ -f "$dest" ]] && cmp -s "$tmp" "$dest"; then rm -f "$tmp"; return 1; fi
+  mv -f "$tmp" "$dest"; return 0
+}
+
+# ------------------------------------------------------------------ secrets
+secrets_present() {
+  [[ -f "$PGBR_SECRETS" ]] && grep -q '^repo1-s3-key=' "$PGBR_SECRETS" \
+    && grep -q '^repo1-s3-key-secret=' "$PGBR_SECRETS" && grep -q '^repo1-cipher-pass=' "$PGBR_SECRETS"
+}
+materialize_secrets() {
+  install -d -m 0750 -o root -g postgres /etc/pgbackrest/conf.d
+  if secrets_present; then return 0; fi
+  [[ "${D[SECRETS_SOURCE]}" == 1password ]] || hold "backup secrets missing at $PGBR_SECRETS (SECRETS_SOURCE=file): owner step pending"
+  command -v op >/dev/null || hold "1Password CLI missing; cannot resolve backup secrets"
+  local r
+  for r in OP_REF_S3_KEY OP_REF_S3_KEY_SECRET OP_REF_CIPHER_PASS; do
+    [[ "${D[$r]:-}" =~ ^op://[A-Za-z0-9\ ._-]+/[A-Za-z0-9\ ._-]+/[A-Za-z0-9\ ._-]+$ ]] || die "$r must be op://vault/item/field"
+  done
+  # The node's existing read-only 1Password service account. Only the token is read; an env
+  # file is never sourced (it holds other secrets).
+  if [[ -n "${D[OP_TOKEN_FILE]:-}" ]]; then
+    [[ -f "${D[OP_TOKEN_FILE]}" ]] || hold "1Password service-account token file ${D[OP_TOKEN_FILE]} missing"
+    local tok
+    case "${D[OP_TOKEN_FORMAT]:-raw}" in
+      raw) tok="$(head -n1 "${D[OP_TOKEN_FILE]}")" ;;
+      env) tok="$(grep -m1 '^OP_SERVICE_ACCOUNT_TOKEN=' "${D[OP_TOKEN_FILE]}" | cut -d= -f2-)"
+           tok="${tok%\"}"; tok="${tok#\"}"; tok="${tok%\'}"; tok="${tok#\'}" ;;
+      *) die "OP_TOKEN_FORMAT must be raw or env" ;;
+    esac
+    [[ -n "$tok" ]] || hold "no service-account token in ${D[OP_TOKEN_FILE]}"
+    export OP_SERVICE_ACCOUNT_TOKEN="$tok"; unset tok
+  fi
+  local tmp k ks c
+  tmp="$(mktemp /etc/pgbackrest/conf.d/.secrets.XXXXXX)"
+  {
+    echo "# written by fleet-company-db from 1Password; do not edit by hand"
+    echo "[global]"
+  } >"$tmp"
+  k="$(op read "${D[OP_REF_S3_KEY]}" 2>/dev/null)" || { rm -f "$tmp"; hold "op read ${D[OP_REF_S3_KEY]} failed (owner step: item missing or service account lacks access)"; }
+  ks="$(op read "${D[OP_REF_S3_KEY_SECRET]}" 2>/dev/null)" || { rm -f "$tmp"; hold "op read ${D[OP_REF_S3_KEY_SECRET]} failed"; }
+  c="$(op read "${D[OP_REF_CIPHER_PASS]}" 2>/dev/null)" || { rm -f "$tmp"; hold "op read ${D[OP_REF_CIPHER_PASS]} failed"; }
+  [[ -n "$k" && -n "$ks" && ${#c} -ge 32 ]] || { rm -f "$tmp"; hold "backup secrets empty or cipher passphrase shorter than 32 chars"; }
+  [[ "$k$ks$c" != *$'\n'* ]] || { rm -f "$tmp"; die "a backup secret contains a newline"; }
+  printf 'repo1-s3-key=%s\nrepo1-s3-key-secret=%s\nrepo1-cipher-pass=%s\n' "$k" "$ks" "$c" >>"$tmp"
+  unset k ks c
+  chmod 0640 "$tmp"; chown root:postgres "$tmp"; mv -f "$tmp" "$PGBR_SECRETS"
+}
+
+pgbr() { as_pg pgbackrest --stanza="${D[STANZA]}" "$@"; }
+
+# ------------------------------------------------------------------ install
+cmd_install() {
+  need_root
+  local desired=""
+  while [[ $# -gt 0 ]]; do case "$1" in --desired) desired="$2"; shift 2 ;; *) die "unknown arg $1" ;; esac; done
+  [[ -n "$desired" ]] || die "--desired <file> required"
+  load_desired "$desired"
+  . /etc/os-release
+  [[ "$ID" == ubuntu && "$VERSION_ID" == 24.04 ]] || die "supported on Ubuntu 24.04 only (found $ID $VERSION_ID)"
+
+  # 1. Packages, without letting the package auto-create a cluster that has no archiving.
+  install -d -m 0755 /etc/postgresql-common/createcluster.d
+  printf 'create_main_cluster = false\n' >/etc/postgresql-common/createcluster.d/50-fleet-company-db.conf
+  chmod 0644 /etc/postgresql-common/createcluster.d/50-fleet-company-db.conf
+  if ! dpkg -s "postgresql-$PG_MAJOR" pgbackrest >/dev/null 2>&1; then
+    say "installing postgresql-$PG_MAJOR + pgbackrest (Ubuntu archive)"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+      "postgresql-$PG_MAJOR" pgbackrest >/dev/null
+  fi
+  install -d -m 0755 "$ETC_DIR"; install -d -m 0750 -o postgres -g postgres "$STATE_DIR"
+  install -d -m 0750 -o postgres -g postgres /var/spool/pgbackrest /var/log/pgbackrest
+  install -d -m 0755 /etc/pgbackrest
+  install -m 0644 "$desired" "$ETC_DIR/desired.env"
+
+  # 2. pgBackRest config + secrets. HOLD (exit 3) here leaves no cluster behind.
+  if [[ -n "${D[S3_CA_FILE]:-}" ]]; then D[S3_CA_LINE]="repo1-storage-ca-file=${D[S3_CA_FILE]}"; else D[S3_CA_LINE]="# repo1-storage-ca-file: system CAs"; fi
+  render "$PAYLOAD/templates/pgbackrest.conf" "$PGBR_CONF" 0640 root:postgres || true
+  materialize_secrets
+
+  # 3. Cluster (once), with archiving configured before first start.
+  local created=0
+  if [[ ! -f "$PGDATA/PG_VERSION" ]]; then
+    say "creating cluster $PG_MAJOR/main"
+    pg_createcluster "$PG_MAJOR" main --start-conf=auto -- --data-checksums --auth-local=peer --auth-host=scram-sha-256 >/dev/null
+    created=1
+  fi
+  install -d -m 0755 -o postgres -g postgres "$PGCONF_DIR/conf.d"
+  local changed=0
+  render "$PAYLOAD/templates/postgresql-fleet.conf" "$PGCONF_DIR/conf.d/50-fleet-company-db.conf" 0644 postgres:postgres && changed=1
+  render "$PAYLOAD/templates/pg_hba.conf" "$PGCONF_DIR/pg_hba.conf" 0640 postgres:postgres && changed=1
+  install -d -m 0755 "/etc/systemd/system/$UNIT.d"
+  render "$PAYLOAD/templates/postgresql-unit-dropin.conf" "/etc/systemd/system/$UNIT.d/50-fleet-company-db.conf" 0644 root:root && changed=1
+  render "$PAYLOAD/templates/fleet-db-backup@.service" /etc/systemd/system/fleet-db-backup@.service 0644 root:root || true
+  render "$PAYLOAD/templates/fleet-db-backup-full.timer" /etc/systemd/system/fleet-db-backup-full.timer 0644 root:root || true
+  render "$PAYLOAD/templates/fleet-db-backup-diff.timer" /etc/systemd/system/fleet-db-backup-diff.timer 0644 root:root || true
+  render "$PAYLOAD/templates/fleet-db-health.service" /etc/systemd/system/fleet-db-health.service 0644 root:root || true
+  render "$PAYLOAD/templates/fleet-db-health.timer" /etc/systemd/system/fleet-db-health.timer 0644 root:root || true
+  systemctl daemon-reload
+  systemctl enable "$UNIT" >/dev/null 2>&1 || true
+  if [[ $created == 1 ]] || ! systemctl is-active -q "$UNIT"; then
+    systemctl start "$UNIT"
+  elif [[ $changed == 1 ]]; then
+    # Settings in 50-fleet-company-db.conf that need a restart (shared_buffers, archive_mode,
+    # max_connections) only change on an attended restart; everything else reloads.
+    systemctl reload "$UNIT"
+    if as_pg psql -X -At -c "select count(*) from pg_settings where pending_restart" | grep -qv '^0$'; then
+      say "NOTE: some settings wait for an attended restart: systemctl restart $UNIT"
+    fi
+  fi
+  wait_ready
+
+  # 4. Stanza + check (fail-closed: archiving must work before any data lands).
+  pgbr stanza-create >/dev/null 2>&1 || pgbr stanza-upgrade >/dev/null 2>&1 || true
+  if ! pgbr check >/dev/null 2>"$STATE_DIR/check.err"; then
+    systemctl stop "$UNIT"
+    die "pgbackrest check failed; cluster stopped so no unarchived data accumulates (see $STATE_DIR/check.err)"
+  fi
+  # 5. First full backup, once.
+  if ! pgbr info --output=json | grep -q '"type":"full"'; then
+    say "first full backup"; pgbr --type=full backup >/dev/null
+  fi
+  # 6. Schema, roles, company row.
+  cmd_migrate_inner
+  # 7. Login passwords for the gate and workers (local loopback only), once.
+  local r
+  for r in fleet_gate fleet_worker; do [[ -f "$ETC_DIR/$r.password" ]] || set_password "$r"; write_dsn "$r"; done
+  systemctl enable --now fleet-db-backup-full.timer fleet-db-backup-diff.timer fleet-db-health.timer >/dev/null 2>&1
+  date -u +%FT%TZ >"$STATE_DIR/installed-at"
+  say "installed: company=${D[COMPANY]} stanza=${D[STANZA]} pg=$(as_pg psql -X -At -c 'show server_version')"
+}
+
+wait_ready() {
+  local i
+  for i in $(seq 1 60); do as_pg pg_isready -q && return 0; sleep 1; done
+  die "postgres did not become ready"
+}
+
+# ------------------------------------------------------------------ migrate
+cmd_migrate() { need_root; load_desired "$ETC_DIR/desired.env"; cmd_migrate_inner; }
+cmd_migrate_inner() {
+  psql_su -d postgres <<'SQL'
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='fleet_owner') THEN CREATE ROLE fleet_owner NOLOGIN; END IF;
+END $$;
+SQL
+  if ! as_pg psql -X -At -d postgres -c "select 1 from pg_database where datname='${D[DB_NAME]}'" | grep -q 1; then
+    psql_su -d postgres -c "CREATE DATABASE ${D[DB_NAME]} OWNER fleet_owner"
+  fi
+  psql_su -d "${D[DB_NAME]}" <<'SQL'
+CREATE SCHEMA IF NOT EXISTS fleet_meta AUTHORIZATION postgres;
+REVOKE ALL ON SCHEMA fleet_meta FROM PUBLIC;
+CREATE TABLE IF NOT EXISTS fleet_meta.schema_migrations (
+  version text PRIMARY KEY, sha256 text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now());
+SQL
+  local f v sum have
+  for f in "$PAYLOAD"/migrations/[0-9][0-9][0-9][0-9]_*.sql; do
+    v="$(basename "$f" .sql)"; sum="$(sha256sum "$f" | cut -d' ' -f1)"
+    have="$(as_pg psql -X -At -d "${D[DB_NAME]}" -c "select sha256 from fleet_meta.schema_migrations where version='$v'")"
+    if [[ -n "$have" ]]; then
+      [[ "$have" == "$sum" ]] || die "migration $v changed after it was applied (expand/contract: add a new file)"
+      continue
+    fi
+    say "applying migration $v"
+    { echo "BEGIN;"; echo "SET LOCAL ROLE fleet_owner;"; cat "$f"; echo "RESET ROLE;";
+      echo "INSERT INTO fleet_meta.schema_migrations(version, sha256) VALUES ('$v', '$sum');"; echo "COMMIT;"; } \
+      | psql_su -d "${D[DB_NAME]}"
+  done
+  psql_su -d "${D[DB_NAME]}" -f "$PAYLOAD/sql/roles-and-grants.sql"
+  local co
+  co="$(as_pg psql -X -At -d "${D[DB_NAME]}" -c "select id from fleet.company")"
+  if [[ -z "$co" ]]; then
+    psql_su -d "${D[DB_NAME]}" -c "INSERT INTO fleet.company(id) VALUES ('${D[COMPANY]}')"
+  elif [[ "$co" != "${D[COMPANY]}" ]]; then
+    die "this database belongs to company '$co', desired state says '${D[COMPANY]}'"
+  fi
+}
+
+# Operator seed (principals, accounts, memberships, the disposable task): a reviewed SQL file that
+# Dan's named people come from. Runs as the owner in one transaction; seeds must be re-runnable.
+cmd_seed() {
+  need_root; load_desired "$ETC_DIR/desired.env"
+  local f="${1:-}"; [[ -f "$f" ]] || die "seed <file.sql>"
+  { echo "BEGIN;"; echo "SET LOCAL ROLE fleet_owner;"; cat "$f"; echo "COMMIT;"; } | psql_su -d "${D[DB_NAME]}"
+  say "seeded from $f"
+}
+
+write_dsn() {  # the gate/worker read a root-only libpq conninfo file, never an inline DSN
+  local role="$1" tmp
+  tmp="$(mktemp "$ETC_DIR/.dsn.XXXXXX")"
+  printf 'host=127.0.0.1 port=5432 dbname=%s user=%s connect_timeout=2 password=%s\n' \
+    "${D[DB_NAME]}" "$role" "$(cat "$ETC_DIR/$role.password")" >"$tmp"
+  chmod 0600 "$tmp"; mv -f "$tmp" "$ETC_DIR/$role.dsn"
+}
+
+set_password() {
+  local role="$1" pw tmp
+  [[ "$role" =~ ^fleet_(gate|worker)$ ]] || die "role must be fleet_gate or fleet_worker"
+  pw="$(head -c 32 /dev/urandom | base64 | tr -d '/+=\n' | head -c 40)"
+  tmp="$(mktemp "$ETC_DIR/.pw.XXXXXX")"; printf '%s' "$pw" >"$tmp"; chmod 0600 "$tmp"
+  # The password goes to psql on stdin, never argv.
+  printf "ALTER ROLE %s PASSWORD '%s';\n" "$role" "$pw" | psql_su -d postgres >/dev/null
+  mv -f "$tmp" "$ETC_DIR/$role.password"; unset pw
+  say "password for $role set ($ETC_DIR/$role.password, root 0600)"
+}
+
+# ------------------------------------------------------------------ status / health
+cmd_status() {
+  need_root; load_desired "$ETC_DIR/desired.env"
+  local json=0; [[ "${1:-}" == --json ]] && json=1
+  local ok=1 reasons=() active ver arch_last arch_fail age last_full last_backup_age
+  active="$(systemctl is-active "$UNIT" 2>/dev/null || true)"
+  [[ "$active" == active ]] || { ok=0; reasons+=("postgres $active"); }
+  ver="$(as_pg psql -X -At -c 'show server_version' 2>/dev/null || echo unknown)"
+  # RPO probe. "Seconds since the last archive" false-alarms on an idle database, so instead:
+  # if the current WAL segment holds changes not yet in the bucket, switch segments now and
+  # require that segment to reach the bucket within 90 s. An idle database switches nothing.
+  local q cur last failed_after age=0
+  q="select pg_walfile_name(pg_current_wal_lsn()), coalesce(last_archived_wal,''),
+            (coalesce(last_failed_time,'-infinity') > coalesce(last_archived_time,'-infinity'))::int, failed_count
+     from pg_stat_archiver"
+  if read -r cur last failed_after arch_fail < <(as_pg psql -X -At -F' ' -d postgres -c "$q" 2>/dev/null); then
+    if [[ "$cur" > "$last" ]]; then
+      local want t0; t0=$(date +%s)
+      want="$(as_pg psql -X -At -d postgres -c "select pg_walfile_name(pg_switch_wal())")"
+      while :; do
+        last="$(as_pg psql -X -At -d postgres -c "select coalesce(last_archived_wal,'') from pg_stat_archiver")"
+        [[ ! "$want" > "$last" ]] && break
+        age=$(( $(date +%s) - t0 ))
+        (( age < 90 )) || { ok=0; reasons+=("WAL $want not archived after ${age}s"); break; }
+        sleep 2
+      done
+      age=$(( $(date +%s) - t0 ))
+    fi
+    [[ "$failed_after" == 0 ]] || { ok=0; reasons+=("archiver failing (last failure after last success)"); }
+  else
+    ok=0; reasons+=("archiver status unreadable"); arch_fail=0
+  fi
+  last_backup_age="$(pgbr info --output=json 2>/dev/null | python3 -c '
+import json,sys,time
+d=json.load(sys.stdin); b=d[0].get("backup",[]) if d else []
+print(int(time.time()-max(x["timestamp"]["stop"] for x in b)) if b else 999999)' 2>/dev/null || echo 999999)"
+  (( last_backup_age <= 8*86400 )) || { ok=0; reasons+=("last backup ${last_backup_age}s ago"); }
+  local doc
+  doc="$(printf '{"company":"%s","postgres":"%s","server_version":"%s","archive_age_s":%s,"archive_failed_total":%s,"last_backup_age_s":%s,"healthy":%s,"reasons":"%s","at":"%s"}' \
+    "${D[COMPANY]}" "$active" "$ver" "$age" "${arch_fail:-0}" "$last_backup_age" \
+    "$([[ $ok == 1 ]] && echo true || echo false)" "${reasons[*]:-}" "$(date -u +%FT%TZ)")"
+  printf '%s\n' "$doc" >"$STATE_DIR/health.json.tmp" && mv -f "$STATE_DIR/health.json.tmp" "$STATE_DIR/health.json"
+  chmod 0644 "$STATE_DIR/health.json"
+  if [[ $json == 1 ]]; then printf '%s\n' "$doc"; else
+    say "company=${D[COMPANY]} postgres=$active version=$ver archive_age=${age}s last_backup=${last_backup_age}s healthy=$ok ${reasons[*]:-}"
+  fi
+  [[ $ok == 1 ]]
+}
+
+cmd_backup() {
+  need_root; load_desired "$ETC_DIR/desired.env"
+  case "${1:-}" in full|diff) ;; *) die "backup full|diff" ;; esac
+  pgbr --type="$1" backup
+}
+
+# ------------------------------------------------------------------ drill restore (fresh host)
+cmd_drill_restore() {
+  need_root
+  local desired="" target="" latest=0
+  while [[ $# -gt 0 ]]; do case "$1" in
+    --desired) desired="$2"; shift 2 ;; --target) target="$2"; shift 2 ;; --latest) latest=1; shift ;;
+    *) die "unknown arg $1" ;; esac; done
+  [[ -n "$desired" ]] || die "--desired required"
+  [[ -n "$target" || $latest == 1 ]] || die "--target <timestamp> or --latest"
+  [[ -z "$target" || "$target" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(\+00|Z)?$ ]] || die "target like '2026-11-15 17:00:00+00'"
+  load_desired "$desired"
+  if systemctl is-active -q "$UNIT" 2>/dev/null || [[ -f "$PGDATA/PG_VERSION" ]]; then
+    die "drill-restore runs only on a fresh host (a cluster already exists here)"
+  fi
+  install -d -m 0755 /etc/postgresql-common/createcluster.d
+  printf 'create_main_cluster = false\n' >/etc/postgresql-common/createcluster.d/50-fleet-company-db.conf
+  if ! dpkg -s "postgresql-$PG_MAJOR" pgbackrest >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "postgresql-$PG_MAJOR" pgbackrest >/dev/null
+  fi
+  install -d -m 0750 -o postgres -g postgres /var/spool/pgbackrest /var/log/pgbackrest "$STATE_DIR"
+  install -d -m 0755 /etc/pgbackrest
+  if [[ -n "${D[S3_CA_FILE]:-}" ]]; then D[S3_CA_LINE]="repo1-storage-ca-file=${D[S3_CA_FILE]}"; else D[S3_CA_LINE]="# repo1-storage-ca-file: system CAs"; fi
+  render "$PAYLOAD/templates/pgbackrest.conf" "$PGBR_CONF" 0640 root:postgres || true
+  materialize_secrets
+  pg_createcluster "$PG_MAJOR" main --start-conf=manual >/dev/null   # registers config; --delta restores over it
+  # A drill must never push WAL into the production repo: archive-mode=off on the restored copy.
+  local t0 t1 opts=(--archive-mode=off --delta)
+  if [[ $latest == 1 ]]; then opts+=(--type=default); else opts+=(--type=time "--target=$target" --target-action=promote); fi
+  t0=$(date +%s)
+  pgbr "${opts[@]}" restore
+  install -d -m 0755 -o postgres -g postgres "$PGCONF_DIR/conf.d"
+  render "$PAYLOAD/templates/postgresql-fleet.conf" "$PGCONF_DIR/conf.d/50-fleet-company-db.conf" 0644 postgres:postgres || true
+  # The drill copy archives nothing: override after the fleet conf.
+  printf "archive_mode = off\narchive_command = ''\n" >"$PGCONF_DIR/conf.d/99-drill-no-archive.conf"
+  chown postgres:postgres "$PGCONF_DIR/conf.d/99-drill-no-archive.conf"
+  systemctl daemon-reload; systemctl start "$UNIT"; wait_ready
+  local i
+  for i in $(seq 1 300); do
+    [[ "$(as_pg psql -X -At -c 'select pg_is_in_recovery()')" == f ]] && break; sleep 1
+  done
+  [[ "$(as_pg psql -X -At -c 'select pg_is_in_recovery()')" == f ]] || die "restore did not finish recovery"
+  t1=$(date +%s)
+  say "restored in $((t1 - t0))s; company=$(as_pg psql -X -At -d "${D[DB_NAME]}" -c 'select id from fleet.company')"
+  printf '{"restore_seconds":%s,"target":"%s"}\n' "$((t1 - t0))" "${target:-latest}" >"$STATE_DIR/drill.json"
+}
+
+main() {
+  local c="${1:-}"; shift || true
+  case "$c" in
+    install) cmd_install "$@" ;;
+    migrate) cmd_migrate "$@" ;;
+    status) cmd_status "$@" ;;
+    backup) cmd_backup "$@" ;;
+    drill-restore) cmd_drill_restore "$@" ;;
+    set-password) need_root; [[ -f "$ETC_DIR/desired.env" ]] && load_desired "$ETC_DIR/desired.env"
+                  set_password "${1:-}"; [[ -n "${D[DB_NAME]:-}" ]] && write_dsn "${1}" ;;
+    seed) cmd_seed "$@" ;;
+    *) sed -n '2,13p' "$0"; exit 2 ;;
+  esac
+}
+main "$@"

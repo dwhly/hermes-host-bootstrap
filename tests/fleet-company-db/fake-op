@@ -1,0 +1,11 @@
+#!/bin/sh
+# Fake 1Password CLI for the prototype: `op read op://vault/item/field` returns the file
+# /etc/fake-op/<vault>__<item>__<field>, and only when a service-account token is exported
+# (proves the installer passes the node's token through, as on h-af/h-btp).
+[ "$1" = read ] || { echo "fake op: only 'read' is supported" >&2; exit 2; }
+[ -n "$OP_SERVICE_ACCOUNT_TOKEN" ] || { echo "fake op: not signed in" >&2; exit 1; }
+[ "$OP_SERVICE_ACCOUNT_TOKEN" = "$(cat /etc/fake-op/.token 2>/dev/null)" ] || { echo "fake op: bad token" >&2; exit 1; }
+ref="${2#op://}"
+f="/etc/fake-op/$(printf '%s' "$ref" | sed 's#/#__#g')"
+[ -f "$f" ] || { echo "fake op: no item for $2" >&2; exit 1; }
+cat "$f"

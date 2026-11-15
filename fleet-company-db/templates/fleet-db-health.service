@@ -1,0 +1,8 @@
+[Unit]
+Description=fleet-company-db health (archiver RPO probe, last backup age)
+After=postgresql@16-main.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fleet-company-db status
+MemoryMax=100M
