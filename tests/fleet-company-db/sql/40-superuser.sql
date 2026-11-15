@@ -19,7 +19,9 @@ DO $$ BEGIN
   ASSERT (SELECT count(*) FROM fleet.job_events WHERE event = 'dead') = 1;
   ASSERT (SELECT actor_principal IS NULL AND detail->>'claimed_actor' = '00000000-0000-4000-8000-0000000000ff'
           FROM fleet.audit WHERE request_id = 'req-denied-00001'), 'unknown actor kept only as a claim';
-  ASSERT (SELECT count(*) FROM fleet.audit WHERE action = 'task.update' AND outcome = 'ok') = 3;
+  ASSERT (SELECT count(*) FROM fleet.audit WHERE action = 'task.update' AND outcome = 'ok' AND origin = 'db') = 4;  -- 3 in 10-gate + 1 in 35
+  ASSERT NOT EXISTS (SELECT 1 FROM fleet.audit WHERE origin = 'gate' AND outcome = 'ok'), 'no gate-reported success';
+  ASSERT (SELECT origin FROM fleet.audit WHERE request_id = 'req-denied-00001') = 'gate';
   ASSERT NOT has_table_privilege('fleet_gate', 'fleet.tasks', 'UPDATE');
   ASSERT NOT has_table_privilege('fleet_gate', 'fleet.task_history', 'INSERT');
   ASSERT NOT has_table_privilege('fleet_gate', 'fleet.tasks', 'TRUNCATE');

@@ -101,48 +101,81 @@ render() {  # render <template> <dest> <mode> <owner>: replaces @@KEY@@ from D[]
   mv -f "$tmp" "$dest"; return 0
 }
 
+put_file() {  # put_file <content> <dest> <mode> <owner>: atomic, and only when the content differs
+  local content="$1" dest="$2" mode="$3" owner="$4" tmp
+  if [[ -f "$dest" ]] && [[ "$(cat "$dest")" == "$content" ]]; then
+    [[ "$(stat -c '%a %U:%G' "$dest")" == "${mode#0} $owner" ]] || { chmod "$mode" "$dest"; chown "$owner" "$dest"; }
+    return 1
+  fi
+  tmp="$(mktemp "$(dirname "$dest")/.fcdb.XXXXXX")"
+  printf '%s\n' "$content" >"$tmp"; chmod "$mode" "$tmp"; chown "$owner" "$tmp"
+  mv -f "$tmp" "$dest"; return 0
+}
+
 # ------------------------------------------------------------------ secrets
 secrets_present() {
   [[ -f "$PGBR_SECRETS" ]] && grep -q '^repo1-s3-key=' "$PGBR_SECRETS" \
     && grep -q '^repo1-s3-key-secret=' "$PGBR_SECRETS" && grep -q '^repo1-cipher-pass=' "$PGBR_SECRETS"
 }
 materialize_secrets() {
+  # Resolved from 1Password on EVERY run, so a rotated or corrected bucket key takes effect; rewritten only when
+  # it differs. If 1Password is unreachable but a working file exists, keep it (warn) instead of breaking a node.
   install -d -m 0750 -o root -g postgres /etc/pgbackrest/conf.d
-  if secrets_present; then return 0; fi
-  [[ "${D[SECRETS_SOURCE]}" == 1password ]] || hold "backup secrets missing at $PGBR_SECRETS (SECRETS_SOURCE=file): owner step pending"
-  command -v op >/dev/null || hold "1Password CLI missing; cannot resolve backup secrets"
+  local why=""
+  [[ "${D[SECRETS_SOURCE]}" == 1password ]] || {
+    secrets_present && return 0
+    hold "backup secrets missing at $PGBR_SECRETS (SECRETS_SOURCE=file): owner step pending"; }
+  command -v op >/dev/null || why="1Password CLI missing; cannot resolve backup secrets"
   local r
   for r in OP_REF_S3_KEY OP_REF_S3_KEY_SECRET OP_REF_CIPHER_PASS; do
     [[ "${D[$r]:-}" =~ ^op://[A-Za-z0-9\ ._-]+/[A-Za-z0-9\ ._-]+/[A-Za-z0-9\ ._-]+$ ]] || die "$r must be op://vault/item/field"
   done
-  # The node's existing read-only 1Password service account. Only the token is read; an env
-  # file is never sourced (it holds other secrets).
-  if [[ -n "${D[OP_TOKEN_FILE]:-}" ]]; then
-    [[ -f "${D[OP_TOKEN_FILE]}" ]] || hold "1Password service-account token file ${D[OP_TOKEN_FILE]} missing"
-    local tok
-    case "${D[OP_TOKEN_FORMAT]:-raw}" in
-      raw) tok="$(head -n1 "${D[OP_TOKEN_FILE]}")" ;;
-      env) tok="$(grep -m1 '^OP_SERVICE_ACCOUNT_TOKEN=' "${D[OP_TOKEN_FILE]}" | cut -d= -f2-)"
-           tok="${tok%\"}"; tok="${tok#\"}"; tok="${tok%\'}"; tok="${tok#\'}" ;;
-      *) die "OP_TOKEN_FORMAT must be raw or env" ;;
-    esac
-    [[ -n "$tok" ]] || hold "no service-account token in ${D[OP_TOKEN_FILE]}"
-    export OP_SERVICE_ACCOUNT_TOKEN="$tok"; unset tok
+  # The node's existing read-only 1Password service account. Only the token is read; an env file is never
+  # sourced (it holds other secrets). The token is never exported: it goes only into the environment of each
+  # `op read` below (VAR=value cmd, not argv), so no later child (pgBackRest, psql) inherits it.
+  local OPTOK="${OP_SERVICE_ACCOUNT_TOKEN:-}"
+  unset OP_SERVICE_ACCOUNT_TOKEN
+  if [[ -z "$why" && -n "${D[OP_TOKEN_FILE]:-}" ]]; then
+    if [[ ! -f "${D[OP_TOKEN_FILE]}" ]]; then why="1Password service-account token file ${D[OP_TOKEN_FILE]} missing"
+    else
+      case "${D[OP_TOKEN_FORMAT]:-raw}" in
+        raw) OPTOK="$(head -n1 "${D[OP_TOKEN_FILE]}")" ;;
+        env) OPTOK="$(grep -m1 '^OP_SERVICE_ACCOUNT_TOKEN=' "${D[OP_TOKEN_FILE]}" | cut -d= -f2-)"
+             OPTOK="${OPTOK%\"}"; OPTOK="${OPTOK#\"}"; OPTOK="${OPTOK%\'}"; OPTOK="${OPTOK#\'}" ;;
+        *) die "OP_TOKEN_FORMAT must be raw or env" ;;
+      esac
+      [[ -n "$OPTOK" ]] || why="no service-account token in ${D[OP_TOKEN_FILE]}"
+    fi
   fi
-  local tmp k ks c
+  local k="" ks="" c=""
+  if [[ -z "$why" ]]; then
+    k="$(OP_SERVICE_ACCOUNT_TOKEN="$OPTOK" op read "${D[OP_REF_S3_KEY]}" 2>/dev/null)" \
+      || why="op read ${D[OP_REF_S3_KEY]} failed (owner step: item missing or service account lacks access)"
+  fi
+  [[ -z "$why" ]] && { ks="$(OP_SERVICE_ACCOUNT_TOKEN="$OPTOK" op read "${D[OP_REF_S3_KEY_SECRET]}" 2>/dev/null)" || why="op read ${D[OP_REF_S3_KEY_SECRET]} failed"; }
+  [[ -z "$why" ]] && { c="$(OP_SERVICE_ACCOUNT_TOKEN="$OPTOK" op read "${D[OP_REF_CIPHER_PASS]}" 2>/dev/null)" || why="op read ${D[OP_REF_CIPHER_PASS]} failed"; }
+  unset OPTOK
+  [[ -n "$why" || ( -n "$k" && -n "$ks" && ${#c} -ge 32 ) ]] || why="backup secrets empty or cipher passphrase shorter than 32 chars"
+  if [[ -n "$why" ]]; then
+    unset k ks c
+    if secrets_present; then say "WARNING: $why; keeping the existing $PGBR_SECRETS"; return 0; fi
+    hold "$why"
+  fi
+  [[ "$k$ks$c" != *$'\n'* ]] || die "a backup secret contains a newline"
+  # The cipher passphrase encrypts every backup already in the bucket: a change is a reviewed rotation
+  # (new stanza/repo), never a silent rewrite that would make the existing backups unreadable.
+  if secrets_present && [[ "$(grep -m1 '^repo1-cipher-pass=' "$PGBR_SECRETS" | cut -d= -f2-)" != "$c" ]] \
+     && [[ -f "$STATE_DIR/installed-at" ]]; then
+    unset k ks c; die "the backup cipher passphrase in 1Password differs from the one in use; rotation is a reviewed procedure"
+  fi
+  local tmp
   tmp="$(mktemp /etc/pgbackrest/conf.d/.secrets.XXXXXX)"
-  {
-    echo "# written by fleet-company-db from 1Password; do not edit by hand"
-    echo "[global]"
-  } >"$tmp"
-  k="$(op read "${D[OP_REF_S3_KEY]}" 2>/dev/null)" || { rm -f "$tmp"; hold "op read ${D[OP_REF_S3_KEY]} failed (owner step: item missing or service account lacks access)"; }
-  ks="$(op read "${D[OP_REF_S3_KEY_SECRET]}" 2>/dev/null)" || { rm -f "$tmp"; hold "op read ${D[OP_REF_S3_KEY_SECRET]} failed"; }
-  c="$(op read "${D[OP_REF_CIPHER_PASS]}" 2>/dev/null)" || { rm -f "$tmp"; hold "op read ${D[OP_REF_CIPHER_PASS]} failed"; }
-  [[ -n "$k" && -n "$ks" && ${#c} -ge 32 ]] || { rm -f "$tmp"; hold "backup secrets empty or cipher passphrase shorter than 32 chars"; }
-  [[ "$k$ks$c" != *$'\n'* ]] || { rm -f "$tmp"; die "a backup secret contains a newline"; }
-  printf 'repo1-s3-key=%s\nrepo1-s3-key-secret=%s\nrepo1-cipher-pass=%s\n' "$k" "$ks" "$c" >>"$tmp"
+  { echo "# written by fleet-company-db from 1Password; do not edit by hand"; echo "[global]"
+    printf 'repo1-s3-key=%s\nrepo1-s3-key-secret=%s\nrepo1-cipher-pass=%s\n' "$k" "$ks" "$c"; } >"$tmp"
   unset k ks c
-  chmod 0640 "$tmp"; chown root:postgres "$tmp"; mv -f "$tmp" "$PGBR_SECRETS"
+  chmod 0640 "$tmp"; chown root:postgres "$tmp"
+  if [[ -f "$PGBR_SECRETS" ]] && cmp -s "$tmp" "$PGBR_SECRETS"; then rm -f "$tmp"; return 0; fi
+  mv -f "$tmp" "$PGBR_SECRETS"; say "backup secrets (re)written from 1Password"
 }
 
 pgbr() { as_pg pgbackrest --stanza="${D[STANZA]}" "$@"; }
@@ -154,13 +187,15 @@ cmd_install() {
   while [[ $# -gt 0 ]]; do case "$1" in --desired) desired="$2"; shift 2 ;; *) die "unknown arg $1" ;; esac; done
   [[ -n "$desired" ]] || die "--desired <file> required"
   load_desired "$desired"
+  # The owner's "roll it out" is a reviewed ROLLOUT=go in this host's desired file; checked here too, not
+  # only by the bootstrap module, so a direct run of this command can't install a held node.
+  [[ "${D[ROLLOUT]:-}" == go ]] || hold "ROLLOUT is not go in $desired (held for the owner's roll-out); nothing changed"
   . /etc/os-release
   [[ "$ID" == ubuntu && "$VERSION_ID" == 24.04 ]] || die "supported on Ubuntu 24.04 only (found $ID $VERSION_ID)"
 
   # 1. Packages, without letting the package auto-create a cluster that has no archiving.
   install -d -m 0755 /etc/postgresql-common/createcluster.d
-  printf 'create_main_cluster = false\n' >/etc/postgresql-common/createcluster.d/50-fleet-company-db.conf
-  chmod 0644 /etc/postgresql-common/createcluster.d/50-fleet-company-db.conf
+  put_file 'create_main_cluster = false' /etc/postgresql-common/createcluster.d/50-fleet-company-db.conf 0644 root:root || true
   if ! dpkg -s "postgresql-$PG_MAJOR" pgbackrest >/dev/null 2>&1; then
     say "installing postgresql-$PG_MAJOR + pgbackrest (Ubuntu archive)"
     apt-get update -q >/dev/null
@@ -170,7 +205,7 @@ cmd_install() {
   install -d -m 0755 "$ETC_DIR"; install -d -m 0750 -o postgres -g postgres "$STATE_DIR"
   install -d -m 0750 -o postgres -g postgres /var/spool/pgbackrest /var/log/pgbackrest
   install -d -m 0755 /etc/pgbackrest
-  install -m 0644 "$desired" "$ETC_DIR/desired.env"
+  put_file "$(cat "$desired")" "$ETC_DIR/desired.env" 0644 root:root || true
 
   # 2. pgBackRest config + secrets. HOLD (exit 3) here leaves no cluster behind.
   if [[ -n "${D[S3_CA_FILE]:-}" ]]; then D[S3_CA_LINE]="repo1-storage-ca-file=${D[S3_CA_FILE]}"; else D[S3_CA_LINE]="# repo1-storage-ca-file: system CAs"; fi
@@ -196,6 +231,7 @@ cmd_install() {
   render "$PAYLOAD/templates/fleet-db-health.service" /etc/systemd/system/fleet-db-health.service 0644 root:root || true
   render "$PAYLOAD/templates/fleet-db-health.timer" /etc/systemd/system/fleet-db-health.timer 0644 root:root || true
   systemctl daemon-reload
+  put_file 'auto' "$PGCONF_DIR/start.conf" 0644 postgres:postgres || true
   systemctl enable "$UNIT" >/dev/null 2>&1 || true
   if [[ $created == 1 ]] || ! systemctl is-active -q "$UNIT"; then
     systemctl start "$UNIT"
@@ -212,12 +248,12 @@ cmd_install() {
   # 4. Stanza + check (fail-closed: archiving must work before any data lands).
   pgbr stanza-create >/dev/null 2>&1 || pgbr stanza-upgrade >/dev/null 2>&1 || true
   if ! pgbr check >/dev/null 2>"$STATE_DIR/check.err"; then
-    systemctl stop "$UNIT"
-    die "pgbackrest check failed; cluster stopped so no unarchived data accumulates (see $STATE_DIR/check.err)"
+    fail_closed "pgbackrest check failed (see $STATE_DIR/check.err)"
   fi
   # 5. First full backup, once.
   if ! pgbr info --output=json | grep -q '"type":"full"'; then
-    say "first full backup"; pgbr --type=full backup >/dev/null
+    say "first full backup"
+    pgbr --type=full backup >/dev/null 2>"$STATE_DIR/backup.err" || fail_closed "first full backup failed (see $STATE_DIR/backup.err)"
   fi
   # 6. Schema, roles, company row.
   cmd_migrate_inner
@@ -225,8 +261,26 @@ cmd_install() {
   local r
   for r in fleet_gate fleet_worker; do [[ -f "$ETC_DIR/$r.password" ]] || set_password "$r"; write_dsn "$r"; done
   systemctl enable --now fleet-db-backup-full.timer fleet-db-backup-diff.timer fleet-db-health.timer >/dev/null 2>&1
-  date -u +%FT%TZ >"$STATE_DIR/installed-at"
+  [[ -f "$STATE_DIR/installed-at" ]] || date -u +%FT%TZ >"$STATE_DIR/installed-at"
   say "installed: company=${D[COMPANY]} stanza=${D[STANZA]} pg=$(as_pg psql -X -At -c 'show server_version')"
+}
+
+# No database runs without working backups.
+#  - First install (never completed): stop AND disable the cluster, so neither a reboot nor a timer
+#    (the backup units are Requisite=, never Requires=) brings it back; there is no schema yet anyway.
+#  - A node that was installed before: close the write fence (reads continue, every write gets FG503)
+#    until the health probe sees WAL reach the bucket again.
+fail_closed() {
+  if [[ -f "$STATE_DIR/installed-at" ]]; then
+    as_pg psql -X -q -d "${D[DB_NAME]}" -c "select fleet.set_write_fence(true, 'install: $1')" >/dev/null 2>&1 || true
+    die "$1; record closed for writes (write fence) until backups work again"
+  fi
+  systemctl disable --now "$UNIT" >/dev/null 2>&1 || true
+  # postgresql-common's systemd generator starts every start.conf=auto cluster at boot, enabled or not
+  # (it shows as enabled-runtime); manual + daemon-reload drops that link now and at every boot.
+  [[ -d "$PGCONF_DIR" ]] && { printf 'manual\n' >"$PGCONF_DIR/start.conf"; chmod 0644 "$PGCONF_DIR/start.conf"; chown postgres:postgres "$PGCONF_DIR/start.conf"; }
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  die "$1; first install not completed: cluster stopped and disabled (re-run install after fixing)"
 }
 
 wait_ready() {
@@ -251,6 +305,8 @@ CREATE SCHEMA IF NOT EXISTS fleet_meta AUTHORIZATION postgres;
 REVOKE ALL ON SCHEMA fleet_meta FROM PUBLIC;
 CREATE TABLE IF NOT EXISTS fleet_meta.schema_migrations (
   version text PRIMARY KEY, sha256 text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now());
+-- Before any migration: nothing fleet_owner creates is ever PUBLIC-executable (global default).
+ALTER DEFAULT PRIVILEGES FOR ROLE fleet_owner REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 SQL
   local f v sum have
   for f in "$PAYLOAD"/migrations/[0-9][0-9][0-9][0-9]_*.sql; do
@@ -261,11 +317,14 @@ SQL
       continue
     fi
     say "applying migration $v"
+    # One transaction: the migration (as the owner), its version row, and the grants. An interrupted run
+    # commits nothing, so no new object is ever live without its privileges.
     { echo "BEGIN;"; echo "SET LOCAL ROLE fleet_owner;"; cat "$f"; echo "RESET ROLE;";
-      echo "INSERT INTO fleet_meta.schema_migrations(version, sha256) VALUES ('$v', '$sum');"; echo "COMMIT;"; } \
+      echo "INSERT INTO fleet_meta.schema_migrations(version, sha256) VALUES ('$v', '$sum');"
+      cat "$PAYLOAD/sql/roles-and-grants.sql"; echo "COMMIT;"; } \
       | psql_su -d "${D[DB_NAME]}"
   done
-  psql_su -d "${D[DB_NAME]}" -f "$PAYLOAD/sql/roles-and-grants.sql"
+  psql_su -d "${D[DB_NAME]}" -1 -f "$PAYLOAD/sql/roles-and-grants.sql"
   local co
   co="$(as_pg psql -X -At -d "${D[DB_NAME]}" -c "select id from fleet.company")"
   if [[ -z "$co" ]]; then
@@ -284,32 +343,44 @@ cmd_seed() {
   say "seeded from $f"
 }
 
-write_dsn() {  # the gate/worker read a root-only libpq conninfo file, never an inline DSN
-  local role="$1" tmp
-  tmp="$(mktemp "$ETC_DIR/.dsn.XXXXXX")"
-  printf 'host=127.0.0.1 port=5432 dbname=%s user=%s connect_timeout=2 password=%s\n' \
-    "${D[DB_NAME]}" "$role" "$(cat "$ETC_DIR/$role.password")" >"$tmp"
-  chmod 0600 "$tmp"; mv -f "$tmp" "$ETC_DIR/$role.dsn"
+write_dsn() {  # the gate/worker read a root-only libpq conninfo file, never an inline DSN; rewritten only on change
+  local role="$1"
+  put_file "$(printf 'host=127.0.0.1 port=5432 dbname=%s user=%s connect_timeout=2 password=%s' \
+    "${D[DB_NAME]}" "$role" "$(cat "$ETC_DIR/$role.password")")" "$ETC_DIR/$role.dsn" 0600 root:root || true
+}
+
+# SCRAM-SHA-256 verifier computed here, so the server only ever sees the verifier (a slow or logged
+# ALTER ROLE can't leak the password). Same format as psql's \password; input is ASCII (no SASLprep needed).
+scram_verifier() {
+  python3 -c '
+import base64, hashlib, hmac, os, sys
+pw = sys.stdin.buffer.read(); salt = os.urandom(16); it = 4096
+salted = hashlib.pbkdf2_hmac("sha256", pw, salt, it)
+ck = hmac.new(salted, b"Client Key", "sha256").digest(); sk = hmac.new(salted, b"Server Key", "sha256").digest()
+b = lambda x: base64.b64encode(x).decode()
+print("SCRAM-SHA-256$%d:%s$%s:%s" % (it, b(salt), b(hashlib.sha256(ck).digest()), b(sk)))'
 }
 
 set_password() {
-  local role="$1" pw tmp
+  local role="$1" pw tmp ver
   [[ "$role" =~ ^fleet_(gate|worker)$ ]] || die "role must be fleet_gate or fleet_worker"
   pw="$(head -c 32 /dev/urandom | base64 | tr -d '/+=\n' | head -c 40)"
+  [[ "$pw" =~ ^[A-Za-z0-9]{40}$ ]] || die "password generation failed"
   tmp="$(mktemp "$ETC_DIR/.pw.XXXXXX")"; printf '%s' "$pw" >"$tmp"; chmod 0600 "$tmp"
-  # The password goes to psql on stdin, never argv.
-  printf "ALTER ROLE %s PASSWORD '%s';\n" "$role" "$pw" | psql_su -d postgres >/dev/null
-  mv -f "$tmp" "$ETC_DIR/$role.password"; unset pw
-  say "password for $role set ($ETC_DIR/$role.password, root 0600)"
+  ver="$(printf '%s' "$pw" | scram_verifier)"; unset pw
+  [[ "$ver" =~ ^SCRAM-SHA-256\$4096:[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$ ]] || { rm -f "$tmp"; die "SCRAM verifier failed"; }
+  printf "ALTER ROLE %s PASSWORD '%s';\n" "$role" "$ver" | psql_su -d postgres >/dev/null
+  mv -f "$tmp" "$ETC_DIR/$role.password"
+  say "password for $role set ($ETC_DIR/$role.password, root 0600; server got only the SCRAM verifier)"
 }
 
 # ------------------------------------------------------------------ status / health
 cmd_status() {
   need_root; load_desired "$ETC_DIR/desired.env"
   local json=0; [[ "${1:-}" == --json ]] && json=1
-  local ok=1 reasons=() active ver arch_last arch_fail age last_full last_backup_age
+  local ok=1 arch_ok=1 reasons=() active ver arch_fail
   active="$(systemctl is-active "$UNIT" 2>/dev/null || true)"
-  [[ "$active" == active ]] || { ok=0; reasons+=("postgres $active"); }
+  [[ "$active" == active ]] || { ok=0; arch_ok=0; reasons+=("postgres $active"); }
   ver="$(as_pg psql -X -At -c 'show server_version' 2>/dev/null || echo unknown)"
   # RPO probe. "Seconds since the last archive" false-alarms on an idle database, so instead:
   # if the current WAL segment holds changes not yet in the bucket, switch segments now and
@@ -326,28 +397,42 @@ cmd_status() {
         last="$(as_pg psql -X -At -d postgres -c "select coalesce(last_archived_wal,'') from pg_stat_archiver")"
         [[ ! "$want" > "$last" ]] && break
         age=$(( $(date +%s) - t0 ))
-        (( age < 90 )) || { ok=0; reasons+=("WAL $want not archived after ${age}s"); break; }
+        (( age < 90 )) || { arch_ok=0; reasons+=("WAL $want not archived after ${age}s"); break; }
         sleep 2
       done
       age=$(( $(date +%s) - t0 ))
+      # Re-read after the wait: a recovery during it must not leave a stale failure verdict.
+      failed_after="$(as_pg psql -X -At -d postgres -c "select (coalesce(last_failed_time,'-infinity') > coalesce(last_archived_time,'-infinity'))::int from pg_stat_archiver")"
     fi
-    [[ "$failed_after" == 0 ]] || { ok=0; reasons+=("archiver failing (last failure after last success)"); }
+    [[ "$failed_after" == 0 ]] || { arch_ok=0; reasons+=("archiver failing (last failure after last success)"); }
   else
-    ok=0; reasons+=("archiver status unreadable"); arch_fail=0
+    arch_ok=0; reasons+=("archiver status unreadable"); arch_fail=0
   fi
-  last_backup_age="$(pgbr info --output=json 2>/dev/null | python3 -c '
+  [[ $arch_ok == 1 ]] || ok=0
+  # The write fence follows the archive verdict (installed nodes only; a drill copy has none of this).
+  if [[ "$active" == active && -f "$STATE_DIR/installed-at" ]]; then
+    if [[ $arch_ok == 1 ]]; then
+      as_pg psql -X -q -d "${D[DB_NAME]}" -c "select fleet.set_write_fence(false, 'health: WAL reaching the bucket')" >/dev/null 2>&1 || true
+    else
+      as_pg psql -X -q -d "${D[DB_NAME]}" -c "select fleet.set_write_fence(true, 'health: WAL not reaching the bucket')" >/dev/null 2>&1 \
+        || reasons+=("could not close the write fence")
+    fi
+  fi
+  local last_backup_age
+  last_backup_age="$(timeout 30 runuser -u postgres -- pgbackrest --stanza="${D[STANZA]}" --io-timeout=10 info --output=json 2>/dev/null | python3 -c '
 import json,sys,time
 d=json.load(sys.stdin); b=d[0].get("backup",[]) if d else []
 print(int(time.time()-max(x["timestamp"]["stop"] for x in b)) if b else 999999)' 2>/dev/null || echo 999999)"
   (( last_backup_age <= 8*86400 )) || { ok=0; reasons+=("last backup ${last_backup_age}s ago"); }
-  local doc
-  doc="$(printf '{"company":"%s","postgres":"%s","server_version":"%s","archive_age_s":%s,"archive_failed_total":%s,"last_backup_age_s":%s,"healthy":%s,"reasons":"%s","at":"%s"}' \
-    "${D[COMPANY]}" "$active" "$ver" "$age" "${arch_fail:-0}" "$last_backup_age" \
+  local doc fence
+  fence="$(as_pg psql -X -At -d "${D[DB_NAME]}" -c "select case when closed then 'closed' else 'open' end from fleet.write_fence" 2>/dev/null || echo unknown)"
+  doc="$(printf '{"company":"%s","postgres":"%s","server_version":"%s","archive_age_s":%s,"archive_failed_total":%s,"last_backup_age_s":%s,"writes":"%s","healthy":%s,"reasons":"%s","at":"%s"}' \
+    "${D[COMPANY]}" "$active" "$ver" "$age" "${arch_fail:-0}" "$last_backup_age" "$fence" \
     "$([[ $ok == 1 ]] && echo true || echo false)" "${reasons[*]:-}" "$(date -u +%FT%TZ)")"
   printf '%s\n' "$doc" >"$STATE_DIR/health.json.tmp" && mv -f "$STATE_DIR/health.json.tmp" "$STATE_DIR/health.json"
   chmod 0644 "$STATE_DIR/health.json"
   if [[ $json == 1 ]]; then printf '%s\n' "$doc"; else
-    say "company=${D[COMPANY]} postgres=$active version=$ver archive_age=${age}s last_backup=${last_backup_age}s healthy=$ok ${reasons[*]:-}"
+    say "company=${D[COMPANY]} postgres=$active version=$ver archive_age=${age}s last_backup=${last_backup_age}s writes=$fence healthy=$ok ${reasons[*]:-}"
   fi
   [[ $ok == 1 ]]
 }

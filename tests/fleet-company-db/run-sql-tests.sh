@@ -46,5 +46,6 @@ skip_test() {
 }
 skip_test
 run_as fleet_worker "$HERE/sql/30-worker-lease.sql"
+run_as postgres     "$HERE/sql/35-recovery-and-fence.sql"
 run_as postgres     "$HERE/sql/40-superuser.sql"
 exit $fail

@@ -106,4 +106,41 @@ SELECT fleet.job_enqueue('amforge', 'lease', NULL, '{"n":3}', 'idem-job-cccc-000
 SELECT fleet.job_enqueue('amforge', 'once',  NULL, '{"n":4}', 'idem-job-dddd-0004', :ed, 'fleet-gate', 1) IS NOT NULL;
 SELECT fleet.job_enqueue('amforge', 'skip',  NULL, '{"n":5}', 'idem-job-eeee-0005', :ed, 'fleet-gate', 3) IS NOT NULL;
 SELECT fleet.job_enqueue('amforge', 'skip',  NULL, '{"n":6}', 'idem-job-ffff-0006', :ed, 'fleet-gate', 3) IS NOT NULL;
+SELECT fleet.job_enqueue('amforge', 'canc',  NULL, '{"n":7}', 'idem-job-gggg-0007', :ed, 'fleet-gate', 3) IS NOT NULL;
+SELECT fleet.job_enqueue('amforge', 'exp1',  NULL, '{"n":8}', 'idem-job-hhhh-0008', :ed, 'fleet-gate', 3) IS NOT NULL;
+
+-- review r1 [7]: a replay must be the same request (max_attempts too), and input is bounded
+DO $$ BEGIN
+  PERFORM fleet.job_enqueue('amforge', 'test2', NULL, '{"n":2}', 'idem-job-bbbb-0002', '00000000-0000-4000-8000-0000000000e1', 'fleet-gate', 9);
+  RAISE EXCEPTION 'TESTFAIL key replayed with other max_attempts';
+EXCEPTION WHEN SQLSTATE 'FG409' THEN NULL; END $$;
+DO $$ BEGIN
+  PERFORM fleet.job_enqueue('amforge', 'test', NULL, '{}', 'short', '00000000-0000-4000-8000-0000000000e1', 'fleet-gate', 3);
+  RAISE EXCEPTION 'TESTFAIL short idempotency key';
+EXCEPTION WHEN SQLSTATE 'FG400' THEN NULL; END $$;
+DO $$ BEGIN
+  PERFORM fleet.job_enqueue('amforge', 'test', NULL, '{}', 'idem-job-big-0001', '00000000-0000-4000-8000-0000000000e1', 'fleet-gate', 500);
+  RAISE EXCEPTION 'TESTFAIL max_attempts 500';
+EXCEPTION WHEN SQLSTATE 'FG400' THEN NULL; END $$;
+-- review r1 [8]: due is exactly YYYY-MM-DD and a real finite date; lengths refused with FG400, not 23514
+DO $$ DECLARE d text; BEGIN
+  FOREACH d IN ARRAY ARRAY['infinity', 'today', '2026-02-30', '2026-1-5', '20261105'] LOOP
+    BEGIN
+      PERFORM fleet.update_task('amforge', '00000000-0000-4000-8000-00000000a001', 4, jsonb_build_object('due', d),
+                                '00000000-0000-4000-8000-0000000000e1', 'fleet-gate', 'req-due-' || md5(d));
+      RAISE EXCEPTION 'TESTFAIL due % accepted', d;
+    EXCEPTION WHEN SQLSTATE 'FG400' THEN NULL; END;
+  END LOOP;
+END $$;
+DO $$ BEGIN
+  PERFORM fleet.update_task('amforge', '00000000-0000-4000-8000-00000000a001', 4, jsonb_build_object('title', repeat('x', 501)),
+                            '00000000-0000-4000-8000-0000000000e1', 'fleet-gate', 'req-long-000001');
+  RAISE EXCEPTION 'TESTFAIL 501-char title';
+EXCEPTION WHEN SQLSTATE 'FG400' THEN NULL; END $$;
+-- review r1 [3]: the gate can record refusals only, never a success
+DO $$ BEGIN
+  PERFORM fleet.audit_record('amforge', '00000000-0000-4000-8000-0000000000e1', 'fleet-gate', 'req-forge-00001',
+                             'task.update', '00000000-0000-4000-8000-00000000a001', 'ok', '{}');
+  RAISE EXCEPTION 'TESTFAIL gate forged a success';
+EXCEPTION WHEN SQLSTATE 'FG400' THEN NULL; END $$;
 SELECT 'PASS:gate' AS result;

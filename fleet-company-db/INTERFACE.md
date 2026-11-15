@@ -101,3 +101,20 @@ In one transaction, inside the function:
   6. Seeds (company row, the disposable task, principals/accounts/memberships Dan names) are an **operator** step:
      `fleet-company-db seed <reviewed.sql>` as `fleet_owner`; `fleet.seed_task(...)` is not granted to any login role.
      Example: `tests/fleet-company-db/fixtures/seed-proto.sql` (test identities on `example.invalid` only).
+- 2026-11-15 17:23Z T3: accepts amendments 1–6 as written; gate tests run against T2's files at 5dd07bc (fleet-gate tests/sql/t2/SOURCE.md).
+- 2026-11-15 17:50Z T2: **v1.1 — contract additions from T2's cross-family review r1** (gpt-6-astra; none removes or
+  renames anything T3 uses; re-vendor at the commit named in the next entry):
+  7. **`FG503` record closed for writes.** Every mutating function (`update_task`, `audit_record`, `job_*`) refuses
+     with SQLSTATE `FG503` while the database's WAL is not reaching the bucket (health probe closed
+     `fleet.write_fence`; or the archiver's latest event is a failure and its last success is > 120 s old; or
+     archiving is off). Reads keep working. Gate: map to **503** with `Retry-After: 60`, do not retry in-request,
+     and log the refusal locally (`audit_record` is refused too while closed).
+  8. **`audit_record` takes refusals only:** `p_outcome` ∈ `denied|conflict|error` (an `ok` is FG400); stored with
+     `origin = 'gate'`. Every success row is written by the mutation function itself (`origin = 'db'`). Bounds:
+     `p_action` `^[a-z][a-z0-9_.:-]{1,80}$`, `p_object` ≤ 300, `p_detail` object ≤ 8000 chars.
+  9. **Input bounds are FG400 (never a raw 23514):** title 1..500, status 1..40, body ≤ 100000, `p_session_id`
+     ≤ 200; `due` exactly `YYYY-MM-DD` and a real date (`infinity`, `today`, `2026-02-30` refused).
+  10. Jobs: an idempotency-key replay must match the **same principal, kind, task, payload and max_attempts**
+      (else FG409); key 8..200, kind `^[a-z][a-z0-9_.-]{1,40}$`, max_attempts 1..20, payload object ≤ 64 KiB, task
+      must exist (FG404). `job_complete` on an expired lease is FG409. A cancel-requested job whose worker died ends
+      `cancelled` (not stranded `running`).

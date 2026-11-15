@@ -6,7 +6,11 @@
 --
 -- Error contract (SQLSTATE): FG001 company mismatch, FG400 invalid input, FG403 forbidden (no live editor
 -- membership, or an append-only violation), FG404 not found, FG409 conflict (stale version, stale worker,
--- duplicate request, idempotency key reused).
+-- expired lease, duplicate request, idempotency key reused), FG503 record closed for writes (backups failing).
+--
+-- No unarchived writes (fail closed, EDD D4 RPO 5 min): every mutating function first calls
+-- fleet._assert_writable(), which refuses while (a) the health probe has closed fleet.write_fence, or
+-- (b) the archiver's latest event is a failure and its last success is over 120 s old, or (c) archiving is off.
 
 CREATE SCHEMA fleet;
 
@@ -99,14 +103,27 @@ CREATE TABLE fleet.task_requests (
 CREATE TABLE fleet.audit (
   id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   at                timestamptz NOT NULL DEFAULT now(),
+  -- 'db': written by the database's own mutation functions (authoritative, incl. every success);
+  -- 'gate': a refusal the gate reported through audit_record (never a success).
+  origin            text NOT NULL DEFAULT 'db' CHECK (origin IN ('db', 'gate')),
   actor_principal   uuid,                 -- NULL when no identity was established
   executing_service text NOT NULL,
   request_id        text NOT NULL,
   action            text NOT NULL,
   object            text,
   outcome           text NOT NULL CHECK (outcome IN ('ok', 'denied', 'conflict', 'error')),
-  detail            jsonb NOT NULL DEFAULT '{}'
+  detail            jsonb NOT NULL DEFAULT '{}',
+  CHECK (origin = 'db' OR outcome <> 'ok')
 );
+
+-- One row. Closed by the health probe when WAL stops reaching the bucket; reopened when it does again.
+CREATE TABLE fleet.write_fence (
+  singleton  boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  closed     boolean NOT NULL DEFAULT false,
+  reason     text NOT NULL DEFAULT '',
+  changed_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO fleet.write_fence DEFAULT VALUES;
 
 -- ---------------------------------------------------------------- jobs (EDD §4.2)
 CREATE TABLE fleet.jobs (
@@ -158,11 +175,11 @@ BEGIN
   FOREACH t IN ARRAY ARRAY['task_history', 'audit', 'job_events', 'task_requests'] LOOP
     EXECUTE format('CREATE TRIGGER %I BEFORE UPDATE OR DELETE ON fleet.%I FOR EACH ROW EXECUTE FUNCTION fleet.refuse_rewrite()', t || '_append_only', t);
   END LOOP;
-  FOREACH t IN ARRAY ARRAY['company', 'principals', 'principal_accounts', 'memberships', 'service_identities', 'tasks', 'jobs'] LOOP
+  FOREACH t IN ARRAY ARRAY['company', 'principals', 'principal_accounts', 'memberships', 'service_identities', 'tasks', 'jobs', 'write_fence'] LOOP
     EXECUTE format('CREATE TRIGGER %I BEFORE DELETE ON fleet.%I FOR EACH ROW EXECUTE FUNCTION fleet.refuse_rewrite()', t || '_no_delete', t);
   END LOOP;
   FOREACH t IN ARRAY ARRAY['task_history', 'audit', 'job_events', 'task_requests', 'company', 'principals',
-                           'principal_accounts', 'memberships', 'service_identities', 'tasks', 'jobs'] LOOP
+                           'principal_accounts', 'memberships', 'service_identities', 'tasks', 'jobs', 'write_fence'] LOOP
     EXECUTE format('CREATE TRIGGER %I BEFORE TRUNCATE ON fleet.%I FOR EACH STATEMENT EXECUTE FUNCTION fleet.refuse_rewrite()', t || '_no_truncate', t);
   END LOOP;
 END $$;
@@ -191,6 +208,39 @@ BEGIN
   END IF;
 END $$;
 
+CREATE FUNCTION fleet._assert_writable() RETURNS void LANGUAGE plpgsql AS $$
+DECLARE f fleet.write_fence; a record;
+BEGIN
+  IF pg_catalog.current_setting('archive_mode') = 'off' THEN
+    RAISE EXCEPTION 'fleet: record closed for writes: WAL archiving is off' USING ERRCODE = 'FG503';
+  END IF;
+  SELECT * INTO f FROM fleet.write_fence;
+  IF f.closed THEN
+    RAISE EXCEPTION 'fleet: record closed for writes: %', f.reason USING ERRCODE = 'FG503';
+  END IF;
+  SELECT s.last_archived_time, s.last_failed_time INTO a FROM pg_catalog.pg_stat_archiver s;
+  IF a.last_failed_time IS NOT NULL AND a.last_failed_time > coalesce(a.last_archived_time, '-infinity')
+     AND coalesce(a.last_archived_time, pg_catalog.pg_postmaster_start_time())
+         < pg_catalog.clock_timestamp() - interval '120 seconds' THEN
+    RAISE EXCEPTION 'fleet: record closed for writes: WAL archiving failing (last success %)', a.last_archived_time
+      USING ERRCODE = 'FG503';
+  END IF;
+END $$;
+
+-- Operator-only (the health probe, as the superuser): open/close the fence; every change is audited.
+CREATE FUNCTION fleet.set_write_fence(p_closed boolean, p_reason text) RETURNS void
+LANGUAGE plpgsql SET search_path = fleet, pg_temp AS $$
+DECLARE f fleet.write_fence;
+BEGIN
+  SELECT * INTO f FROM fleet.write_fence FOR UPDATE;
+  IF f.closed IS DISTINCT FROM p_closed THEN
+    UPDATE fleet.write_fence SET closed = p_closed, reason = coalesce(p_reason, ''), changed_at = now();
+    INSERT INTO fleet.audit (executing_service, request_id, action, object, outcome, detail)
+    VALUES ('fleet-company-db.health', 'fence-' || pg_catalog.txid_current(), CASE WHEN p_closed THEN 'record.close' ELSE 'record.open' END,
+            'write_fence', 'ok', jsonb_build_object('reason', coalesce(p_reason, '')));
+  END IF;
+END $$;
+
 -- ---------------------------------------------------------------- the one task write path
 CREATE FUNCTION fleet.update_task(
   p_company text, p_task uuid, p_base_version bigint, p_changes jsonb,
@@ -202,11 +252,15 @@ DECLARE
 BEGIN
   PERFORM fleet._require_company(p_company);
   PERFORM fleet._require_editor(p_actor);
+  PERFORM fleet._assert_writable();
   IF p_service IS NULL OR p_service !~ '^[a-z][a-z0-9_.-]{1,60}$' THEN
     RAISE EXCEPTION 'fleet: executing service required' USING ERRCODE = 'FG400';
   END IF;
   IF p_request_id IS NULL OR length(p_request_id) NOT BETWEEN 8 AND 128 THEN
     RAISE EXCEPTION 'fleet: request_id must be 8..128 chars' USING ERRCODE = 'FG400';
+  END IF;
+  IF p_session_id IS NOT NULL AND length(p_session_id) > 200 THEN
+    RAISE EXCEPTION 'fleet: session_id longer than 200 chars' USING ERRCODE = 'FG400';
   END IF;
   IF p_base_version IS NULL OR p_base_version < 1 THEN
     RAISE EXCEPTION 'fleet: base version required' USING ERRCODE = 'FG400';
@@ -220,6 +274,25 @@ BEGIN
   IF EXISTS (SELECT 1 FROM jsonb_each(p_changes) e
              WHERE NOT (jsonb_typeof(e.value) = 'string' OR (e.key = 'due' AND jsonb_typeof(e.value) = 'null'))) THEN
     RAISE EXCEPTION 'fleet: values must be strings (due: YYYY-MM-DD or null)' USING ERRCODE = 'FG400';
+  END IF;
+  -- Same bounds as the table CHECKs, but refused here with the contract's FG400 instead of 23514.
+  IF (p_changes ? 'title' AND length(p_changes ->> 'title') NOT BETWEEN 1 AND 500)
+     OR (p_changes ? 'status' AND length(p_changes ->> 'status') NOT BETWEEN 1 AND 40)
+     OR (p_changes ? 'body' AND length(p_changes ->> 'body') > 100000) THEN
+    RAISE EXCEPTION 'fleet: title 1..500, status 1..40, body <= 100000 chars' USING ERRCODE = 'FG400';
+  END IF;
+  -- due: exactly YYYY-MM-DD and a real, finite date (Postgres would also accept 'infinity', 'today', ...).
+  IF jsonb_typeof(p_changes -> 'due') = 'string' THEN
+    IF (p_changes ->> 'due') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' THEN
+      RAISE EXCEPTION 'fleet: due must be YYYY-MM-DD' USING ERRCODE = 'FG400';
+    END IF;
+    BEGIN
+      IF to_char((p_changes ->> 'due')::date, 'YYYY-MM-DD') <> (p_changes ->> 'due') THEN
+        RAISE EXCEPTION 'not canonical';
+      END IF;
+    EXCEPTION WHEN others THEN
+      RAISE EXCEPTION 'fleet: due must be a real YYYY-MM-DD date' USING ERRCODE = 'FG400';
+    END;
   END IF;
 
   SELECT * INTO t FROM fleet.tasks WHERE id = p_task FOR UPDATE;
@@ -247,11 +320,7 @@ BEGIN
     oldval := to_jsonb(t) -> f;
     newval := p_changes -> f;
     IF f = 'due' AND jsonb_typeof(newval) = 'string' THEN
-      BEGIN
-        newval := to_jsonb((newval #>> '{}')::date);
-      EXCEPTION WHEN others THEN
-        RAISE EXCEPTION 'fleet: due must be YYYY-MM-DD' USING ERRCODE = 'FG400';
-      END;
+      newval := to_jsonb((newval #>> '{}')::date);   -- validated above
     END IF;
     IF oldval IS DISTINCT FROM newval THEN
       INSERT INTO fleet.task_history (task_id, version, field, old_value, new_value, actor_principal,
@@ -276,8 +345,10 @@ BEGIN
   RETURN newv;
 END $$;
 
--- The gate records refusals (denied reads/writes, forged headers, conflicts) in its own transaction.
--- An actor that isn't a known principal is kept only as detail.claimed_actor.
+-- The gate records REFUSALS only (denied reads/writes, forged headers, conflicts), in its own transaction.
+-- They are stored with origin 'gate' and can never be a success: authoritative successes are written only by
+-- the mutation functions themselves (origin 'db'). An actor that isn't a known principal is kept only as
+-- detail.claimed_actor.
 CREATE FUNCTION fleet.audit_record(
   p_company text, p_actor uuid, p_service text, p_request_id text, p_action text, p_object text,
   p_outcome text, p_detail jsonb DEFAULT '{}'
@@ -285,9 +356,20 @@ CREATE FUNCTION fleet.audit_record(
 DECLARE i bigint; known boolean;
 BEGIN
   PERFORM fleet._require_company(p_company);
+  PERFORM fleet._assert_writable();
+  IF p_outcome IS NULL OR p_outcome NOT IN ('denied', 'conflict', 'error') THEN
+    RAISE EXCEPTION 'fleet: the gate may record only denied, conflict or error' USING ERRCODE = 'FG400';
+  END IF;
+  IF p_service IS NULL OR p_service !~ '^[a-z][a-z0-9_.-]{1,60}$'
+     OR p_request_id IS NULL OR length(p_request_id) NOT BETWEEN 1 AND 128
+     OR p_action IS NULL OR p_action !~ '^[a-z][a-z0-9_.:-]{1,80}$'
+     OR (p_object IS NOT NULL AND length(p_object) > 300)
+     OR (p_detail IS NOT NULL AND (jsonb_typeof(p_detail) <> 'object' OR length(p_detail::text) > 8000)) THEN
+    RAISE EXCEPTION 'fleet: bad audit record' USING ERRCODE = 'FG400';
+  END IF;
   known := EXISTS (SELECT 1 FROM fleet.principals WHERE id = p_actor);
-  INSERT INTO fleet.audit (actor_principal, executing_service, request_id, action, object, outcome, detail)
-  VALUES (CASE WHEN known THEN p_actor END, p_service, p_request_id, p_action, p_object, p_outcome,
+  INSERT INTO fleet.audit (origin, actor_principal, executing_service, request_id, action, object, outcome, detail)
+  VALUES ('gate', CASE WHEN known THEN p_actor END, p_service, p_request_id, p_action, p_object, p_outcome,
           coalesce(p_detail, '{}') || CASE WHEN p_actor IS NOT NULL AND NOT known
                                            THEN jsonb_build_object('claimed_actor', p_actor::text) ELSE '{}' END)
   RETURNING id INTO i;
@@ -321,14 +403,28 @@ DECLARE j fleet.jobs;
 BEGIN
   PERFORM fleet._require_company(p_company);
   PERFORM fleet._require_editor(p_actor);
+  PERFORM fleet._assert_writable();
+  IF p_kind IS NULL OR p_kind !~ '^[a-z][a-z0-9_.-]{1,40}$'
+     OR p_idempotency_key IS NULL OR length(p_idempotency_key) NOT BETWEEN 8 AND 200
+     OR p_max_attempts IS NULL OR p_max_attempts NOT BETWEEN 1 AND 20
+     OR p_service IS NULL OR p_service !~ '^[a-z][a-z0-9_.-]{1,60}$'
+     OR (p_payload IS NOT NULL AND (jsonb_typeof(p_payload) <> 'object' OR length(p_payload::text) > 65536)) THEN
+    RAISE EXCEPTION 'fleet: bad job (kind, idempotency key 8..200, max_attempts 1..20, payload object <= 64 KiB)'
+      USING ERRCODE = 'FG400';
+  END IF;
+  IF p_task IS NOT NULL AND NOT EXISTS (SELECT 1 FROM fleet.tasks WHERE id = p_task) THEN
+    RAISE EXCEPTION 'fleet: no such task' USING ERRCODE = 'FG404';
+  END IF;
   INSERT INTO fleet.jobs (kind, task_id, payload, idempotency_key, max_attempts, created_by)
   VALUES (p_kind, p_task, coalesce(p_payload, '{}'), p_idempotency_key, p_max_attempts, p_actor)
   ON CONFLICT (idempotency_key) DO NOTHING
   RETURNING * INTO j;
   IF NOT FOUND THEN
     SELECT * INTO j FROM fleet.jobs WHERE idempotency_key = p_idempotency_key;
-    IF j.kind <> p_kind OR j.payload <> coalesce(p_payload, '{}') OR j.task_id IS DISTINCT FROM p_task THEN
-      RAISE EXCEPTION 'fleet: idempotency key reused with different content' USING ERRCODE = 'FG409';
+    -- A replay is the SAME request: same initiating principal and every execution-affecting parameter.
+    IF j.created_by <> p_actor OR j.kind <> p_kind OR j.payload <> coalesce(p_payload, '{}')
+       OR j.task_id IS DISTINCT FROM p_task OR j.max_attempts <> p_max_attempts THEN
+      RAISE EXCEPTION 'fleet: idempotency key reused with a different request' USING ERRCODE = 'FG409';
     END IF;
     RETURN to_jsonb(j);           -- the same job, enqueued once
   END IF;
@@ -344,18 +440,27 @@ CREATE FUNCTION fleet.job_claim(p_worker text, p_kinds text[], p_lease_seconds i
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = fleet, pg_temp AS $$
 DECLARE j fleet.jobs;
 BEGIN
-  IF p_worker IS NULL OR p_worker = '' OR p_lease_seconds IS NULL OR p_lease_seconds NOT BETWEEN 10 AND 3600 THEN
+  IF p_worker IS NULL OR p_worker = '' OR length(p_worker) > 120 OR p_lease_seconds IS NULL
+     OR p_lease_seconds NOT BETWEEN 10 AND 3600 OR p_kinds IS NULL THEN
     RAISE EXCEPTION 'fleet: worker and a lease of 10..3600 s required' USING ERRCODE = 'FG400';
   END IF;
+  PERFORM fleet._assert_writable();
+  -- Recovery sweep over expired leases of these kinds: a cancel-requested job ends 'cancelled'; one that
+  -- used all its attempts ends 'dead'. Both are kept, with an event; the old worker is fenced (state <> running).
   WITH d AS (
-    UPDATE fleet.jobs SET state = 'dead', lease_owner = NULL, lease_expires_at = NULL,
-           last_error = coalesce(last_error, 'lease expired after the final attempt'), updated_at = now()
+    UPDATE fleet.jobs SET state = CASE WHEN cancel_requested THEN 'cancelled' ELSE 'dead' END,
+           lease_owner = NULL, lease_expires_at = NULL,
+           last_error = CASE WHEN cancel_requested THEN last_error
+                             ELSE coalesce(last_error, 'lease expired after the final attempt') END,
+           updated_at = now()
     WHERE id IN (SELECT id FROM fleet.jobs
                  WHERE state = 'running' AND lease_expires_at < clock_timestamp()
-                   AND attempts >= max_attempts AND kind = ANY (p_kinds)
+                   AND (cancel_requested OR attempts >= max_attempts) AND kind = ANY (p_kinds)
                  FOR UPDATE SKIP LOCKED)
-    RETURNING id, lease_epoch)
-  INSERT INTO fleet.job_events (job_id, event, epoch, worker) SELECT id, 'dead', lease_epoch, p_worker FROM d;
+    RETURNING id, lease_epoch, state)
+  INSERT INTO fleet.job_events (job_id, event, epoch, worker, detail)
+  SELECT id, CASE WHEN state = 'cancelled' THEN 'cancelled' ELSE 'dead' END, lease_epoch, p_worker,
+         jsonb_build_object('reason', 'lease expired') FROM d;
 
   SELECT * INTO j FROM fleet.jobs
   WHERE kind = ANY (p_kinds) AND NOT cancel_requested AND (
@@ -381,6 +486,7 @@ BEGIN
   IF p_lease_seconds IS NULL OR p_lease_seconds NOT BETWEEN 10 AND 3600 THEN
     RAISE EXCEPTION 'fleet: lease of 10..3600 s required' USING ERRCODE = 'FG400';
   END IF;
+  PERFORM fleet._assert_writable();
   UPDATE fleet.jobs SET lease_expires_at = clock_timestamp() + make_interval(secs => p_lease_seconds), updated_at = now()
   WHERE id = p_id AND state = 'running' AND lease_epoch = p_epoch AND lease_owner = p_worker
     AND lease_expires_at >= clock_timestamp()
@@ -389,17 +495,26 @@ BEGIN
   RETURN jsonb_build_object('ok', true, 'cancel_requested', j.cancel_requested);
 END $$;
 
--- Finish a job. A worker whose epoch is stale (its lease was reclaimed) gets FG409 and changes nothing.
+-- Finish a job. A worker whose epoch is stale (its lease was reclaimed) or whose lease has expired gets
+-- FG409 and changes nothing.
 CREATE FUNCTION fleet.job_complete(
   p_id uuid, p_epoch bigint, p_worker text, p_outcome text, p_result jsonb DEFAULT NULL,
   p_error text DEFAULT NULL, p_retry_after_seconds int DEFAULT 30
 ) RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = fleet, pg_temp AS $$
 DECLARE j fleet.jobs; nextstate text;
 BEGIN
+  PERFORM fleet._assert_writable();
+  IF (p_result IS NOT NULL AND length(p_result::text) > 65536) OR (p_error IS NOT NULL AND length(p_error) > 4000)
+     OR (p_retry_after_seconds IS NOT NULL AND p_retry_after_seconds NOT BETWEEN 0 AND 86400) THEN
+    RAISE EXCEPTION 'fleet: result <= 64 KiB, error <= 4000 chars, retry 0..86400 s' USING ERRCODE = 'FG400';
+  END IF;
   SELECT * INTO j FROM fleet.jobs WHERE id = p_id FOR UPDATE;
   IF NOT FOUND THEN RAISE EXCEPTION 'fleet: no such job' USING ERRCODE = 'FG404'; END IF;
   IF j.state <> 'running' OR j.lease_epoch <> p_epoch OR j.lease_owner IS DISTINCT FROM p_worker THEN
     RAISE EXCEPTION 'fleet: stale worker (epoch %, current %)', p_epoch, j.lease_epoch USING ERRCODE = 'FG409';
+  END IF;
+  IF j.lease_expires_at < clock_timestamp() THEN
+    RAISE EXCEPTION 'fleet: lease expired' USING ERRCODE = 'FG409', DETAIL = 'lease expired';
   END IF;
   IF p_outcome = 'succeeded' THEN nextstate := 'succeeded';
   ELSIF p_outcome = 'cancelled' AND j.cancel_requested THEN nextstate := 'cancelled';
@@ -425,6 +540,7 @@ DECLARE j fleet.jobs;
 BEGIN
   PERFORM fleet._require_company(p_company);
   PERFORM fleet._require_editor(p_actor);
+  PERFORM fleet._assert_writable();
   SELECT * INTO j FROM fleet.jobs WHERE id = p_id FOR UPDATE;
   IF NOT FOUND THEN RAISE EXCEPTION 'fleet: no such job' USING ERRCODE = 'FG404'; END IF;
   IF j.state = 'queued' THEN

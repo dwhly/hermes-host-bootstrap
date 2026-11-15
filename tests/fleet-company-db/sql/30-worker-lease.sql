@@ -4,7 +4,7 @@ SET statement_timeout = '30s';  -- the role default (5s) is a guard; this test s
 SELECT fleet.job_claim('w-old', ARRAY['lease'], 10) IS NOT NULL AS claimed_lease;
 SELECT fleet.job_claim('w-old', ARRAY['once'], 10) IS NOT NULL AS claimed_once;
 SELECT pg_sleep(11);
-DO $$ DECLARE j jsonb; old uuid; BEGIN
+DO $$ DECLARE j jsonb; BEGIN
   j := fleet.job_claim('w-new', ARRAY['lease'], 60);
   ASSERT j IS NOT NULL AND j->>'lease_owner' = 'w-new' AND (j->>'lease_epoch')::int = 2, 'expired lease reclaimed';
   BEGIN

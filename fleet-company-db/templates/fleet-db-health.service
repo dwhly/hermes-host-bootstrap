@@ -1,8 +1,9 @@
 [Unit]
-Description=fleet-company-db health (archiver RPO probe, last backup age)
+Description=fleet-company-db health (archiver RPO probe, last backup age; opens/closes the write fence)
 After=postgresql@16-main.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/fleet-company-db status
+TimeoutStartSec=150
 MemoryMax=100M

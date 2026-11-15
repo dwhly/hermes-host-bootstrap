@@ -21,11 +21,12 @@ fresh host can rebuild the database from the bucket plus two secrets (D5).
 | RPO 5 min | `archive_timeout=60` + async push; the health probe forces a WAL switch when there are unarchived changes and requires the segment in the bucket within 90 s | Measured on h-do1 under host loss (SIGKILL): see Evidence. An idle database switches nothing (no false alarms, no empty segments). |
 | Backups | weekly full (Sun 03:30 UTC), daily diff (Mon–Sat), `Persistent=true`, randomized 15 min, `MemoryMax=300M`, nice/idle IO | RTO 4 h: restore = 1 full + 1 diff + ≤ 1 day of WAL. |
 | Retention | **`expire-auto=n`: nothing is expired or deleted in this round** (standing rule). `repo1-retention-full=35` (time) is configured but inert. R2 lifecycle (D4, 35 d on WAL) is an owner step to apply only after the first live drill passes — see Needs Dan. | |
-| Fail closed | `install` creates the cluster only after the secrets resolve; then `pgbackrest check` must pass or the cluster is stopped; the first full backup runs before the schema exists. HOLD (exit 3) on any pending owner step leaves **no cluster**. | No database ever runs without working backups. |
+| Fail closed | `install` creates the cluster only after the secrets resolve (HOLD, exit 3, leaves **no cluster**); then `pgbackrest check` and the first full backup must pass before the schema exists, or the cluster is stopped, **disabled and `start.conf=manual`** (survives reboot; backup units are `Requisite=`, so they never start it). After the first install, **a write fence closes the record** whenever WAL stops reaching the bucket: every mutating function refuses with `FG503` (reads continue) while (a) the health probe — every minute — has closed `fleet.write_fence`, or (b) the archiver's latest event is a failure and its last success is > 120 s old, or (c) archiving is off. It reopens by itself when WAL reaches the bucket again. | No database runs, and no write is accepted, without working backups (review r1 BLOCKER). Proven live with a real bucket outage: see Evidence (`outage_*`). |
 | Memory | systemd drop-in `MemoryHigh/MemoryMax` on the unit; h-af 768M/1G with `shared_buffers=256MB`; h-btp 384M/512M with `128MB` | Baseline (`edd/evidence/fleet-architecture/memory-baseline-2026-11-15.md`) + live 2026-11-15: h-af 23.4 GB available of 32 GB; h-btp 7.0 GB available of 16 GB with swap 2034/2047 MB used. Measured: 93 MiB idle, 137 MiB peak under the workload (cap 1 GiB). |
 | Network | `listen_addresses=localhost`; pg_hba: postgres by peer on the socket, `fleet_gate`/`fleet_worker` by scram-sha-256 on 127.0.0.1/::1 to `fleet_<company>` only; everything else refused | The gate runs on the same node; nothing listens on the tailnet. |
-| Roles | `fleet_owner` NOLOGIN owns everything; `fleet_gate` SELECT on what it authorizes + EXECUTE on the write functions; `fleet_worker` EXECUTE on job claim/renew/complete only; PUBLIC nothing; nobody can become the owner | EDD §4.1 "enforced, not just a library". History/audit/job_events/task_requests are append-only even for the superuser (triggers); no record is ever deleted. |
-| Secrets | resolved by the node's own read-only 1Password service account into `/etc/pgbackrest/conf.d/50-secrets.conf` (root:postgres 0640); gate/worker passwords generated on the node (`/etc/fleet-company-db/*.password|*.dsn`, root 0600) | Values never in git, argv, logs or chat. |
+| Roles | `fleet_owner` NOLOGIN owns everything; `fleet_gate` SELECT on what it authorizes + EXECUTE on the write functions; `fleet_worker` EXECUTE on job claim/renew/complete only; PUBLIC nothing (a global default revoke is in place before the first migration, and each migration commits together with the grants); nobody can become the owner | EDD §4.1 "enforced, not just a library". History/audit/job_events/task_requests are append-only even for the superuser (triggers); no record is ever deleted. The gate may record **refusals only** (`origin='gate'`); every success is written by the mutation function itself (`origin='db'`). |
+| Secrets | resolved by the node's own read-only 1Password service account into `/etc/pgbackrest/conf.d/50-secrets.conf` (root:postgres 0640); the token is passed only to each `op read`, never exported; gate/worker passwords generated on the node (`/etc/fleet-company-db/*.password|*.dsn`, root 0600), and the server only ever receives the SCRAM verifier | Values never in git, argv, logs or chat. |
+| OS user | the `postgresql-common` package creates the system user `postgres` (and group) on first install | Creating an OS user needs Dan's approval: part of "roll it out" (Needs Dan). No login shell use; no SSH key; peer auth on the local socket only. |
 
 ## How convergence installs and upgrades it
 - Module `lib/62-fleet-company-db.sh` (auto-discovered by `bootstrap.sh`, skip key `fleet-company-db`). It acts only
@@ -44,8 +45,9 @@ fresh host can rebuild the database from the bucket plus two secrets (D5).
 ## Owner steps (Dan; nothing here was created by T2)
 Per company (AmForge in AmForge's Cloudflare + 1Password; BTP in BTP's):
 1. **R2 bucket** in the company's own Cloudflare account: `amforge-fleet-db` / `btp-fleet-db`, location hint
-   nearest the node (h-af/h-btp: North America), **Object versioning: on** (keeps overwritten/deleted objects; S3
-   versioning works with pgBackRest — proven with MinIO). Do **not** add a lifecycle rule yet (see Needs Dan).
+   nearest the node (h-af/h-btp: North America). **R2 has no object versioning** (D4 assumed it; Cloudflare's S3 API
+   table lists `PutBucketVersioning` and Object Lock as unimplemented — review r1 [10]). The R2 equivalent is a
+   **Bucket Lock rule** (prefix + age). Do **not** add a lock or lifecycle rule yet: both are Needs Dan.
 2. **R2 API token** (R2 → Manage API tokens → Create): permission **Object Read & Write**, scoped to **that one
    bucket only**, no expiry or 1-year expiry, no IP filter (or the node's egress IP). Note the Account ID (the S3
    endpoint is `<account-id>.r2.cloudflarestorage.com`). Never "Roll" an existing token; "Update token" only.
@@ -61,7 +63,7 @@ Per company (AmForge in AmForge's Cloudflare + 1Password; BTP in BTP's):
 5. Tell T2 (or edit the reviewed desired file): the vault name and the Account ID, replacing `owner-step-pending`
    in `config/fleet-company-db/<host>.env`.
 
-### Drill host (D5), per company, quarterly and after every major change
+### Drill host (D5), per company, monthly (D5: "a monthly drill restores each one") and after every major change
 - A **fresh** Ubuntu 24.04 droplet/VM **in the company's own account** (DigitalOcean for BTP like h-btp; AmForge's
   provider for AmForge), 2 vCPU / 4 GB is plenty, on the tailnet with a `tag:drill` (no inbound from the internet).
 - On it, as root: install `op` + a read-only service-account token for that company's vault (same as step 4), copy
@@ -86,7 +88,9 @@ Backups before the change (standing rule): `/root/legacy-capture/<date>-fleet-co
 
 ## Rollback, per node (never deletes data)
 1. `systemctl disable --now fleet-db-backup-full.timer fleet-db-backup-diff.timer fleet-db-health.timer`
-2. `systemctl disable --now postgresql@16-main` — the cluster stays on disk, the bucket keeps every backup and WAL.
+2. `systemctl disable --now postgresql@16-main` and `echo manual > /etc/postgresql/16/main/start.conf` (the
+   postgresql-common generator starts `auto` clusters at boot even when disabled) — the cluster stays on disk, the
+   bucket keeps every backup and WAL.
 3. Set `ROLLOUT=hold` in the desired file (reviewed). Code rollback only: point `/usr/local/lib/fleet-company-db/current`
    at the previous `<sha>` and re-run `fleet-company-db install`.
    Removing packages/data is out of scope for rollback (archive = keep).

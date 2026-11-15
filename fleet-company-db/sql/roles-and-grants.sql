@@ -35,7 +35,10 @@ GRANT USAGE ON SCHEMA fleet TO fleet_gate, fleet_worker;
 REVOKE ALL ON ALL TABLES IN SCHEMA fleet FROM PUBLIC, fleet_gate, fleet_worker;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA fleet FROM PUBLIC, fleet_gate, fleet_worker;
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA fleet FROM PUBLIC, fleet_gate, fleet_worker;
-ALTER DEFAULT PRIVILEGES FOR ROLE fleet_owner IN SCHEMA fleet REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+-- Global (no IN SCHEMA): functions fleet_owner creates anywhere are never PUBLIC-executable. The runner also
+-- applies this before the first migration, and applies each migration together with this file in ONE
+-- transaction, so no function is ever committed with PUBLIC EXECUTE.
+ALTER DEFAULT PRIVILEGES FOR ROLE fleet_owner REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 
 GRANT SELECT ON fleet.company, fleet.principals, fleet.principal_accounts, fleet.memberships,
                 fleet.service_identities, fleet.tasks, fleet.task_history
