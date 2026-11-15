@@ -49,7 +49,7 @@ load_desired() {
       COMPANY|STANZA|S3_ENDPOINT|S3_PORT|S3_BUCKET|S3_REGION|S3_CA_FILE|REPO_PATH|RETENTION_FULL_DAYS|\
       SHARED_BUFFERS|EFFECTIVE_CACHE_SIZE|WORK_MEM|MAINTENANCE_WORK_MEM|MAX_CONNECTIONS|\
       MEMORY_HIGH|MEMORY_MAX|ARCHIVE_TIMEOUT|BACKUP_FULL_CALENDAR|BACKUP_DIFF_CALENDAR|\
-      SECRETS_SOURCE|OP_REF_S3_KEY|OP_REF_S3_KEY_SECRET|OP_REF_CIPHER_PASS|OP_TOKEN_FILE|OP_TOKEN_FORMAT) D[$k]="$v" ;;
+      SECRETS_SOURCE|OP_REF_S3_KEY|OP_REF_S3_KEY_SECRET|OP_REF_CIPHER_PASS|OP_TOKEN_FILE|OP_TOKEN_FORMAT|ROLLOUT) D[$k]="$v" ;;
       *) die "unknown key $k in $f" ;;
     esac
     # Values the owner hasn't supplied yet (bucket, account id, vault) stop the install cleanly.
@@ -163,6 +163,7 @@ cmd_install() {
   chmod 0644 /etc/postgresql-common/createcluster.d/50-fleet-company-db.conf
   if ! dpkg -s "postgresql-$PG_MAJOR" pgbackrest >/dev/null 2>&1; then
     say "installing postgresql-$PG_MAJOR + pgbackrest (Ubuntu archive)"
+    apt-get update -q >/dev/null
     DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
       "postgresql-$PG_MAJOR" pgbackrest >/dev/null
   fi
@@ -374,6 +375,7 @@ cmd_drill_restore() {
   install -d -m 0755 /etc/postgresql-common/createcluster.d
   printf 'create_main_cluster = false\n' >/etc/postgresql-common/createcluster.d/50-fleet-company-db.conf
   if ! dpkg -s "postgresql-$PG_MAJOR" pgbackrest >/dev/null 2>&1; then
+    apt-get update -q >/dev/null
     DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "postgresql-$PG_MAJOR" pgbackrest >/dev/null
   fi
   install -d -m 0750 -o postgres -g postgres /var/spool/pgbackrest /var/log/pgbackrest "$STATE_DIR"

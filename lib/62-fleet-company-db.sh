@@ -30,6 +30,12 @@ if [[ ! -f "$DESIRED" ]]; then
   skip "no desired state for $FCDB_HOST ($DESIRED): not a company database node"
   return 0 2>/dev/null || exit 0
 fi
+# Dan's "roll it out" is a reviewed one-line change to ROLLOUT=go in the host's desired file.
+# Until then nothing at all is written on the host (not even the payload).
+if ! grep -qx 'ROLLOUT=go' "$DESIRED"; then
+  skip "fleet-company-db on $FCDB_HOST: ROLLOUT is not go (held for the owner's roll-out)"
+  return 0 2>/dev/null || exit 0
+fi
 if [[ "$OS" != "ubuntu" ]]; then
   warn "fleet-company-db supports Ubuntu 24.04 only (OS=$OS); skipping"
   return 0 2>/dev/null || exit 0
