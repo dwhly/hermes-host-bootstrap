@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""fleet-trace-retention — D3: drop a card run's raw trace from Hermes's state.db 90 days after its Postgres copy.
+
+EDD-fleet-architecture r5 §14 D3 (decided 2026-11-15): the raw trace stays in state.db for 90 days after its copy
+exists in the company's Postgres; nothing is dropped before the durable copy exists. Contract for the copy receipts:
+chief docs `edd/evidence/fleet-architecture/transcript-copy-receipts.md` (fleet.transcript_copies).
+
+Usage (run with the node's Hermes interpreter, which has `hermes_state` and PyYAML):
+  fleet-trace-retention [--hermes-home ~/.hermes] [--hermes-src /usr/local/lib/hermes-agent]
+                        [--queue-dir ~/.local/state/card-prompts] [--copies-dsn-file FILE]
+                        [--keep-days 90] [--apply]
+
+Default is a read-only plan (dry run). `--apply` deletes only eligible sessions, each through Hermes's own fenced
+`SessionDB.delete_session`. Prints ids, counts and reasons only, never message content.
+
+A session is eligible only if ALL hold (one rule, `check()`, run in the plan and again inside Hermes's own delete
+transaction, so nothing can change between the last check and the delete):
+  - the card-prompt queue names it (a `<job>.runs.jsonl` record or the job's log footer) under the receipt's job_id,
+    and none of its jobs is queued, running or unreadable (re-read from the queue inside the transaction);
+  - a receipt exists in fleet.transcript_copies, hash_version 1, copied_at at least --keep-days (>= 90) ago;
+  - EVERY covered session (it and the delegate children Hermes would cascade-delete) has ended and isn't pinned;
+  - those covered sessions equal the receipt's covered_session_ids;
+  - the content hash over every messages row of the covered sessions equals the receipt's.
+Apply also refuses unless Hermes's delete_session source is a reviewed version (DELETE_SOURCE_SHA256), because the
+in-transaction check rides that function's display-snapshot fence.
+
+Exit codes: 0 ok; 2 usage/environment error; 3 Hermes's own sessions.auto_prune is on (or unknown) while card traces
+lack a verified copy (report only, nothing changed); 4 the copy store was configured but unreadable or returned any
+malformed receipt (nothing deleted).
+"""
+import argparse, ast, datetime as dt, fcntl, hashlib, json, os, re, sqlite3, subprocess, sys, time
+from pathlib import Path
+
+# A retention job must never trigger a Hermes dependency sync or a relaunch into another interpreter on import.
+os.environ.setdefault("HERMES_DISABLE_LAZY_INSTALLS", "1")
+
+MIN_KEEP_DAYS = 90
+HASH_VERSION = 1
+SID = r"(\d{8}_\d{6}_[0-9A-Za-z]+)"
+SESSION_RE = re.compile(r"^Session:[ \t]+" + SID + r"[ \t]*$", re.M)       # same regexes as the card-prompt worker
+RESUME_RE = re.compile(r"^[ \t]*hermes --resume " + SID + r"[ \t]*$", re.M)
+SID_FULL = re.compile(r"^" + SID + r"$")
+JOB_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_.-]{0,127}$")
+SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+ACTIVE_JOB_STATES = {"queued", "running"}
+# sha256 of textwrap.dedent(inspect.getsource(SessionDB.delete_session)).strip() in reviewed Hermes builds. The fence in
+# apply() relies on it calling self._display_messages_from_conn(conn, ...) inside its BEGIN IMMEDIATE transaction
+# before deleting; a new build gets added here only after reading its delete_session.
+DELETE_SOURCE_SHA256 = {
+    "6a3dd6c7a29bca5b4432a35bebc29cc9256bf3a626c5172f2b63f17d9016de2f",   # Hermes 0.21.x (h-do1, h-af, h-btp 2026-11-15)
+}
+RECEIPTS_SQL = ("select coalesce(json_agg(r), '[]'::json) from (select session_id, job_id, covered_session_ids, "
+                "message_count, content_sha256, copied_at, hash_version from fleet.transcript_copies) r")
+
+
+class Refuse(Exception):
+    """Environment problem: exit 2 without touching anything."""
+
+
+def content_hash(conn, covered_ids):
+    """Hash v1 over every messages row (active, compacted and rewound) of each covered session. Shared with the copier."""
+    sessions = []
+    for sid in sorted(covered_ids):
+        cur = conn.execute("SELECT * FROM messages WHERE session_id = ? ORDER BY id", (sid,))
+        cols = [d[0] for d in cur.description]
+        rows = [{c: (v.hex() if isinstance(v, (bytes, bytearray, memoryview)) else v)
+                 for c, v in zip(cols, (bytes(x) if isinstance(x, memoryview) else x for x in r))}
+                for r in cur.fetchall()]
+        sessions.append({"id": sid, "messages": rows})
+    blob = json.dumps({"v": HASH_VERSION, "sessions": sessions}, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, default=str).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest(), sum(len(s["messages"]) for s in sessions)
+
+
+def _regular(p):
+    return p.is_file() and not p.is_symlink()
+
+
+def job_state(q, jid):
+    st = Path(q) / f"{jid}.status.json"
+    if not (Path(q) / f"{jid}.job.json").exists():
+        return "missing"
+    if not _regular(st):
+        return "queued"   # no status yet = not picked up
+    try:
+        state = (json.loads(st.read_text(errors="replace")) or {}).get("state")
+    except (OSError, ValueError, AttributeError):
+        return "unreadable"
+    return state if isinstance(state, str) else "unreadable"
+
+
+def queue_bindings(queue_dir):
+    """{session_id: set(job_ids)} from runs.jsonl records, plus the legacy log footer for jobs without records."""
+    out = {}
+    q = Path(queue_dir)
+    if not q.is_dir():
+        return out, {}
+    states = {}
+    for job_file in q.glob("*.job.json"):
+        jid = job_file.name[:-len(".job.json")]
+        if not JOB_RE.match(jid) or not _regular(job_file):
+            continue
+        states[jid] = job_state(q, jid)
+        runs = q / f"{jid}.runs.jsonl"
+        found = False
+        if _regular(runs):
+            for line in runs.read_text(errors="replace").splitlines():
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                sid = rec.get("hermes_session_id") if isinstance(rec, dict) else None
+                if isinstance(sid, str) and SID_FULL.match(sid) and rec.get("job") == jid:
+                    out.setdefault(sid, set()).add(jid)
+                    found = True
+        log = q / f"{jid}.log"
+        if not found and _regular(log):
+            text = log.read_text(errors="replace")
+            for rx in (RESUME_RE, SESSION_RE):
+                m = rx.findall(text)
+                if m:
+                    out.setdefault(m[-1], set()).add(jid)
+                    break
+    return out, states
+
+
+def read_receipts(dsn_file, psql):
+    """[receipt dicts] from fleet.transcript_copies; raises RuntimeError when configured but unreadable."""
+    p = Path(dsn_file)
+    try:
+        dsn = p.read_text().strip()
+    except OSError as e:
+        raise RuntimeError(f"copy store DSN file unreadable: {e.__class__.__name__}")
+    if not dsn or "\n" in dsn:
+        raise RuntimeError("copy store DSN file must hold one line")
+    if re.search(r"password\s*=|://[^/@\s]*:[^/@\s]*@", dsn, re.I):
+        raise RuntimeError("copy store DSN carries a password; use peer auth on the Unix socket")
+    try:
+        r = subprocess.run([psql, "-X", "-At", "-v", "ON_ERROR_STOP=1", "-d", dsn, "-c", RECEIPTS_SQL],
+                           capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"psql failed: {e.__class__.__name__}")
+    if r.returncode != 0:
+        raise RuntimeError(f"psql exit {r.returncode}")
+    try:
+        rows = json.loads(r.stdout.strip() or "null")
+    except ValueError:
+        raise RuntimeError("copy store answer is not JSON")
+    if not isinstance(rows, list):
+        raise RuntimeError("copy store answer is not a list")
+    return rows
+
+
+def parse_receipt(r):
+    """A validated receipt or None (malformed rows never make anything eligible)."""
+    if not isinstance(r, dict):
+        return None
+    sid, jid, cov, sha = r.get("session_id"), r.get("job_id"), r.get("covered_session_ids"), r.get("content_sha256")
+    if not (isinstance(sid, str) and SID_FULL.match(sid) and isinstance(jid, str) and JOB_RE.match(jid)):
+        return None
+    if not (isinstance(cov, list) and cov and all(isinstance(c, str) and c for c in cov) and sid in cov):
+        return None
+    if not (isinstance(sha, str) and SHA_RE.match(sha)) or r.get("hash_version") != HASH_VERSION:
+        return None
+    mc = r.get("message_count")
+    if not isinstance(mc, int) or isinstance(mc, bool) or mc < 0:
+        return None
+    try:
+        at = dt.datetime.fromisoformat(str(r.get("copied_at")).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if at.tzinfo is None:
+        return None
+    return {"session_id": sid, "job_id": jid, "covered": set(cov), "sha": sha, "message_count": mc,
+            "copied_at": at.timestamp()}
+
+
+def default_sessions(src):
+    """DEFAULT_CONFIG["sessions"] read from Hermes's config_defaults.py as data (ast), never imported; {} if unknown."""
+    try:
+        tree = ast.parse((Path(src) / "hermes_cli" / "config_defaults.py").read_text())
+    except (OSError, SyntaxError, ValueError):
+        return {}
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "DEFAULT_CONFIG"
+                                                 for t in node.targets) and isinstance(node.value, ast.Dict)):
+            for k, v in zip(node.value.keys, node.value.values):
+                if isinstance(k, ast.Constant) and k.value == "sessions" and isinstance(v, ast.Dict):
+                    out = {}
+                    for kk, vv in zip(v.keys, v.values):
+                        if isinstance(kk, ast.Constant) and kk.value in ("auto_prune", "retention_days"):
+                            try:
+                                out[kk.value] = ast.literal_eval(vv)
+                            except ValueError:
+                                pass
+                    return out
+    return {}
+
+
+def native_prune(hermes_home, src_ok, src=None):
+    """Hermes's own sessions.auto_prune for this home: {"enabled": bool|None, "retention_days": int|None}."""
+    cfg = {}
+    try:
+        import yaml
+        p = Path(hermes_home) / "config.yaml"
+        if p.exists():
+            cfg = (yaml.safe_load(p.read_text()) or {}).get("sessions") or {}
+    except Exception:                                   # noqa: BLE001  unknown, reported as such
+        return {"enabled": None, "retention_days": None}
+    default = default_sessions(src) if src_ok else {}
+    enabled = cfg.get("auto_prune", default.get("auto_prune"))
+    days = cfg.get("retention_days", default.get("retention_days"))
+    return {"enabled": enabled if isinstance(enabled, bool) else None,
+            "retention_days": days if isinstance(days, int) and not isinstance(days, bool) else None}
+
+
+DF = ("json_extract(CASE WHEN json_valid(model_config) THEN model_config ELSE json_object() END, "
+      "'$._delegate_from')")
+
+
+def delegate_children(conn, sid):
+    """The delegate sessions Hermes's delete_session cascades with *sid* (same rule as Hermes's
+    _collect_delegate_child_ids, in plain SQL so plan mode imports no Hermes code). On apply, Hermes re-checks this
+    set itself inside its write transaction (expected_delete_ids), so a divergence refuses the delete."""
+    found, frontier = {sid}, [sid]
+    while frontier:
+        nxt = []
+        for i in range(0, len(frontier), 400):
+            chunk = frontier[i:i + 400]
+            ph = ",".join("?" * len(chunk))
+            for row in conn.execute(f"SELECT id FROM sessions WHERE {DF} IN ({ph}) "
+                                    f"OR (parent_session_id IN ({ph}) AND {DF} IS NOT NULL)", chunk + chunk):
+                if row[0] not in found:
+                    found.add(row[0])
+                    nxt.append(row[0])
+        frontier = nxt
+    return found - {sid}
+
+
+class Ctx:
+    """What check() needs: receipts, queue dir, cutoff."""
+    def __init__(self, args, receipts, bindings, now):
+        self.queue_dir, self.receipts, self.bindings = args.queue_dir, receipts, bindings
+        self.cutoff = now - args.keep_days * 86400
+        self.keep_days = args.keep_days
+
+
+def check(conn, sid, ctx, fresh_states=False, states=None):
+    """(reason or None, info). The single eligibility rule, used by the plan and inside the delete transaction.
+    info["verified"] is True when a receipt matches the current content, whatever its age (for the risk report)."""
+    info = {"verified": False}
+    if fresh_states:          # inside the delete transaction: re-read which jobs name the session, and their states
+        bindings, states = queue_bindings(ctx.queue_dir)
+    else:
+        bindings = ctx.bindings
+    jobs = bindings.get(sid, set())
+    if not jobs:
+        return "no card job names this session", info
+    rc = ctx.receipts.get(sid)
+    if conn.execute("SELECT 1 FROM sessions WHERE id = ?", (sid,)).fetchone() is None:
+        return "not in state.db", info
+    if rc is None:
+        return "no Postgres copy receipt", info
+    info["has_receipt"] = True
+    if rc["job_id"] not in jobs:
+        return "receipt names a job that doesn't name this session", info
+    covered = {sid} | delegate_children(conn, sid)
+    if covered != rc["covered"]:
+        return "delegate sessions differ from the copy", info
+    sha, n = content_hash(conn, covered)
+    if sha != rc["sha"] or n != rc["message_count"]:
+        return "state.db content differs from the copy", info
+    info.update(verified=True, covered=sorted(covered), messages=n, sha256=sha)
+    for c in sorted(covered):
+        row = conn.execute("SELECT ended_at, pinned FROM sessions WHERE id = ?", (c,)).fetchone()
+        if row is None or row[0] is None:
+            return "session not ended" if c == sid else "a covered delegate session isn't ended", info
+        if row[1]:
+            return "session pinned" if c == sid else "a covered delegate session is pinned", info
+    if any(states.get(j) in ACTIVE_JOB_STATES or states.get(j) in ("unreadable", "missing", None) for j in jobs):
+        return "its card job is queued, running or unreadable", info
+    if rc["copied_at"] > ctx.cutoff:
+        return f"copy younger than {ctx.keep_days} days", info
+    return None, info
+
+
+def plan(args, now):
+    db_path = Path(args.hermes_home) / "state.db"
+    if not _regular(db_path):
+        raise Refuse(f"no state.db at {db_path}")
+    bindings, states = queue_bindings(args.queue_dir)
+    receipts, store = {}, {"configured": bool(args.copies_dsn_file), "readable": None, "rows": 0, "malformed": 0}
+    if args.copies_dsn_file:
+        try:
+            rows = read_receipts(args.copies_dsn_file, args.psql)
+            store["readable"], store["rows"] = True, len(rows)
+            seen = set()
+            for r in rows:
+                pr = parse_receipt(r)
+                if pr is None or pr["session_id"] in seen:     # a duplicate is ambiguous: malformed
+                    store["malformed"] += 1
+                    receipts.pop(pr["session_id"], None) if pr else None
+                    continue
+                seen.add(pr["session_id"])
+                receipts[pr["session_id"]] = pr
+        except RuntimeError as e:
+            store["readable"], store["error"] = False, str(e)
+    if store["malformed"]:
+        store["usable"] = False                                # any malformed row: delete nothing this run
+    else:
+        store["usable"] = store["readable"] is True
+    ctx = Ctx(args, receipts, bindings, now)
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only = 1")
+    eligible, kept, unverified = [], [], 0
+    try:
+        conn.execute("BEGIN")                                  # one read snapshot for the whole plan
+        for sid in sorted(bindings):
+            entry = {"session": sid, "jobs": sorted(bindings[sid])}
+            row = conn.execute("SELECT started_at, last_activity_at, ended_at FROM sessions WHERE id = ?",
+                               (sid,)).fetchone()
+            if row is not None:
+                activity = max(x for x in (*row, 0) if isinstance(x, (int, float)))
+                entry["inactive_days"] = round((now - activity) / 86400, 1)
+            reason, info = check(conn, sid, ctx, states=states)
+            if sid in receipts:
+                entry["copied_days_ago"] = round((now - receipts[sid]["copied_at"]) / 86400, 1)
+            if not info["verified"]:
+                unverified += 1
+            if reason is None:
+                entry.update(covered=info["covered"], messages=info["messages"], sha256=info["sha256"])
+                eligible.append(entry)
+            else:
+                entry["reason"] = reason
+                kept.append(entry)
+    finally:
+        conn.close()
+    np_ = native_prune(args.hermes_home, args.src_ok, args.hermes_src)
+    np_["card_traces_without_copy"] = unverified
+    # Unknown (None) counts as on: Hermes's default is to prune.
+    np_["at_risk"] = np_["enabled"] is not False and unverified > 0
+    return {"keep_days": args.keep_days, "copy_store": store, "candidates": len(bindings),
+            "eligible": eligible if store["usable"] else [], "kept": kept, "native_prune": np_}, ctx
+
+
+def apply(args, report, ctx):
+    """Delete each eligible session through Hermes's delete_session. check() runs again on Hermes's own connection,
+    inside its BEGIN IMMEDIATE write transaction, via the display-snapshot fence hook; any failure there refuses."""
+    import inspect
+    from hermes_state import SessionDB
+    try:
+        src = inspect.getsource(SessionDB.delete_session)
+    except (OSError, TypeError):
+        raise Refuse("can't read this Hermes's delete_session; refusing to delete")
+    import textwrap
+    digest = hashlib.sha256(textwrap.dedent(src).strip().encode()).hexdigest()
+    if digest not in DELETE_SOURCE_SHA256:
+        raise Refuse(f"unreviewed Hermes delete_session (sha256 {digest}); refusing to delete")
+    token = [{"fleet-trace-retention": "in-transaction check passed"}]
+
+    class Fenced(SessionDB):
+        fence = None            # (sid, result list) while one delete runs
+
+        def _display_messages_from_conn(self, conn, session_id):
+            f = self.fence
+            if f is None or session_id != f[0]:
+                return None                                  # never matches the token: Hermes refuses
+            reason, _ = check(conn, session_id, ctx, fresh_states=True)
+            f[1].append(reason)
+            return token if reason is None else None
+
+    db = Fenced(Path(args.hermes_home) / "state.db")
+    deleted, skipped = [], []
+    try:
+        for e in report["eligible"]:
+            sid = e["session"]
+            result = []
+            db.fence = (sid, result)
+            try:
+                ok = db.delete_session(sid, expected_delete_ids=list(e["covered"]),
+                                       expected_display_messages={sid: token})
+            finally:
+                db.fence = None
+            if ok and result == [None]:
+                deleted.append({"session": sid, "covered": e["covered"]})
+            elif ok:                                           # impossible with a reviewed delete_session
+                raise Refuse(f"Hermes deleted {sid} without running the in-transaction check")
+            else:
+                skipped.append({"session": sid, "reason": (result[-1] if result and result[-1] else
+                                                           "Hermes's fence refused (changed since the plan)")})
+    finally:
+        db.close()
+    report["deleted"], report["apply_skipped"] = deleted, skipped
+    return report
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--hermes-home", default=os.path.expanduser("~/.hermes"))
+    ap.add_argument("--hermes-src", default="/usr/local/lib/hermes-agent")
+    ap.add_argument("--queue-dir", default=os.path.expanduser("~/.local/state/card-prompts"))
+    ap.add_argument("--copies-dsn-file")
+    ap.add_argument("--psql", default="psql")
+    ap.add_argument("--keep-days", type=int, default=MIN_KEEP_DAYS)
+    ap.add_argument("--apply", action="store_true")
+    args = ap.parse_args(argv)
+    if args.keep_days < MIN_KEEP_DAYS:
+        print(json.dumps({"error": f"--keep-days must be >= {MIN_KEEP_DAYS} (D3)"}))
+        return 2
+    src = Path(args.hermes_src)
+    args.src_ok = (src / "hermes_state.py").is_file()
+    if args.src_ok and str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    lock = None   # plan mode writes nothing, not even a lock file; apply runs one at a time
+    if args.apply:
+        lock_path = Path(args.hermes_home) / ".fleet-trace-retention.lock"
+        try:
+            lock = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            print(json.dumps({"error": f"lock {lock_path}: {e.__class__.__name__}"}))
+            return 2
+    try:
+        report, ctx = plan(args, time.time())
+        report["mode"] = "apply" if args.apply else "plan"
+        if args.apply:
+            if not args.src_ok:
+                raise Refuse("--apply needs --hermes-src with hermes_state.py")
+            if not report["copy_store"]["usable"]:
+                report["deleted"] = []
+            else:
+                report = apply(args, report, ctx)
+    except Refuse as e:
+        print(json.dumps({"error": str(e)}))
+        return 2
+    finally:
+        if lock is not None:
+            os.close(lock)
+    print(json.dumps(report, sort_keys=True, default=sorted))
+    if report["copy_store"]["configured"] and not report["copy_store"]["usable"]:
+        return 4
+    return 3 if report["native_prune"]["at_risk"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
