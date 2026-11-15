@@ -17,6 +17,16 @@ echo "junk" >"$T/skills/beta/__pycache__/x.pyc"
 echo "TOKEN=abc" >"$T/skills/beta/.env"
 echo "beta" >"$T/skills/beta/SKILL.md"
 ln -s /etc/hostname "$T/skills/beta/link"
+# Hermes-provided packages: bundled (manifest hash) and hub installs
+mkdir -p "$T/skills/cat/bundled-same" "$T/skills/cat/bundled-edited" "$T/skills/cat/hubbed" "$T/skills/.hub" "$T/skills/.curator_backups"
+printf -- '---\nname: bundled-same\n---\nx\n' >"$T/skills/cat/bundled-same/SKILL.md"
+printf -- '---\nname: bundled-edited\n---\nx\n' >"$T/skills/cat/bundled-edited/SKILL.md"
+echo hub >"$T/skills/cat/hubbed/SKILL.md"
+echo '{"version":1,"installed":{"hubbed":{"install_path":"cat/hubbed"}}}' >"$T/skills/.hub/lock.json"
+echo old >"$T/skills/.curator_backups/b"; echo '{}' >"$T/skills/.usage.json"
+mh() { python3 -c "import hashlib,sys; from pathlib import Path; d=Path(sys.argv[1]); h=hashlib.md5(); [ (h.update(str(f.relative_to(d)).encode()), h.update(f.read_bytes())) for f in sorted(d.rglob('*')) if f.is_file()]; print(h.hexdigest())" "$1"; }
+printf 'bundled-same:%s\nbundled-edited:%s\n' "$(mh "$T/skills/cat/bundled-same")" "$(mh "$T/skills/cat/bundled-edited")" >"$T/skills/.bundled_manifest"
+echo "edited on the node" >>"$T/skills/cat/bundled-edited/SKILL.md"
 run() { "$CAP" --skills "$T/skills" --repo "$T/remote.git" --state "$T/state" --host testhost "$@"; }
 
 # 1. dry run commits nothing
@@ -29,6 +39,9 @@ files="$(git --git-dir="$T/remote.git" ls-tree -r --name-only main)"
 [[ "$(st result)" == "pushed" ]] && ok "first capture pushed" || no "first capture result $(st result)"
 grep -qx "skills/alpha/SKILL.md" <<<"$files" && grep -qx "skills/alpha/references/r.md" <<<"$files" && ok "skills captured" || no "skills missing: $files"
 ! grep -q -e '\.env' -e '__pycache__' <<<"$files" && ok "env + cache files excluded" || no "excluded files leaked: $files"
+! grep -q "cat/bundled-same" <<<"$files" && grep -qx "skills/cat/bundled-edited/SKILL.md" <<<"$files" && ok "unmodified bundled skill skipped, node-edited one captured" || no "bundled: $files"
+! grep -q "cat/hubbed" <<<"$files" && grep -qx "skills/.hub/lock.json" <<<"$files" && grep -qx "skills/.bundled_manifest" <<<"$files" && ok "hub install skipped, lock + manifest kept" || no "hub: $files"
+! grep -q -e curator_backups -e usage.json <<<"$files" && ok "Hermes runtime state skipped" || no "runtime state: $files"
 [[ "$(git --git-dir="$T/remote.git" log -1 --format=%an main)" == "Hermes skills capture (testhost)" ]] && ok "author names the host" || no "author"
 
 # 3. unchanged run is a no-op
@@ -67,8 +80,9 @@ run >/dev/null
 tmpc="$T/other-writer"; git clone -q "$T/remote.git" "$tmpc"
 (cd "$tmpc" && echo x >README.md && git add README.md && git -c user.name=t -c user.email=t@t commit -qm readme && git push -q origin main)
 echo "racing edit" >>"$T/skills/alpha/SKILL.md"
-run >/dev/null 2>&1 && rebased=1 || rebased=0
+run >/dev/null 2>&1 || true
 git --git-dir="$T/remote.git" cat-file -e main:README.md && ok "another writer's commit survives (fetch+reset keeps it)" || no "remote commit lost"
+git --git-dir="$T/remote.git" show main:skills/alpha/SKILL.md | grep -q "racing edit" && [[ "$(st result)" == "pushed" ]] && ok "the racing edit lands on top" || no "racing edit: $(st result)"
 
 echo "# $pass passed, $failn failed"
 [[ "$failn" == "0" ]]

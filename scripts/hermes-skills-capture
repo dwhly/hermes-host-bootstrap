@@ -9,7 +9,8 @@
 #
 # What it does, in order (fail closed at every step):
 #   1. mirror DIR into <state>/work/skills/ (rsync --delete inside the capture copy only; the node's skills dir is
-#      only ever READ), excluding caches and key/env files;
+#      only ever READ), excluding caches, key/env files, Hermes runtime state (usage, curator, locks, archive), and
+#      Hermes-provided packages: unmodified bundled skills and hub installs (the manifest and hub lock are kept);
 #   2. scan every captured file for credential patterns; ANY hit -> no commit, no push, exit 3, file:line + pattern
 #      name in the status file (never the matched value);
 #   3. commit if anything changed (author "Hermes skills capture (<host>)"), push to <branch>;
@@ -71,10 +72,68 @@ else
 fi
 [[ -z "$(git status --porcelain --ignored -- . ':!skills')" ]] || fail "working clone has unexpected local changes outside skills/"
 
+# Hermes-provided packages are not company skills (§7.2: "Hermes's bundled skills are not copied"): a bundled skill
+# whose files still match its .bundled_manifest origin hash (Hermes's own md5 recipe), and any hub install listed in
+# .hub/lock.json (the lock itself is captured as the record). A bundled skill edited on the node no longer matches,
+# so it IS captured: that edit is exactly what capture exists to keep.
+EXCL="$STATE/excludes.txt"
+python3 - "$SKILLS" >"$EXCL" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+CACHE = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+def runtime_cache(p, d):
+    rel = p.relative_to(d)
+    if any(x in CACHE for x in rel.parts[:-1]) or (p.name in CACHE and p.is_dir()):
+        return True
+    return p.suffix in {".pyc", ".pyo"} and p.with_suffix(".py").is_file()
+def dir_hash(d, with_cache=False):          # mirrors hermes-agent tools/skills_sync.py _dir_hash
+    h = hashlib.md5()
+    for f in sorted(d.rglob("*")):
+        if (with_cache or not runtime_cache(f, d)) and f.is_file():
+            h.update(str(f.relative_to(d)).encode("utf-8")); h.update(f.read_bytes())
+    return h.hexdigest()
+def skill_name(md, fallback):               # mirrors tools/skill_usage.py _read_skill_name
+    try:
+        lines = [l.strip() for l in md.read_text(encoding="utf-8-sig", errors="replace")[:4000].split("\n")]
+    except OSError:
+        return fallback
+    if "---" not in lines:
+        return fallback
+    block = lines[lines.index("---") + 1:]
+    block = block[:block.index("---")] if "---" in block else block
+    return next((v for v in (l.split(":", 1)[1].strip().strip("\"'") for l in block if l.startswith("name:")) if v), fallback)
+manifest = {}
+try:
+    for line in (root / ".bundled_manifest").read_text(encoding="utf-8-sig").splitlines():
+        if ":" in line:
+            n, _, hv = line.strip().partition(":"); manifest[n.strip()] = hv.strip()
+except OSError:
+    pass
+hub = set()
+try:
+    for e in (json.loads((root / ".hub" / "lock.json").read_text()).get("installed") or {}).values():
+        if isinstance(e, dict) and e.get("install_path"):
+            hub.add(str(e["install_path"]).strip("/"))
+except (OSError, ValueError):
+    pass
+out = set(hub)
+for md in sorted(root.rglob("SKILL.md")):
+    d = md.parent; rel = d.relative_to(root).as_posix()
+    if rel.startswith(".") or "/." in rel:
+        continue
+    origin = manifest.get(skill_name(md, d.name))
+    if origin and (dir_hash(d) == origin or dir_hash(d, True) == origin):
+        out.add(rel)
+for rel in sorted(out):
+    print("/" + rel + "/")
+PY
 mkdir -p skills
-rsync -a --delete --delete-excluded \
+rsync -a --delete --delete-excluded --exclude-from="$EXCL" \
   --exclude '.git/' --exclude '__pycache__/' --exclude '*.pyc' --exclude 'node_modules/' \
   --exclude '.env' --exclude '.env.*' --exclude '*.pem' --exclude '*.key' --exclude '*.p12' --exclude '.DS_Store' \
+  --exclude '/.archive/' --exclude '/.curator_backups/' --exclude '/.locks/' --exclude '/.usage.json*' \
+  --exclude '/.curator_state' --exclude '/.curator_ledger.jsonl' \
   "$SKILLS"/ skills/
 
 # 2. credential scan of the captured tree (pattern names only are reported)
