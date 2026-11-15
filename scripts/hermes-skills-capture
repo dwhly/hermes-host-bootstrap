@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# hermes-skills-capture — nightly capture of a node's Hermes skills into the company's private skills repo.
+#
+# EDD-fleet-architecture §7.3 step 1 ("Now: capture every node's skills into private repos as they are, with a
+# nightly automatic capture and a diff alert until convergence owns them"). Repo homes decided in §7.2:
+# amforge/operating-skills, BTPAutomation/operating-skills.
+#
+# Usage: hermes-skills-capture --skills DIR --repo URL [--state DIR] [--branch main] [--dry-run] [--host NAME]
+#
+# What it does, in order (fail closed at every step):
+#   1. mirror DIR into <state>/work/skills/ (rsync --delete inside the capture copy only; the node's skills dir is
+#      only ever READ), excluding caches and key/env files;
+#   2. scan every captured file for credential patterns; ANY hit -> no commit, no push, exit 3, file:line + pattern
+#      name in the status file (never the matched value);
+#   3. commit if anything changed (author "Hermes skills capture (<host>)"), push to <branch>;
+#   4. write <state>/status.json: last run, result, changed paths count, commit, error. The "diff alert" is this
+#      status file plus a failed systemd unit on any error; the nightly commit itself is the diff record.
+# Never deletes anything in the remote's history (no force push; a rejected push is an error, not a retry loop).
+set -euo pipefail
+umask 077
+
+SKILLS="" REPO="" STATE="/var/lib/hermes-skills-capture" BRANCH="main" DRY=0 HOST="$(hostname -s)"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --skills) SKILLS="$2"; shift 2 ;;
+    --repo) REPO="$2"; shift 2 ;;
+    --state) STATE="$2"; shift 2 ;;
+    --branch) BRANCH="$2"; shift 2 ;;
+    --host) HOST="$2"; shift 2 ;;
+    --dry-run) DRY=1; shift ;;
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+[[ -n "$SKILLS" && -n "$REPO" ]] || { echo "need --skills DIR and --repo URL" >&2; exit 2; }
+[[ -d "$SKILLS" ]] || { echo "skills dir not found: $SKILLS" >&2; exit 2; }
+[[ "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "bad branch name" >&2; exit 2; }
+
+mkdir -p "$STATE"
+WORK="$STATE/work"
+STATUS="$STATE/status.json"
+NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+exec 9>"$STATE/.lock"
+flock -n 9 || { echo "another capture is running" >&2; exit 4; }
+
+status() {  # status <result> <changed> <commit> <error>
+  python3 - "$STATUS" "$NOW" "$HOST" "$SKILLS" "$REPO" "$1" "$2" "$3" "$4" <<'PY'
+import json, os, sys
+p, now, host, skills, repo, result, changed, commit, err = sys.argv[1:]
+tmp = p + ".tmp"
+json.dump({"at": now, "host": host, "skills": skills, "repo": repo, "result": result,
+           "changed_paths": int(changed or 0), "commit": commit or None, "error": err or None}, open(tmp, "w"), indent=1)
+os.replace(tmp, p)
+PY
+}
+fail() { status "error" 0 "" "$1"; echo "ERROR: $1" >&2; exit "${2:-1}"; }
+
+# 1. working clone (first run clones; an existing clone must point at the same repo)
+if [[ ! -d "$WORK/.git" ]]; then
+  rm -rf "$WORK.tmp"
+  git clone -q "$REPO" "$WORK.tmp" 2>"$STATE/clone.err" || fail "clone failed: $(tail -1 "$STATE/clone.err")"
+  mv "$WORK.tmp" "$WORK"
+fi
+cd "$WORK"
+[[ "$(git remote get-url origin)" == "$REPO" ]] || fail "working clone points at $(git remote get-url origin), not $REPO"
+git fetch -q origin 2>"$STATE/fetch.err" || fail "fetch failed: $(tail -1 "$STATE/fetch.err")"
+if git rev-parse -q --verify "origin/$BRANCH" >/dev/null; then
+  git checkout -q -B "$BRANCH" "origin/$BRANCH"
+else
+  git checkout -q --orphan "$BRANCH" 2>/dev/null || git checkout -q "$BRANCH"
+fi
+[[ -z "$(git status --porcelain --ignored -- . ':!skills')" ]] || fail "working clone has unexpected local changes outside skills/"
+
+mkdir -p skills
+rsync -a --delete --delete-excluded \
+  --exclude '.git/' --exclude '__pycache__/' --exclude '*.pyc' --exclude 'node_modules/' \
+  --exclude '.env' --exclude '.env.*' --exclude '*.pem' --exclude '*.key' --exclude '*.p12' --exclude '.DS_Store' \
+  "$SKILLS"/ skills/
+
+# 2. credential scan of the captured tree (pattern names only are reported)
+HITS="$STATE/scan-hits.txt"
+python3 - skills >"$HITS" <<'PY'
+import os, re, sys
+PATTERNS = {
+    "private-key": r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----",
+    "github-token": r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}\b|\bgithub_pat_[A-Za-z0-9_]{40,}\b",
+    "slack-token": r"\bxox[abposr]-[A-Za-z0-9-]{10,}\b",
+    "aws-key": r"\bAKIA[0-9A-Z]{16}\b",
+    "openai-like-key": r"\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{32,}\b",
+    "google-api-key": r"\bAIza[0-9A-Za-z_-]{35}\b",
+    "notion-token": r"\b(?:secret|ntn)_[A-Za-z0-9]{40,}\b",
+    "1password-sa-token": r"\bops_[A-Za-z0-9_-]{40,}\b",
+    "bearer-literal": r"(?i)authorization:\s*bearer\s+[A-Za-z0-9._-]{30,}",
+}
+rx = {k: re.compile(v) for k, v in PATTERNS.items()}
+for root, dirs, files in os.walk(sys.argv[1]):
+    dirs.sort()
+    for f in sorted(files):
+        p = os.path.join(root, f)
+        if os.path.islink(p):
+            continue  # committed as a link (its path), never its target's content
+        try:
+            with open(p, "rb") as fh:
+                data = fh.read(4 * 1024 * 1024)
+        except OSError:
+            continue
+        if b"\0" in data[:8192]:
+            continue  # binary: no text secrets expected; size-limited by the repo anyway
+        for n, line in enumerate(data.decode("utf-8", "replace").splitlines(), 1):
+            for name, r in rx.items():
+                if r.search(line):
+                    print(f"{p}:{n}: {name}")
+PY
+if [[ -s "$HITS" ]]; then
+  git checkout -q -- . 2>/dev/null || true; git clean -fdq -- skills 2>/dev/null || true
+  status "blocked-secret" 0 "" "credential pattern in $(wc -l <"$HITS") line(s); see $HITS (file:line: pattern, no values)"
+  echo "BLOCKED: credential patterns found; nothing committed or pushed. See $HITS" >&2
+  exit 3
+fi
+
+# 3. commit + push
+git add -A -- skills
+CHANGED="$(git diff --cached --name-only | wc -l | tr -d ' ')"
+if [[ "$CHANGED" == "0" ]]; then
+  status "unchanged" 0 "$(git rev-parse -q --verify HEAD || true)" ""
+  echo "unchanged"; exit 0
+fi
+if [[ "$DRY" == "1" ]]; then
+  git diff --cached --stat | tail -3
+  git reset -q
+  status "dry-run" "$CHANGED" "" ""
+  exit 0
+fi
+git -c user.name="Hermes skills capture ($HOST)" -c user.email="hermes-skills-capture@$HOST" \
+  commit -q -m "capture $HOST skills $NOW ($CHANGED paths)" -m "Source: $HOST:$SKILLS (nightly capture, EDD-fleet-architecture §7.3)"
+git push -q origin "HEAD:refs/heads/$BRANCH" 2>"$STATE/push.err" || fail "push failed: $(tail -1 "$STATE/push.err")"
+status "pushed" "$CHANGED" "$(git rev-parse HEAD)" ""
+echo "pushed $CHANGED paths: $(git rev-parse --short HEAD)"
