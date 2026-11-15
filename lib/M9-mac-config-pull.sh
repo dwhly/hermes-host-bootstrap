@@ -5,7 +5,8 @@
 # once at bootstrap, so a Mac silently froze at whatever commit it had (h-mini2 was
 # 10,077 commits behind in 2026-11). This installs a per-user LaunchAgent that runs
 # ~/.hermes/scripts/hermes-config-pull.sh --quiet at load and every 30 minutes.
-# launchd runs a missed StartInterval on wake, so sleeping laptops catch up.
+# It uses StartCalendarInterval (not StartInterval): launchd runs a calendar slot
+# missed during sleep once on wake, so sleeping laptops catch up.
 #
 # The agent never passes --adopt-fleet: a Mac with unharvested local commits is
 # left in place and the pull tool logs "blocked" instead of dropping work. Local
@@ -15,7 +16,7 @@
 # Scope: macOS, client role, recommended tier, ~/.hermes git-tracked with the pull tool.
 # Knobs (~/.hermes-bootstrap.conf or env):
 #   HERMES_CONFIG_PULL_SCHEDULE=1|0     default 1; 0 removes the agent
-#   HERMES_CONFIG_PULL_INTERVAL_MIN=30  minutes between pulls (5..1440)
+#   HERMES_CONFIG_PULL_INTERVAL_MIN=30  minutes between pulls: 10, 15, 20, 30 or 60
 # Skip key: config-pull-schedule (leaves any existing agent as is).
 
 set -euo pipefail
@@ -60,12 +61,9 @@ case "$want" in
   *) warn "invalid HERMES_CONFIG_PULL_SCHEDULE=$want (use 1 or 0)"; return 1 2>/dev/null || exit 1 ;;
 esac
 case "$interval_min" in
-  ''|*[!0-9]*) warn "invalid HERMES_CONFIG_PULL_INTERVAL_MIN=$interval_min"; return 1 2>/dev/null || exit 1 ;;
+  10|15|20|30|60) ;;
+  *) warn "invalid HERMES_CONFIG_PULL_INTERVAL_MIN=$interval_min (use 10, 15, 20, 30 or 60)"; return 1 2>/dev/null || exit 1 ;;
 esac
-if (( interval_min < 5 || interval_min > 1440 )); then
-  warn "HERMES_CONFIG_PULL_INTERVAL_MIN=$interval_min out of range (5..1440)"
-  return 1 2>/dev/null || exit 1
-fi
 
 if ! role_includes client || ! tier_allows R; then
   remove_agent "needs a Mac client on the recommended tier"
@@ -81,7 +79,13 @@ if [[ ! -f "$pull_script" ]]; then
 fi
 
 mkdir -p "$log_dir" "$HOME/Library/LaunchAgents"
-interval_s=$(( interval_min * 60 ))
+# One calendar slot per interval within the hour, offset by 7 minutes.
+slots=""
+minute=7
+while (( minute < 60 )); do
+  slots+="    <dict><key>Minute</key><integer>$minute</integer></dict>"$'\n'
+  minute=$(( minute + interval_min ))
+done
 agent_path="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # XML-escape every interpolated path (a HERMES_HOME may contain & < >).
@@ -97,7 +101,9 @@ cat >"$plist.tmp" <<PLIST
   <key>ProgramArguments</key>
   <array><string>/bin/bash</string><string>$x_script</string><string>--quiet</string></array>
   <key>RunAtLoad</key><true/>
-  <key>StartInterval</key><integer>$interval_s</integer>
+  <key>StartCalendarInterval</key>
+  <array>
+$slots  </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>HERMES_HOME</key><string>$x_home</string>
@@ -118,10 +124,14 @@ else
   if launchctl print "$domain/$label" >/dev/null 2>&1; then
     # Changed definition: reload. bootout is async; bootstrapping too early fails (EIO).
     launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
+    for _ in $(seq 1 20); do
       launchctl print "$domain/$label" >/dev/null 2>&1 || break
       sleep 0.5
     done
+    if launchctl print "$domain/$label" >/dev/null 2>&1; then
+      warn "config-pull: old agent still loaded after bootout; new definition not active (rerun bootstrap)"
+      return 1 2>/dev/null || exit 1
+    fi
   fi
 fi
 if ! launchctl print "$domain/$label" >/dev/null 2>&1; then
