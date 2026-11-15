@@ -348,6 +348,29 @@ class Capture(unittest.TestCase):
         self.assertEqual(st["result"], "pushed")
         self.assertTrue(st["alert_error"])
 
+    def test_truncated_or_failed_cat_file_blocks(self):
+        shim = self.t / "shim"
+        shim.mkdir()
+        real_git = shutil.which("git")
+        for mode in ("truncate", "exit"):
+            with self.subTest(mode=mode):
+                body = ("python3 -c 'import sys; l=sys.stdin.readline().split()[0]; "
+                        "sys.stdout.buffer.write(l.encode()+b\\\" blob 100\\\\n\\\"+b\\\"x\\\"*16)'"
+                        if mode == "truncate" else f"{real_git} \"$@\"; exit 7")
+                (shim / "git").write_text(
+                    f'#!/bin/sh\nfor a in "$@"; do [ "$a" = "--batch" ] && {{ {body}; exit $?; }}; done\n'
+                    f'exec {real_git} "$@"\n')
+                os.chmod(shim / "git", 0o755)
+                env_path = os.environ["PATH"]
+                os.environ["PATH"] = f"{shim}:{env_path}"
+                try:
+                    rc = self.run_cap()
+                finally:
+                    os.environ["PATH"] = env_path
+                self.assertEqual(rc, 1)
+                self.assertIn("cat-file", self.status()["error"])
+                self.assertIsNone(self.tip())
+
     # ── r2 review counterexamples ──
     def test_conditional_include_rewrite_is_refused(self):
         other = self.t / "other.git"

@@ -240,12 +240,15 @@ def scan_index(work):
                 raise Blocked("error", f"cat-file failed for {redact(path)}")
             size = int(header[2])
             data = proc.stdout.read(size)
-            proc.stdout.read(1)                                  # trailing newline
+            if len(data) != size or proc.stdout.read(1) != b"\n":   # a truncated body is never "scanned"
+                raise Blocked("error", f"cat-file returned a truncated blob for {redact(path)}")
             hits += scan(path, data)
     finally:
         proc.stdin.close()
         proc.stdout.close()
-        proc.wait()
+        rc = proc.wait()
+    if rc != 0:
+        raise Blocked("error", f"cat-file exited {rc}")
     return hits
 
 
