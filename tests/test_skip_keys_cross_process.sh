@@ -32,7 +32,11 @@ expect() { [[ "$2" == "$3" ]] || fail "$1: got [$2] want [$3]"; }
 expect "cli --skip"      "$(run -- --skip=alpha,beta)"            "PROBE kept=gamma PROBE skipped=alpha PROBE skipped=beta "
 expect "cli --skip x y"  "$(run -- --skip alpha)"                 "PROBE kept=beta PROBE kept=gamma PROBE skipped=alpha "
 expect "HERMES_SKIP"     "$(run HERMES_SKIP=gamma --)"            "PROBE kept=alpha PROBE kept=beta PROBE skipped=gamma "
-expect "conf + cli"      "$(run HERMES_SKIP=gamma -- --skip=alpha)" "PROBE kept=beta PROBE skipped=alpha PROBE skipped=gamma "
+expect "env + cli"       "$(run HERMES_SKIP=gamma -- --skip=alpha)" "PROBE kept=beta PROBE skipped=alpha PROBE skipped=gamma "
 expect "no skips"        "$(run --)"                              "PROBE kept=alpha PROBE kept=beta PROBE kept=gamma "
+# Unexported HERMES_SKIP in ~/.hermes-bootstrap.conf (how hosts actually set it), plus CLI.
+printf 'HERMES_SKIP=gamma\n' >"$WORK/home/.hermes-bootstrap.conf"
+expect "conf file + cli" "$(run -- --skip=alpha)"                 "PROBE kept=beta PROBE skipped=alpha PROBE skipped=gamma "
+rm -f "$WORK/home/.hermes-bootstrap.conf"
 
 echo "PASS test_skip_keys_cross_process"
