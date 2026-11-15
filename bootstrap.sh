@@ -109,7 +109,10 @@ if [[ -n "$ROLE_CLI" ]]; then
   esac
 fi
 
-export TIER SKIP_KEYS
+# Bash cannot export arrays, and modules run as child `bash "$path"` processes, so
+# also export the skip list as a comma-separated string; common.sh rebuilds SKIP_KEYS.
+HERMES_SKIP_KEYS="$(IFS=,; printf '%s' "${SKIP_KEYS[*]:-}")"
+export TIER SKIP_KEYS HERMES_SKIP_KEYS
 
 # ── Source common helpers ──
 # shellcheck disable=SC1091

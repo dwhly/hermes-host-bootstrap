@@ -223,6 +223,12 @@ tier_allows() {
   esac
 }
 
+# Modules run as child processes and arrays are not inherited: rebuild SKIP_KEYS
+# from the HERMES_SKIP_KEYS string bootstrap.sh exports.
+if [[ -z "${SKIP_KEYS[*]:-}" && -n "${HERMES_SKIP_KEYS:-}" ]]; then
+  IFS=',' read -r -a SKIP_KEYS <<< "$HERMES_SKIP_KEYS"
+fi
+
 # is_skipped — was this module/keyword passed via --skip?
 is_skipped() {
   local key="$1"
