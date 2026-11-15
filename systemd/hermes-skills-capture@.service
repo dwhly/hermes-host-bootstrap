@@ -1,12 +1,14 @@
 # Nightly capture of a company's Hermes skills into its private skills repo (EDD-fleet-architecture §7.3).
-# Instance = company (amforge, btp). Each install adds a drop-in, e.g. on h-af
+# Instance = company (amforge, btp). Each install adds a drop-in with the arguments, e.g. on h-af
 # /etc/systemd/system/hermes-skills-capture@amforge.service.d/args.conf:
 #   [Service]
-#   Environment="SKILLS_CAPTURE_ARGS=--skills /root/.hermes/skills --repo https://github.com/amforge/operating-skills.git --host h-af"
-# Interim for BTP (h-btp's credential cannot reach the repo): run on h-do1 and pull the tree first, read-only:
-#   ExecStartPre=/usr/bin/rsync -a --delete root@h-btp:/home/hermes/.hermes/skills/ /var/lib/hermes-skills-capture/btp/src/
-# A failed run (credential pattern found, push rejected, clone/fetch error) leaves the unit failed: that is the
-# alert; the reason is in /var/lib/hermes-skills-capture/<instance>/status.json.
+#   Environment="SKILLS_CAPTURE_ARGS=--skills /root/.hermes/skills --bundled /usr/local/lib/hermes-agent/skills --repo https://github.com/amforge/operating-skills.git --host h-af"
+#   Environment="SKILLS_CAPTURE_ALERT=hermes send -q -t slack:hermes-cronjobs -f -"
+# Interim for BTP (h-btp's credential can't reach the repo): runs on h-do1, first copying the trees read-only:
+#   ExecStartPre=/usr/bin/rsync -a --checksum --delete root@h-btp:/home/hermes/.hermes/skills/ /var/lib/hermes-skills-capture-src/btp/skills/
+#   ExecStartPre=/usr/bin/rsync -a --checksum --delete root@h-btp:/home/hermes/.hermes/hermes-agent/skills/ /var/lib/hermes-skills-capture-src/btp/bundled/
+# The diff alert: SKILLS_CAPTURE_ALERT gets a line for every pushed change and every failure; a failure also leaves
+# the unit failed. Details: /var/lib/hermes-skills-capture/<instance>/status.json.
 [Unit]
 Description=Capture %i Hermes skills into the company skills repo
 After=network-online.target
@@ -14,8 +16,13 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/hermes-skills-capture --state /var/lib/hermes-skills-capture/%i $SKILLS_CAPTURE_ARGS
+StateDirectory=hermes-skills-capture/%i hermes-skills-capture-src/%i
+StateDirectoryMode=0700
+Environment=HOME=/root
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=SKILLS_CAPTURE_ALERT=
+ExecStart=/usr/local/sbin/hermes-skills-capture --state /var/lib/hermes-skills-capture/%i --alert-cmd ${SKILLS_CAPTURE_ALERT} $SKILLS_CAPTURE_ARGS
 Nice=10
 IOSchedulingClass=idle
-MemoryMax=400M
+MemoryMax=600M
 TimeoutStartSec=20min
