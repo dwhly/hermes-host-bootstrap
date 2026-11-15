@@ -33,7 +33,7 @@ os.environ.setdefault("HERMES_DISABLE_LAZY_INSTALLS", "1")
 MIN_KEEP_DAYS = 90
 HASH_VERSION = 1
 SID = r"(\d{8}_\d{6}_[0-9A-Za-z]+)"
-SESSION_RE = re.compile(r"^Session:[ \t]+" + SID + r"[ \t]*$", re.M)       # same as amforge prompt_worker
+SESSION_RE = re.compile(r"^Session:[ \t]+" + SID + r"[ \t]*$", re.M)       # same regexes as the card-prompt worker
 RESUME_RE = re.compile(r"^[ \t]*hermes --resume " + SID + r"[ \t]*$", re.M)
 SID_FULL = re.compile(r"^" + SID + r"$")
 JOB_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_.-]{0,127}$")
