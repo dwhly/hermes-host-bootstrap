@@ -53,12 +53,14 @@ try:
 except Exception as e:
     open(log,'a').write(f"  herdr pane list unavailable ({type(e).__name__}); no sessions ended\n"); sys.exit(0)
 c=sqlite3.connect(f"file:{os.path.expanduser('~/.hermes/state.db')}?mode=ro", uri=True, timeout=tmo)
-def leaf(sid):
-    seen=set()
+def chain(sid):
+    """The pane's session and its newest-descendant chain (compactions, branches). A branch can live in ANOTHER
+    pane, so idleness is the newest human message anywhere on the chain, never the leaf's alone."""
+    out=[sid]
     while True:
         k=c.execute("select id from sessions where parent_session_id=? order by started_at desc limit 1",(sid,)).fetchone()
-        if not k or k[0] in seen: return sid
-        seen.add(sid); sid=k[0]
+        if not k or k[0] in out: return out
+        sid=k[0]; out.append(sid)
 def last_human(sid):
     r=c.execute("select max(timestamp) from messages where session_id=? and role='user' and content not like '[IMPORTANT: Background%'",(sid,)).fetchone()[0]
     return float(r) if r else None
@@ -67,8 +69,10 @@ now=time.time(); idle=[]
 for p in panes:
     s=(p.get('agent_session') or {}).get('value')
     if not s or p.get('agent_status')=='working' or 'keep' in (p.get('label') or '').lower(): continue
-    l=leaf(s); t=last_human(l)
-    if l==me or t is None or (now-t) < 12*3600: continue
+    ch=chain(s); l=ch[-1]
+    ts=[x for x in (last_human(i) for i in ch) if x is not None]
+    t=max(ts) if ts else None
+    if me in ch or t is None or (now-t) < 12*3600: continue
     idle.append((p,l,t))
 if not idle: sys.exit(0)
 # one /proc pass for all idle panes (not one per pane). Each match is pinned with a pidfd and re-verified, and
