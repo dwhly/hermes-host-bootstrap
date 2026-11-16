@@ -95,16 +95,27 @@ def last_human(sid):
     return float(r) if r else None
 me=os.environ.get('HERMES_SESSION_ID','')
 now=time.time(); idle=[]
-for p in panes:
+def idle_state(p):
+    """(leaf, last_human_ts) when the pane is eligible (not working, not 'keep', not this session, idle >= IDLE)."""
     s=(p.get('agent_session') or {}).get('value')
-    if not s or p.get('agent_status')=='working' or 'keep' in (p.get('label') or '').lower(): continue
-    ch=chain(s); l=ch[-1]
-    ts=[x for x in (last_human(i) for i in ch) if x is not None]
+    if not s or p.get('agent_status')=='working' or 'keep' in (p.get('label') or '').lower(): return None
+    ch=chain(s); ts=[x for x in (last_human(i) for i in ch) if x is not None]
     t=max(ts) if ts else None
-    if me in ch or t is None or (now-t) < IDLE: continue
-    idle.append((p,l,t))
+    if me in ch or t is None or (time.time()-t) < IDLE: return None
+    return ch[-1], t
+def still_idle(p, leaf):
+    """Re-check right before disconnecting: archiving takes seconds, and any input meanwhile must win."""
+    try:
+        cur=json.loads(subprocess.run(["herdr","--session","ws","pane","list"],capture_output=True,text=True,timeout=tmo).stdout)['result']['panes']
+    except Exception: return False
+    q=[x for x in cur if x.get('pane_id')==p['pane_id']]
+    if not q or (q[0].get('agent_session') or {}).get('value')!=(p.get('agent_session') or {}).get('value'): return False
+    st=idle_state(q[0])
+    return bool(st) and st[0]==leaf
+for p in panes:
+    st=idle_state(p)
+    if st: idle.append((p,st[0],st[1]))
 if not idle: sys.exit(0)
-idle.sort(key=lambda x:x[2]); idle=idle[:MAXN]        # oldest first, bounded per run
 def export(args):
     r=subprocess.run(["hermes","sessions","export",*args],capture_output=True,text=True,timeout=EXPORT_TMO)
     return r.returncode==0
@@ -155,15 +166,18 @@ for d in os.listdir('/proc'):
     except OSError: continue
     if is_tui(d)!=pane: os.close(fd); continue      # re-verify after pinning
     bypane.setdefault(pane,[]).append((int(d),fd))
+idle=[x for x in idle if bypane.get(x[0]['pane_id'])]   # only panes with a live TUI count against the limit
+idle.sort(key=lambda x:x[2]); idle=idle[:MAXN]           # oldest first, bounded per run
 ended=[]
 for p,l,t in idle:
     pf=bypane.get(p['pane_id'],[])
-    if not pf: continue
     where="(dry-run: not archived)"
     if not dry:
         where=archive(p,l,t)
         if where is None:
             open(log,'a').write(f"  archive FAILED for pane {p['pane_id']} session {l}; left connected\n"); continue
+        if not still_idle(p,l):
+            open(log,'a').write(f"  pane {p['pane_id']} session {l} became active during archiving; archived, left connected\n"); continue
         for _,fd in pf:
             try: signal.pidfd_send_signal(fd, signal.SIGTERM)
             except Exception: pass
