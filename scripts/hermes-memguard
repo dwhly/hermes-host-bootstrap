@@ -1,57 +1,58 @@
 #!/usr/bin/env bash
-# h-do1 memory guard — immediate live fix (2026-10-22). Reversible, no restarts.
-# 1) OOM priorities: protect the access chain + Chief + Herdr; sacrifice idle sessions/helpers/non-default Desktop backends first.
-# 2) +2 GB swap file (buffer; zram module not available on this kernel).
-# 3) End Hermes terminal sessions idle > 12 h (Dan's rule), logging resume commands.
+# shellcheck disable=SC2046  # pid lists are intentionally word-split into separate args
+# hermes-memguard — h-do1 memory guard (installed by lib/S1-memguard.sh; timer every 5 min).
+# 1) Under pressure FIRST: end Hermes terminal sessions idle > 12 h (Dan's rule), logging resume commands.
+# 2) OOM priorities: protect the access chain + Chief + Herdr; sacrifice idle sessions/helpers/non-default Desktop
+#    backends first.
+# 3) +2 GB swap file (buffer; zram module not available on this kernel).
+#
+# Must finish even while the host thrashes (2026-11-15: a run hung > 120 s on blocked docker/herdr/systemctl calls
+# and systemd killed it at the exact moment it was needed). So: every external call is time-boxed (T / timeout=),
+# relief runs before housekeeping, and the unit runs at high CPU/IO priority with protected memory.
+# Test knobs: MEMGUARD_DRY_RUN=1 (log, never kill), MEMGUARD_FORCE_PRESSURE=1, MG_CMD_TIMEOUT=<s> (default 8).
 set -u
 LOG=${LOG:-/root/.hermes/logs/memguard-$(date -u +%F).md}
 QUIET=${QUIET:-0}
+MG_CMD_TIMEOUT=${MG_CMD_TIMEOUT:-8}
+export MG_CMD_TIMEOUT
+DRY=${MEMGUARD_DRY_RUN:-0}
+export MEMGUARD_DRY_RUN=$DRY
+T(){ timeout -k 2 "$MG_CMD_TIMEOUT" "$@"; }
 # Pressure = MemAvailable < 15% of total, or PSI memory some avg60 > 20
 AVAIL_PCT=$(awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{printf "%d", a*100/t}' /proc/meminfo)
 PSI60=$(awk '/^some/{split($3,x,"="); printf "%d", x[2]}' /proc/pressure/memory)
 PRESSURE=0; { [ "$AVAIL_PCT" -lt 15 ] || [ "$PSI60" -gt 20 ]; } && PRESSURE=1
+[ "${MEMGUARD_FORCE_PRESSURE:-0}" = 1 ] && PRESSURE=1
 mkdir -p "$(dirname "$LOG")"
 say(){ [ "$QUIET" = 1 ] && { echo "$(date -u +%T) $*" >> "$LOG"; return; }; echo "$*" | tee -a "$LOG"; }
 adj(){ # adj <score> <label> <pid...> — sets oom_score_adj on each pid and its current children
   local s=$1 l=$2; shift 2
   for p in "$@"; do
-    [ -d /proc/$p ] || continue
+    [ -d "/proc/$p" ] || continue
     local changed=0
-    for q in $p $(pgrep -P $p 2>/dev/null); do
-      [ "$(cat /proc/$q/oom_score_adj 2>/dev/null)" = "$s" ] && continue
-      { echo "$s" > /proc/$q/oom_score_adj; } 2>/dev/null && changed=1
+    for q in $p $(pgrep -P "$p" 2>/dev/null); do
+      [ "$(cat "/proc/$q/oom_score_adj" 2>/dev/null)" = "$s" ] && continue
+      { echo "$s" > "/proc/$q/oom_score_adj"; } 2>/dev/null && changed=1
     done
     [ "$changed" = 1 ] && say "  oom_score_adj $s  pid $p  $l"
   done
 }
-[ "$QUIET" = 1 ] || say "# h-do1 memory guard: live fix $(date -u '+%F %T UTC')"
+[ "$QUIET" = 1 ] || say "# h-do1 memory guard $(date -u '+%F %T UTC')"
 [ "$QUIET" = 1 ] || say "Before: $(free -m | awk '/Mem:/{print "avail "$7"MB"} /Swap:/{print "swap "$3"/"$2"MB"}' | tr '\n' ' ') load $(cut -d' ' -f1-3 /proc/loadavg)"
-[ "$QUIET" = 1 ] || say "## OOM priorities"
-adj -900 "tailscaled (the only way in)"              $(pidof tailscaled)
-adj -800 "herdr servers (Dan's workspace)"           $(pgrep -x herdr) $(pgrep -f 'herdr .*server')
-adj -500 "hermes gateway"                            $(systemctl --user show hermes-gateway -p MainPID --value)
-adj -500 "chief core (uvicorn)"                      $(pgrep -f 'uvicorn chief_core')
-adj -500 "chief postgres"                            $(docker inspect -f '{{.State.Pid}}' chief-stack-postgres-1 2>/dev/null)
-adj -300 "chief fleet console"                       $(docker inspect -f '{{.State.Pid}}' chief-stack-fleet-1 2>/dev/null) $(pgrep -f next-server)
-adj -300 "hermes dashboard (:9000)"                  $(systemctl show hermes-dashboard-server -p MainPID --value)
-for p in $(pgrep -f 'ssh-owner-nonce'); do
-  prof=$(tr '\0' ' ' </proc/$p/cmdline | grep -o -E -- '--profile [^ ]+' | awk '{print $2}')
-  if [ -n "$prof" ] && [ "$prof" != default ]; then adj 500 "Desktop backend, profile $prof (first to go)" $p; fi
-done
-adj 700 "tool helper: chromium"                      $(pgrep -f 'chromium-[0-9]+/chrome-linux64/chrome' | head -40)
-adj 700 "tool helper: pyright LSP"                   $(pgrep -f pyright-langserver)
-adj 200 "hermes terminal sessions (TUI)"             $(pgrep -f 'tui_gateway.entry') $(pgrep -f 'ui-tui/dist/entry.js')
-[ "$QUIET" = 1 ] || say "## Swap buffer"
-if ! swapon --show=NAME --noheadings | grep -q /swapfile2; then
-  fallocate -l 2G /swapfile2 && chmod 600 /swapfile2 && mkswap -q /swapfile2 && swapon -p -3 /swapfile2 && say "  added /swapfile2 (2 GB, lower priority than /swapfile)"
-else [ "$QUIET" = 1 ] || say "  /swapfile2 already active"; fi
+
+# --- 1) relief first -------------------------------------------------------------------------------------------
 if [ "$PRESSURE" = 1 ]; then
-say "## Memory tight (avail ${AVAIL_PCT}%, PSI60 ${PSI60}): end terminal sessions idle > 12 h"
-python3 - "$LOG" <<'PY'
+say "## Memory tight (avail ${AVAIL_PCT}%, PSI60 ${PSI60}): end terminal sessions idle > 12 h$([ "$DRY" = 1 ] && echo " (dry-run)")"
+timeout -k 2 "$((MG_CMD_TIMEOUT * 5))" python3 - "$LOG" <<'PY'
 import sqlite3, os, json, subprocess, time, signal, sys
-log=sys.argv[1]
-c=sqlite3.connect(f"file:{os.path.expanduser('~/.hermes/state.db')}?mode=ro", uri=True)
-panes=json.loads(subprocess.run(["herdr","--session","ws","pane","list"],capture_output=True,text=True).stdout)['result']['panes']
+log=sys.argv[1]; dry=os.environ.get('MEMGUARD_DRY_RUN')=='1'
+tmo=float(os.environ.get('MG_CMD_TIMEOUT','8'))
+try:
+    out=subprocess.run(["herdr","--session","ws","pane","list"],capture_output=True,text=True,timeout=tmo).stdout
+    panes=json.loads(out)['result']['panes']
+except Exception as e:
+    open(log,'a').write(f"  herdr pane list unavailable ({type(e).__name__}); no sessions ended\n"); sys.exit(0)
+c=sqlite3.connect(f"file:{os.path.expanduser('~/.hermes/state.db')}?mode=ro", uri=True, timeout=tmo)
 def leaf(sid):
     seen=set()
     while True:
@@ -62,37 +63,73 @@ def last_human(sid):
     r=c.execute("select max(timestamp) from messages where session_id=? and role='user' and content not like '[IMPORTANT: Background%'",(sid,)).fetchone()[0]
     return float(r) if r else None
 me=os.environ.get('HERMES_SESSION_ID','')
-now=time.time(); out=[]
+now=time.time(); idle=[]
 for p in panes:
     s=(p.get('agent_session') or {}).get('value')
     if not s or p.get('agent_status')=='working' or 'keep' in (p.get('label') or '').lower(): continue
     l=leaf(s); t=last_human(l)
     if l==me or t is None or (now-t) < 12*3600: continue
-    # find the TUI processes bound to this pane
-    pids=[]
-    for d in os.listdir('/proc'):
-        if not d.isdigit(): continue
-        try: env=open(f'/proc/{d}/environ','rb').read()
-        except Exception: continue
-        if f"HERDR_PANE_ID={p['pane_id']}".encode() in env:
-            cmd=open(f'/proc/{d}/cmdline','rb').read()
-            if b'tui_gateway.entry' in cmd or b'ui-tui/dist/entry.js' in cmd: pids.append(int(d))
+    idle.append((p,l,t))
+if not idle: sys.exit(0)
+# one /proc pass for all idle panes (not one per pane)
+want={f"HERDR_PANE_ID={p['pane_id']}".encode():p['pane_id'] for p,_,_ in idle}
+bypane={}
+for d in os.listdir('/proc'):
+    if not d.isdigit(): continue
+    try:
+        env=open(f'/proc/{d}/environ','rb').read(); cmd=open(f'/proc/{d}/cmdline','rb').read()
+    except Exception: continue
+    if b'tui_gateway.entry' not in cmd and b'ui-tui/dist/entry.js' not in cmd: continue
+    for k,pid in want.items():
+        if k+b'\0' in env+b'\0': bypane.setdefault(pid,[]).append(int(d))
+ended=[]
+for p,l,t in idle:
+    pids=bypane.get(p['pane_id'],[])
     if not pids: continue
-    for q in pids:
-        try: os.kill(q, signal.SIGTERM)
-        except Exception: pass
-    out.append(f"  ended pane {p['pane_id']} '{(p.get('terminal_title_stripped') or '')[:45]}' idle {(now-t)/3600:.0f}h pids {pids} -> resume: hermes --resume {l}")
-time.sleep(10)
-for line in out:
-    for q in eval(line.split('pids ')[1].split(' ->')[0]):
-        if os.path.exists(f'/proc/{q}'):
-            try: os.kill(q, signal.SIGKILL)
+    if not dry:
+        for q in pids:
+            try: os.kill(q, signal.SIGTERM)
             except Exception: pass
-if out: open(log,'a').write("\n".join(out)+"\n"); print("\n".join(out))
+    ended.append((pids, f"  {'WOULD END' if dry else 'ended'} pane {p['pane_id']} '{(p.get('terminal_title_stripped') or '')[:45]}' idle {(now-t)/3600:.0f}h pids {pids} -> resume: hermes --resume {l}"))
+if ended and not dry:
+    time.sleep(5)
+    for pids,_ in ended:
+        for q in pids:
+            if os.path.exists(f'/proc/{q}'):
+                try: os.kill(q, signal.SIGKILL)
+                except Exception: pass
+if ended:
+    txt="\n".join(x for _,x in ended); open(log,'a').write(txt+"\n"); print(txt)
 PY
+[ $? -eq 124 ] && say "  session reaper timed out after $((MG_CMD_TIMEOUT * 5))s"
 fi
-[ "$QUIET" = 1 ] || sleep 5
+
+# --- 2) OOM priorities -----------------------------------------------------------------------------------------
+[ "$QUIET" = 1 ] || say "## OOM priorities"
+adj -900 "tailscaled (the only way in)"              $(pidof tailscaled)
+adj -800 "herdr servers (Dan's workspace)"           $(pgrep -x herdr) $(pgrep -f 'herdr .*server')
+adj -500 "hermes gateway"                            $(T systemctl --user show hermes-gateway -p MainPID --value 2>/dev/null)
+adj -500 "chief core (uvicorn)"                      $(pgrep -f 'uvicorn chief_core')
+adj -500 "chief postgres"                            $(T docker inspect -f '{{.State.Pid}}' chief-stack-postgres-1 2>/dev/null)
+adj -300 "chief fleet console"                       $(T docker inspect -f '{{.State.Pid}}' chief-stack-fleet-1 2>/dev/null) $(pgrep -f next-server)
+adj -300 "hermes dashboard (:9000)"                  $(T systemctl show hermes-dashboard-server -p MainPID --value 2>/dev/null)
+for p in $(pgrep -f 'ssh-owner-nonce'); do
+  prof=$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -o -E -- '--profile [^ ]+' | awk '{print $2}')
+  if [ -n "$prof" ] && [ "$prof" != default ]; then adj 500 "Desktop backend, profile $prof (first to go)" "$p"; fi
+done
+adj 700 "tool helper: chromium"                      $(pgrep -f 'chromium-[0-9]+/chrome-linux64/chrome' | head -40)
+adj 700 "tool helper: pyright LSP"                   $(pgrep -f pyright-langserver)
+adj 200 "hermes terminal sessions (TUI)"             $(pgrep -f 'tui_gateway.entry') $(pgrep -f 'ui-tui/dist/entry.js')
+
+# --- 3) swap buffer --------------------------------------------------------------------------------------------
+[ "$QUIET" = 1 ] || say "## Swap buffer"
+if ! swapon --show=NAME --noheadings | grep -q /swapfile2; then
+  if [ "$DRY" = 1 ]; then say "  would add /swapfile2 (dry-run)"
+  else fallocate -l 2G /swapfile2 && chmod 600 /swapfile2 && mkswap -q /swapfile2 && swapon -p -3 /swapfile2 && say "  added /swapfile2 (2 GB, lower priority than /swapfile)"; fi
+else [ "$QUIET" = 1 ] || say "  /swapfile2 already active"; fi
+
 [ "$QUIET" = 1 ] || say "After: $(free -m | awk '/Mem:/{print "avail "$7"MB"} /Swap:/{print "swap "$3"/"$2"MB"}' | tr '\n' ' ') load $(cut -d' ' -f1-3 /proc/loadavg)"
 [ "$QUIET" = 1 ] || say "Log: $LOG"
 # one heartbeat line per run (capacity history for the alerting work)
-echo "{\"at\":\"$(date -u +%FT%TZ)\",\"avail_pct\":$AVAIL_PCT,\"psi_some60\":$PSI60,\"swap_used_mb\":$(free -m | awk '/Swap:/{print $3}'),\"load1\":$(cut -d' ' -f1 /proc/loadavg),\"pressure\":$PRESSURE}" >> /root/.hermes/logs/memguard-capacity.jsonl
+echo "{\"at\":\"$(date -u +%FT%TZ)\",\"avail_pct\":$AVAIL_PCT,\"psi_some60\":$PSI60,\"swap_used_mb\":$(free -m | awk '/Swap:/{print $3}'),\"load1\":$(cut -d' ' -f1 /proc/loadavg),\"pressure\":$PRESSURE,\"secs\":$SECONDS}" >> "${CAPACITY_LOG:-/root/.hermes/logs/memguard-capacity.jsonl}"
+exit 0

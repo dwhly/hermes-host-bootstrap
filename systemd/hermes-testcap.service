@@ -1,0 +1,18 @@
+[Unit]
+Description=Move test runs from login/agent sessions into memory-capped scopes (6G each, 12G total)
+Documentation=https://github.com/dwhly/hermes-host-bootstrap/blob/main/scripts/hermes-testcap
+After=dbus.service
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1 TESTCAP_PER_RUN=6G TESTCAP_SWAP=512M TESTCAP_INTERVAL=2
+ExecStart=/usr/bin/python3 /usr/local/bin/hermes-testcap
+Restart=always
+RestartSec=5
+Nice=-5
+CPUWeight=500
+MemoryMin=64M
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target

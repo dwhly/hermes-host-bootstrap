@@ -1,0 +1,9 @@
+[Unit]
+Description=Memory-capped test runs (hermes-testcap); total cap for all concurrent runs
+Documentation=https://github.com/dwhly/hermes-host-bootstrap/blob/main/scripts/hermes-testcap
+
+[Slice]
+MemoryMax=12G
+MemorySwapMax=2G
+CPUWeight=50
+IOWeight=50

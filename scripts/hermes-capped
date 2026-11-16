@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# hermes-capped <cmd...>: run any heavy command (build, benchmark, unrecognised test runner) inside testcap.slice
+# with a hard memory cap. Foreground, same tty, exit status preserved. CAP=8G hermes-capped make -j8
+set -euo pipefail
+[ $# -gt 0 ] || { echo "usage: [CAP=6G] hermes-capped <cmd...>" >&2; exit 2; }
+exec systemd-run --scope --quiet --collect --slice=testcap.slice \
+  -p MemoryMax="${CAP:-6G}" -p MemorySwapMax="${CAP_SWAP:-512M}" -- "$@"

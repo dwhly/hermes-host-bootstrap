@@ -1,11 +1,16 @@
 [Unit]
-Description=h-do1 memory guard (interim): OOM priorities + end idle >12h sessions under pressure
-Documentation=https://github.com/dwhly/chief-docs/blob/145a7df/edd/PROPOSAL-h-do1-memory-guard.md
+Description=h-do1 memory guard: end idle >12h sessions under pressure + OOM priorities
+Documentation=https://github.com/dwhly/hermes-host-bootstrap/blob/main/lib/S1-memguard.sh
 
 [Service]
 Type=oneshot
 Environment=QUIET=1 HOME=/root XDG_RUNTIME_DIR=/run/user/0 PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
-ExecStart=/bin/bash /root/work/memguard/apply-now.sh
+ExecStart=/usr/local/bin/hermes-memguard
+# It must run WHILE the host thrashes: high CPU/IO priority, its memory protected from reclaim, never an OOM victim.
+# (Nice=5 before 2026-11-16 made it lose to the very processes it was guarding against.)
+Nice=-10
+CPUWeight=1000
+IOWeight=1000
+MemoryMin=128M
 OOMScoreAdjust=-900
-Nice=5
-TimeoutStartSec=120
+TimeoutStartSec=90
