@@ -127,3 +127,13 @@ def test_migrator_submit_never_blocks_and_dedupes():
 def test_pin_rejects_changed_identity():
     me = os.getpid()
     assert tc.pin(me, -1) is None  # wrong starttime: never pinned
+
+
+def test_chunk_units_respects_dbus_fd_limit():
+    """Codex r3: >16 pidfds in one message fails; split, root first, same unit name for the first chunk."""
+    procs = [(i, 0) for i in range(1, 41)]
+    chunks = tc.chunk_units("testcap-1.scope", procs)
+    assert [u for u, _ in chunks] == ["testcap-1.scope", "testcap-1-p1.scope", "testcap-1-p2.scope"]
+    assert [len(c) for _, c in chunks] == [16, 16, 8]
+    assert chunks[0][1][0] == (1, 0)
+    assert tc.chunk_units("testcap-9.scope", [(9, 0)]) == [("testcap-9.scope", [(9, 0)])]

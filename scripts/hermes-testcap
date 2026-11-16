@@ -17,8 +17,9 @@ run ends as one unit (exit 143/137) instead of limping on with a dead worker.
 Limits: a runner is moved within ~INTERVAL seconds while systemd answers (all D-Bus work runs on a separate
 migrator thread, each call bounded by TESTCAP_DBUS_TIMEOUT; the scan never waits on it). Memory allocated before
 the move stays charged to the old cgroup (cgroup v2 does not migrate charges), so a fast grower can exceed PER_RUN
-by that much. Processes are only ever moved by pidfd (StartTransientUnit PIDFDs), never by a bare PID that could
-have been recycled since the scan. Explicit wrapper for other heavy commands: hermes-capped <cmd...>.
+by that much. Processes are handed to systemd as pidfds (StartTransientUnit PIDFDs), re-verified (starttime +
+cgroup) right before the call; systemd's own pidfd-to-PID step leaves a tiny internal race, accepted here (Codex r3).
+Runs with more than 16 processes are split across scopes of <= 16 (D-Bus fd limit per message). Explicit wrapper for other heavy commands: hermes-capped <cmd...>.
 """
 import json
 import os
@@ -210,6 +211,17 @@ def log(event):
 
 
 DBUS_TIMEOUT = float(os.environ.get("TESTCAP_DBUS_TIMEOUT", "3"))
+MAX_FDS = 16  # dbus-daemon's default max_message_unix_fds on the system bus
+
+
+def chunk_units(unit, procs):
+    """Split a run across scopes of <= MAX_FDS processes (root first, in the first scope). Every chunk carries the
+    per-run cap and all sit in testcap.slice, which caps the total."""
+    stem = unit[:-len(".scope")] if unit.endswith(".scope") else unit
+    out = []
+    for n, i in enumerate(range(0, len(procs), MAX_FDS)):
+        out.append((unit if n == 0 else f"{stem}-p{n}.scope", procs[i:i + MAX_FDS]))
+    return out
 
 
 def manager():
@@ -298,6 +310,11 @@ class Migrator:
                     self.inflight.discard(job[1][0])
 
     def _do(self, unit, procs, argv, event):
+        for n, (u, part) in enumerate(chunk_units(unit, procs)):
+            if not self._start(u, part, argv, event if n == 0 else event + "_part", require_first=(n == 0)):
+                return
+
+    def _start(self, unit, procs, argv, event, require_first):
         fds, pids = [], []
         try:
             for pid, ident in procs:
@@ -305,8 +322,8 @@ class Migrator:
                 if fd is not None:
                     fds.append(fd)
                     pids.append(pid)
-            if procs[0][0] not in pids:
-                return  # the runner itself is gone or no longer eligible
+            if not pids or (require_first and procs[0][0] not in pids):
+                return False  # the runner itself is gone or no longer eligible
             import dbus
             err = None
             try:
@@ -320,6 +337,7 @@ class Migrator:
                 self.mgr = None
             log({"event": (event + "_failed") if err else event, "unit": unit, "pids": pids,
                  "cmd": " ".join(argv)[:200], "cap": PER_RUN, "err": err})
+            return err is None
         finally:
             for fd in fds:
                 os.close(fd)
