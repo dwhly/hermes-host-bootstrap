@@ -8,17 +8,17 @@ stopped answering. A runaway test must die inside its own cgroup, never take the
 HOW: every INTERVAL seconds, scan /proc. A process under /user.slice/ whose argv is a test runner (pytest, vitest,
 jest, `playwright test`, `cargo test`, `go test`) is moved, with all its current descendants, into a new transient
 scope `testcap-<pid>.scope` inside `testcap.slice` (MemoryMax=PER_RUN, MemorySwapMax=SWAP; the slice caps the total).
-Children forked later inherit the scope. A descendant that raced the move is attached on the next tick.
+Children forked later inherit the scope. A descendant that raced the move gets its own capped scope next tick.
 Docker/system services are never touched: containers already carry their own mem_limit.
 
 No agent or script has to change. The kernel kills the biggest process INSIDE the scope at the cap; the event is
 logged to LOG (JSONL) and the journal. systemd then stops the whole scope (default OOMPolicy=stop), so the
 run ends as one unit (exit 143/137) instead of limping on with a dead worker.
-Limits: a runner is moved within INTERVAL + (candidates ahead of it in the same scan) x TESTCAP_DBUS_TIMEOUT
-seconds (normally ~2 s; each D-Bus call is bounded at 3 s and failures are per-candidate). Memory allocated before
+Limits: a runner is moved within ~INTERVAL seconds while systemd answers (all D-Bus work runs on a separate
+migrator thread, each call bounded by TESTCAP_DBUS_TIMEOUT; the scan never waits on it). Memory allocated before
 the move stays charged to the old cgroup (cgroup v2 does not migrate charges), so a fast grower can exceed PER_RUN
-by that much. Processes are moved by pidfd (StartTransientUnit PIDFDs) or pinned by one (attach), never by a bare
-PID that could have been recycled since the scan. Explicit wrapper for other heavy commands: hermes-capped <cmd...>.
+by that much. Processes are only ever moved by pidfd (StartTransientUnit PIDFDs), never by a bare PID that could
+have been recycled since the scan. Explicit wrapper for other heavy commands: hermes-capped <cmd...>.
 """
 import json
 import os
@@ -45,23 +45,57 @@ def base(p):
     return os.path.basename(p)
 
 
-PY_VALUE_FLAGS = ("-X", "-W", "-Q")
+PYTEST_NAMES = ("pytest", "py.test")
+PY_VALUE_LETTERS = "XWQ"           # short options whose value may be attached (-Ximporttime) or the next arg
 NODE_VALUE_FLAGS = ("-r", "--require", "--import", "--loader", "--experimental-loader", "-C", "--conditions")
-NODE_INLINE_FLAGS = ("-e", "--eval", "-p", "--print")
+NODE_INLINE = ("-e", "--eval", "-p", "--print")
 
 
-def _first_positional(rest, value_flags, inline_flags):
-    """Index of the script argument after interpreter flags, or None (inline code / no script)."""
+def python_target(rest):
+    """What a python interpreter will run: ("module", name) | ("script", path) | None (inline -c, stdin, REPL)."""
     i = 0
     while i < len(rest):
         t = rest[i]
-        if t in inline_flags:
-            return None
-        if t in value_flags:
-            i += 2
+        if t == "-":
+            return None                      # program from stdin
+        if t == "--":
+            return ("script", rest[i + 1]) if i + 1 < len(rest) else None
+        if t.startswith("--"):
+            i += 1                           # --version, --help, ... (no long option takes a separate value)
             continue
-        if t.startswith("-"):
+        if t.startswith("-") and len(t) > 1:
+            letters = t[1:]
+            for j, ch in enumerate(letters):
+                if ch == "c":
+                    return None              # -c code, -cCODE, -uc code
+                if ch == "m":
+                    mod = letters[j + 1:] or (rest[i + 1] if i + 1 < len(rest) else "")
+                    return ("module", mod) if mod else None
+                if ch in PY_VALUE_LETTERS:
+                    if not letters[j + 1:]:
+                        i += 1               # value is the next argument
+                    break                    # rest of this token is the value
             i += 1
+            continue
+        return ("script", t)
+    return None
+
+
+def node_script(rest):
+    """Index of node's script argument, or None for inline code (-e/-p/--eval[=]/--print[=]) or stdin."""
+    i = 0
+    while i < len(rest):
+        t = rest[i]
+        if t == "-":
+            return None
+        if t == "--":
+            return i + 1 if i + 1 < len(rest) else None
+        name = t.split("=", 1)[0]
+        if name in NODE_INLINE or (t.startswith("-") and not t.startswith("--") and len(t) > 1
+                                   and any(c in "ep" for c in t[1:])):
+            return None
+        if t.startswith("-"):
+            i += 2 if (name in NODE_VALUE_FLAGS and "=" not in t and t == name) else 1
             continue
         return i
     return None
@@ -76,33 +110,19 @@ def is_test_runner(argv):
         return False
     a0 = base(argv[0])
     rest = argv[1:]
-    if a0 in ("pytest", "py.test", "vitest", "jest"):
+    if a0 in PYTEST_NAMES or a0 in ("vitest", "jest"):
         return True
-    if a0 == "playwright":
-        return rest[:1] == ["test"]
-    if a0 in ("cargo", "go"):
+    if a0 in ("playwright", "cargo", "go"):
         return rest[:1] == ["test"]
     if a0.startswith("python"):
-        i = 0
-        while i < len(rest):
-            t = rest[i]
-            if t == "-m":
-                return i + 1 < len(rest) and rest[i + 1] in ("pytest", "py.test")
-            if t in ("-mpytest", "-mpy.test"):
-                return True
-            if t == "-c":
-                return False
-            if t in PY_VALUE_FLAGS:
-                i += 2
-                continue
-            if t.startswith("-"):
-                i += 1
-                continue
-            return base(t) in ("pytest", "py.test")
-        return False
+        tgt = python_target(rest)
+        if tgt is None:
+            return False
+        kind, val = tgt
+        return val in PYTEST_NAMES if kind == "module" else base(val) in PYTEST_NAMES
     if a0 in ("node", "bun") or a0.startswith("node"):
-        i = _first_positional(rest, NODE_VALUE_FLAGS, NODE_INLINE_FLAGS)
-        if i is None:
+        i = node_script(rest)
+        if i is None or i >= len(rest):
             return False
         script, after = rest[i], rest[i + 1:]
         b = base(script)
@@ -190,22 +210,20 @@ def log(event):
 
 
 DBUS_TIMEOUT = float(os.environ.get("TESTCAP_DBUS_TIMEOUT", "3"))
-_MGR = [None]
 
 
 def manager():
-    if _MGR[0] is None:
-        import dbus  # system python3-dbus; imported lazily so the matcher stays testable without it
-        bus = dbus.SystemBus()
-        _MGR[0] = dbus.Interface(bus.get_object("org.freedesktop.systemd1", "/org/freedesktop/systemd1"),
-                                 "org.freedesktop.systemd1.Manager")
-    return _MGR[0]
+    """Private system-bus connection used ONLY by the migrator thread. introspect=False: no Introspect round trip;
+    every call passes an explicit signature, so nothing blocks outside the per-call DBUS_TIMEOUT except the
+    socket connect itself, which also happens on the migrator thread, never on the scanner."""
+    import dbus  # system python3-dbus; imported lazily so the matcher stays testable without it
+    bus = dbus.SystemBus(private=True)
+    obj = bus.get_object("org.freedesktop.systemd1", "/org/freedesktop/systemd1", introspect=False)
+    return dbus.Interface(obj, "org.freedesktop.systemd1.Manager")
 
 
 def pin(pid, ident):
-    """Open a pidfd and prove it is still the process we scanned (same starttime, still in /user.slice/).
-
-    Returns the fd or None. Holding the fd means the kernel cannot hand this PID to anyone else."""
+    """Open a pidfd and prove it is still the process we scanned (same starttime, still in /user.slice/)."""
     try:
         fd = os.pidfd_open(pid)
     except OSError:
@@ -219,7 +237,7 @@ def pin(pid, ident):
 
 
 def scope_properties(pidfds, argv):
-    """Plain (name, type, value) triples; converted to D-Bus types in cap(). One entry per PROPERTY."""
+    """Plain (name, type, value) triples; converted to D-Bus types in start_scope(). One entry per PROPERTY."""
     return [
         ("PIDFDs", "ah", list(pidfds)),
         ("Slice", "s", SLICE),
@@ -235,59 +253,76 @@ def _dbus_props(props):
     conv = {"s": dbus.String, "t": dbus.UInt64}
     out = []
     for name, sig, val in props:
-        if sig == "ah":
-            v = dbus.Array([dbus.types.UnixFd(fd) for fd in val], signature="h")
-        else:
-            v = conv[sig](val)
+        v = dbus.Array([dbus.types.UnixFd(fd) for fd in val], signature="h") if sig == "ah" else conv[sig](val)
         out.append(dbus.Struct((name, v), signature=None))
     return dbus.Array(out, signature="(sv)")
 
 
-def cap(root, tree, ident_of, argv):
-    """Move root + descendants into a new capped scope, by pidfd (exact identity, no PID-reuse window)."""
-    unit = f"testcap-{root}.scope"
-    fds, pids = [], []
-    try:
-        for p in tree:
-            fd = pin(p, ident_of[p])
-            if fd is not None:
-                fds.append(fd)
-                pids.append(p)
-        if root not in pids:
-            return
-        import dbus
-        err = None
+class Migrator:
+    """Runs every systemd call on its own thread so the /proc scan never waits on systemd.
+
+    Jobs are (unit, [(pid, starttime)], argv, event). Processes are pinned by pidfd and handed to systemd as
+    PIDFDs, so a PID recycled since the scan can never be moved. A straggler (a child that forked before its
+    runner moved) gets its OWN capped scope rather than a by-PID attach; the slice still caps the total.
+    Latency: a job runs within INTERVAL of its process appearing while systemd answers inside DBUS_TIMEOUT;
+    while systemd is stalled nothing can be moved, jobs wait (deduplicated) and the scan carries on."""
+
+    def __init__(self, mgr_factory=manager):
+        import queue
+        import threading
+        self.q = queue.Queue()
+        self.inflight = set()
+        self.lock = threading.Lock()
+        self.mgr_factory = mgr_factory
+        self.mgr = None
+        threading.Thread(target=self._run, name="testcap-migrator", daemon=True).start()
+
+    def submit(self, unit, procs, argv, event):
+        key = procs[0]
+        with self.lock:
+            if key in self.inflight:
+                return False
+            self.inflight.add(key)
+        self.q.put((unit, procs, argv, event))
+        return True
+
+    def _run(self):
+        while True:
+            job = self.q.get()
+            try:
+                self._do(*job)
+            except Exception as e:  # noqa: BLE001 - logged; the thread never dies
+                log({"event": "migrator_error", "err": repr(e)[:200]})
+            finally:
+                with self.lock:
+                    self.inflight.discard(job[1][0])
+
+    def _do(self, unit, procs, argv, event):
+        fds, pids = [], []
         try:
-            manager().StartTransientUnit(unit, "fail", _dbus_props(scope_properties(fds, argv)),
-                                         dbus.Array([], signature="(sa(sv))"), timeout=DBUS_TIMEOUT)
-        except Exception as e:  # noqa: BLE001 - logged, next candidate continues
-            err = str(e)[:200]
-            _MGR[0] = None
-        log({"event": "cap_failed" if err else "capped", "unit": unit, "pids": pids,
-             "cmd": " ".join(argv)[:200], "cap": PER_RUN, "err": err})
-    finally:
-        for fd in fds:
-            os.close(fd)
-
-
-def attach(unit, pid, ident):
-    """Straggler that forked before its runner moved. AttachProcessesToUnit takes PIDs only, so pin the
-    process with a pidfd and re-verify identity first; the fd stays open across the call, so the PID cannot be
-    recycled to another process while systemd acts on it."""
-    fd = pin(pid, ident)
-    if fd is None:
-        return
-    err = None
-    try:
-        import dbus
-        manager().AttachProcessesToUnit(unit, "", dbus.Array([dbus.UInt32(pid)], signature="u"),
-                                        timeout=DBUS_TIMEOUT)
-    except Exception as e:  # noqa: BLE001
-        err = str(e)[:200]
-        _MGR[0] = None
-    finally:
-        os.close(fd)
-    log({"event": "attach_failed" if err else "attached", "unit": unit, "pids": [pid], "err": err})
+            for pid, ident in procs:
+                fd = pin(pid, ident)
+                if fd is not None:
+                    fds.append(fd)
+                    pids.append(pid)
+            if procs[0][0] not in pids:
+                return  # the runner itself is gone or no longer eligible
+            import dbus
+            err = None
+            try:
+                if self.mgr is None:
+                    self.mgr = self.mgr_factory()
+                self.mgr.StartTransientUnit(unit, "fail", _dbus_props(scope_properties(fds, argv)),
+                                            dbus.Array([], signature="(sa(sv))"),
+                                            signature="ssa(sv)a(sa(sv))", timeout=DBUS_TIMEOUT)
+            except Exception as e:  # noqa: BLE001
+                err = str(e)[:200]
+                self.mgr = None
+            log({"event": (event + "_failed") if err else event, "unit": unit, "pids": pids,
+                 "cmd": " ".join(argv)[:200], "cap": PER_RUN, "err": err})
+        finally:
+            for fd in fds:
+                os.close(fd)
 
 
 OOM_SEEN = [None]
@@ -305,7 +340,7 @@ def watch_ooms():
     OOM_SEEN[0] = n
 
 
-def tick():
+def tick(mig):
     snap = snapshot()
     ppids = {p: v[0] for p, v in snap.items()}
     ident = {p: v[1] for p, v in snap.items()}
@@ -316,7 +351,6 @@ def tick():
         if cg is None or not cg.startswith("/user.slice/") or in_testcap(cg):
             continue
         try:
-            # A straggler whose ancestor is already capped: attach it to that scope.
             a, hops, parent_scope = ppids.get(pid), 0, None
             while a and a > 1 and hops < 64:
                 if in_testcap(cgs.get(a)):
@@ -324,12 +358,12 @@ def tick():
                     break
                 a, hops = ppids.get(a), hops + 1
             if parent_scope:
-                attach(parent_scope, pid, ident[pid])
+                stem = parent_scope[:-len(".scope")] if parent_scope.endswith(".scope") else parent_scope
+                mig.submit(f"{stem}-s{pid}.scope", [(pid, ident[pid])], read_argv(pid) or ["?"], "straggler_capped")
                 continue
             argv = read_argv(pid)
             if not argv or not is_test_runner(argv):
                 continue
-            # Cap only the top-most runner in a chain (pytest spawning pytest is one run).
             a, top = ppids.get(pid), True
             while a and a > 1:
                 if a in capped_roots:
@@ -339,7 +373,7 @@ def tick():
             if not top:
                 continue
             tree = [p for p in descendants(pid, ppids) if (cgs.get(p) or "").startswith("/user.slice/")]
-            cap(pid, tree, ident, argv)
+            mig.submit(f"testcap-{pid}.scope", [(p, ident[p]) for p in tree], argv, "capped")
             capped_roots.add(pid)
         except Exception as e:  # noqa: BLE001 - one bad candidate never stops the scan
             log({"event": "candidate_error", "pid": pid, "err": repr(e)[:200]})
@@ -352,9 +386,10 @@ def main():
         print("match" if is_test_runner(sys.argv[i + 1:]) else "no-match")
         return
     log({"event": "start", "per_run": PER_RUN, "swap": SWAP, "interval": INTERVAL})
+    mig = Migrator()
     while True:
         try:
-            tick()
+            tick(mig)
         except Exception as e:  # never die on a /proc race
             log({"event": "tick_error", "err": repr(e)[:200]})
         time.sleep(INTERVAL)
