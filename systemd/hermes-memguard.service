@@ -14,3 +14,6 @@ IOWeight=1000
 MemoryMin=128M
 OOMScoreAdjust=-900
 TimeoutStartSec=90
+# On timeout: SIGKILL at once (no extra stop grace), so a stuck run never outlives its slot.
+TimeoutStartFailureMode=kill
+TimeoutStopSec=10

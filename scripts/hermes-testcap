@@ -12,13 +12,16 @@ Children forked later inherit the scope. A descendant that raced the move is att
 Docker/system services are never touched: containers already carry their own mem_limit.
 
 No agent or script has to change. The kernel kills the biggest process INSIDE the scope at the cap; the event is
-logged to LOG (JSONL) and the journal.
-Limit: memory a runner allocates in the <= INTERVAL seconds before it is moved stays charged to its old cgroup
-(cgroup v2 does not migrate charges), so a fast grower can exceed PER_RUN by that much. Explicit wrapper for other heavy commands: hermes-capped <cmd...>.
+logged to LOG (JSONL) and the journal. systemd then stops the whole scope (default OOMPolicy=stop), so the
+run ends as one unit (exit 143/137) instead of limping on with a dead worker.
+Limits: a runner is moved within INTERVAL + (candidates ahead of it in the same scan) x TESTCAP_DBUS_TIMEOUT
+seconds (normally ~2 s; each D-Bus call is bounded at 3 s and failures are per-candidate). Memory allocated before
+the move stays charged to the old cgroup (cgroup v2 does not migrate charges), so a fast grower can exceed PER_RUN
+by that much. Processes are moved by pidfd (StartTransientUnit PIDFDs) or pinned by one (attach), never by a bare
+PID that could have been recycled since the scan. Explicit wrapper for other heavy commands: hermes-capped <cmd...>.
 """
 import json
 import os
-import subprocess
 import sys
 import time
 
@@ -42,36 +45,72 @@ def base(p):
     return os.path.basename(p)
 
 
+PY_VALUE_FLAGS = ("-X", "-W", "-Q")
+NODE_VALUE_FLAGS = ("-r", "--require", "--import", "--loader", "--experimental-loader", "-C", "--conditions")
+NODE_INLINE_FLAGS = ("-e", "--eval", "-p", "--print")
+
+
+def _first_positional(rest, value_flags, inline_flags):
+    """Index of the script argument after interpreter flags, or None (inline code / no script)."""
+    i = 0
+    while i < len(rest):
+        t = rest[i]
+        if t in inline_flags:
+            return None
+        if t in value_flags:
+            i += 2
+            continue
+        if t.startswith("-"):
+            i += 1
+            continue
+        return i
+    return None
+
+
 def is_test_runner(argv):
-    """True when argv is a test-runner process itself (not a shell that merely mentions one)."""
+    """True only when the EXECUTABLE (or the interpreter's script / -m module) is a test runner.
+
+    Arguments are never matched on their own: `vim jest`, `grep vitest log`, `node server.js jest` are not runs.
+    """
     if not argv:
         return False
     a0 = base(argv[0])
     rest = argv[1:]
-    if a0 in ("pytest", "py.test"):
+    if a0 in ("pytest", "py.test", "vitest", "jest"):
         return True
+    if a0 == "playwright":
+        return rest[:1] == ["test"]
+    if a0 in ("cargo", "go"):
+        return rest[:1] == ["test"]
     if a0.startswith("python"):
-        for i, t in enumerate(rest):
-            if t == "-m" and i + 1 < len(rest) and rest[i + 1] in ("pytest", "py.test"):
-                return True
+        i = 0
+        while i < len(rest):
+            t = rest[i]
+            if t == "-m":
+                return i + 1 < len(rest) and rest[i + 1] in ("pytest", "py.test")
             if t in ("-mpytest", "-mpy.test"):
                 return True
-            if not t.startswith("-"):
-                # first positional is the script: python /venv/bin/pytest ...
-                return base(t) in ("pytest", "py.test")
-        return False
-    if a0 in ("cargo", "go"):
-        return bool(rest) and rest[0] == "test"
-    names = [a0] + [base(t) for t in rest[:2]]
-    if a0 in ("node", "bun") or a0.startswith("node"):
-        names = [base(t) for t in rest[:2]]
-    for n in names:
-        if n in ("vitest", "vitest.mjs", "jest", "jest.js"):
-            return True
-        if n in ("playwright", "cli.js") and "test" in rest[:4]:
-            if n == "cli.js" and not any("playwright" in t for t in rest[:2]):
+            if t == "-c":
+                return False
+            if t in PY_VALUE_FLAGS:
+                i += 2
                 continue
+            if t.startswith("-"):
+                i += 1
+                continue
+            return base(t) in ("pytest", "py.test")
+        return False
+    if a0 in ("node", "bun") or a0.startswith("node"):
+        i = _first_positional(rest, NODE_VALUE_FLAGS, NODE_INLINE_FLAGS)
+        if i is None:
+            return False
+        script, after = rest[i], rest[i + 1:]
+        b = base(script)
+        if b in ("vitest", "vitest.mjs", "jest", "jest.js"):
             return True
+        if b == "playwright" or (b == "cli.js" and "playwright" in script):
+            return after[:1] == ["test"]
+        return False
     return False
 
 
@@ -95,23 +134,30 @@ def read_cgroup(pid):
     return None
 
 
-def read_ppid(pid):
+def read_stat(pid):
+    """(ppid, starttime) from /proc/<pid>/stat; starttime identifies the process across PID reuse."""
     try:
         with open(f"/proc/{pid}/stat") as f:
             s = f.read()
-        return int(s[s.rindex(")") + 2:].split()[1])
+        fields = s[s.rindex(")") + 2:].split()
+        return int(fields[1]), int(fields[19])
     except (OSError, ValueError, IndexError):
         return None
 
 
+def read_ppid(pid):
+    st = read_stat(pid)
+    return st[0] if st else None
+
+
 def snapshot():
+    """{pid: (ppid, starttime)}"""
     procs = {}
     for d in os.listdir("/proc"):
         if d.isdigit():
-            pid = int(d)
-            pp = read_ppid(pid)
-            if pp is not None:
-                procs[pid] = pp
+            st = read_stat(int(d))
+            if st is not None:
+                procs[int(d)] = st
     return procs
 
 
@@ -143,32 +189,105 @@ def log(event):
         pass
 
 
-def busctl(*args):
-    return subprocess.run(
-        ["busctl", "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
-         "org.freedesktop.systemd1.Manager", *args],
-        capture_output=True, text=True, timeout=10)
+DBUS_TIMEOUT = float(os.environ.get("TESTCAP_DBUS_TIMEOUT", "3"))
+_MGR = [None]
 
 
-def cap(root, pids, argv):
-    unit = f"testcap-{root}.scope"
-    props = [
-        "PIDs", "au", str(len(pids)), *map(str, pids),
-        "Slice", "s", SLICE,
-        "MemoryMax", "t", str(parse_size(PER_RUN)),
-        "MemorySwapMax", "t", str(parse_size(SWAP)),
-        "CollectMode", "s", "inactive-or-failed",
-        "Description", "s", "hermes-testcap: " + " ".join(argv)[:120],
+def manager():
+    if _MGR[0] is None:
+        import dbus  # system python3-dbus; imported lazily so the matcher stays testable without it
+        bus = dbus.SystemBus()
+        _MGR[0] = dbus.Interface(bus.get_object("org.freedesktop.systemd1", "/org/freedesktop/systemd1"),
+                                 "org.freedesktop.systemd1.Manager")
+    return _MGR[0]
+
+
+def pin(pid, ident):
+    """Open a pidfd and prove it is still the process we scanned (same starttime, still in /user.slice/).
+
+    Returns the fd or None. Holding the fd means the kernel cannot hand this PID to anyone else."""
+    try:
+        fd = os.pidfd_open(pid)
+    except OSError:
+        return None
+    st = read_stat(pid)
+    cg = read_cgroup(pid)
+    if st is None or st[1] != ident or not (cg or "").startswith("/user.slice/") or in_testcap(cg):
+        os.close(fd)
+        return None
+    return fd
+
+
+def scope_properties(pidfds, argv):
+    """Plain (name, type, value) triples; converted to D-Bus types in cap(). One entry per PROPERTY."""
+    return [
+        ("PIDFDs", "ah", list(pidfds)),
+        ("Slice", "s", SLICE),
+        ("MemoryMax", "t", parse_size(PER_RUN)),
+        ("MemorySwapMax", "t", parse_size(SWAP)),
+        ("CollectMode", "s", "inactive-or-failed"),
+        ("Description", "s", "hermes-testcap: " + " ".join(argv)[:120]),
     ]
-    r = busctl("StartTransientUnit", "ssa(sv)a(sa(sv))", unit, "fail", str(len(props) // 3), *props, "0")
-    log({"event": "capped" if r.returncode == 0 else "cap_failed", "unit": unit, "pids": pids,
-         "cmd": " ".join(argv)[:200], "cap": PER_RUN, "err": r.stderr.strip()[:200] or None})
 
 
-def attach(unit, pids):
-    r = busctl("AttachProcessesToUnit", "ssau", unit, "", str(len(pids)), *map(str, pids))
-    log({"event": "attached" if r.returncode == 0 else "attach_failed", "unit": unit, "pids": pids,
-         "err": r.stderr.strip()[:200] or None})
+def _dbus_props(props):
+    import dbus
+    conv = {"s": dbus.String, "t": dbus.UInt64}
+    out = []
+    for name, sig, val in props:
+        if sig == "ah":
+            v = dbus.Array([dbus.types.UnixFd(fd) for fd in val], signature="h")
+        else:
+            v = conv[sig](val)
+        out.append(dbus.Struct((name, v), signature=None))
+    return dbus.Array(out, signature="(sv)")
+
+
+def cap(root, tree, ident_of, argv):
+    """Move root + descendants into a new capped scope, by pidfd (exact identity, no PID-reuse window)."""
+    unit = f"testcap-{root}.scope"
+    fds, pids = [], []
+    try:
+        for p in tree:
+            fd = pin(p, ident_of[p])
+            if fd is not None:
+                fds.append(fd)
+                pids.append(p)
+        if root not in pids:
+            return
+        import dbus
+        err = None
+        try:
+            manager().StartTransientUnit(unit, "fail", _dbus_props(scope_properties(fds, argv)),
+                                         dbus.Array([], signature="(sa(sv))"), timeout=DBUS_TIMEOUT)
+        except Exception as e:  # noqa: BLE001 - logged, next candidate continues
+            err = str(e)[:200]
+            _MGR[0] = None
+        log({"event": "cap_failed" if err else "capped", "unit": unit, "pids": pids,
+             "cmd": " ".join(argv)[:200], "cap": PER_RUN, "err": err})
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def attach(unit, pid, ident):
+    """Straggler that forked before its runner moved. AttachProcessesToUnit takes PIDs only, so pin the
+    process with a pidfd and re-verify identity first; the fd stays open across the call, so the PID cannot be
+    recycled to another process while systemd acts on it."""
+    fd = pin(pid, ident)
+    if fd is None:
+        return
+    err = None
+    try:
+        import dbus
+        manager().AttachProcessesToUnit(unit, "", dbus.Array([dbus.UInt32(pid)], signature="u"),
+                                        timeout=DBUS_TIMEOUT)
+    except Exception as e:  # noqa: BLE001
+        err = str(e)[:200]
+        _MGR[0] = None
+    finally:
+        os.close(fd)
+    log({"event": "attach_failed" if err else "attached", "unit": unit, "pids": [pid], "err": err})
 
 
 OOM_SEEN = [None]
@@ -187,22 +306,26 @@ def watch_ooms():
 
 
 def tick():
-    ppids = snapshot()
-    cgs = {p: read_cgroup(p) for p in ppids}
+    snap = snapshot()
+    ppids = {p: v[0] for p, v in snap.items()}
+    ident = {p: v[1] for p, v in snap.items()}
+    cgs = {p: read_cgroup(p) for p in snap}
     capped_roots = set()
-    for pid in sorted(ppids):
+    for pid in sorted(snap):
         cg = cgs.get(pid)
         if cg is None or not cg.startswith("/user.slice/") or in_testcap(cg):
             continue
-        # A straggler whose ancestor is already capped: attach it to that scope.
-        a, hops = ppids.get(pid), 0
-        while a and a > 1 and hops < 64:
-            acg = cgs.get(a)
-            if in_testcap(acg):
-                attach(acg.rstrip("/").split("/")[-1], [pid])
-                break
-            a, hops = ppids.get(a), hops + 1
-        else:
+        try:
+            # A straggler whose ancestor is already capped: attach it to that scope.
+            a, hops, parent_scope = ppids.get(pid), 0, None
+            while a and a > 1 and hops < 64:
+                if in_testcap(cgs.get(a)):
+                    parent_scope = cgs[a].rstrip("/").split("/")[-1]
+                    break
+                a, hops = ppids.get(a), hops + 1
+            if parent_scope:
+                attach(parent_scope, pid, ident[pid])
+                continue
             argv = read_argv(pid)
             if not argv or not is_test_runner(argv):
                 continue
@@ -216,8 +339,10 @@ def tick():
             if not top:
                 continue
             tree = [p for p in descendants(pid, ppids) if (cgs.get(p) or "").startswith("/user.slice/")]
-            cap(pid, tree, argv)
+            cap(pid, tree, ident, argv)
             capped_roots.add(pid)
+        except Exception as e:  # noqa: BLE001 - one bad candidate never stops the scan
+            log({"event": "candidate_error", "pid": pid, "err": repr(e)[:200]})
     watch_ooms()
 
 

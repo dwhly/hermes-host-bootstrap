@@ -5,8 +5,9 @@
 # A 4.3 GB pytest plus session growth filled RAM and swap; the kernel OOM-killed 78 processes in three days and
 # tailnet SSH stopped answering. The interim memguard (loose in /root/work/memguard since 2026-10-22) hung under
 # exactly that pressure and was killed by systemd. This module makes both guards bootstrap-owned:
-#   hermes-memguard.{service,timer}  every 5 min: end Hermes sessions idle > 12 h under pressure, OOM priorities,
-#                                    +2 GB swap. Every external call is time-boxed; runs at high priority.
+#   hermes-memguard.{service,timer}  every 5 min: end Hermes sessions idle > 12 h under pressure, OOM priorities.
+#                                    Every external call is time-boxed; runs at high priority.
+#   /swapfile2                       +2 GB swap buffer, persistent in /etc/fstab.
 #   hermes-testcap.service + testcap.slice
 #                                    moves pytest/vitest/jest/playwright/cargo/go test runs started from user
 #                                    sessions into capped scopes (6G per run, 12G total) so a runaway test dies
@@ -42,6 +43,16 @@ if ! ip -4 addr show 2>/dev/null | grep -q "inet ${CONTROL_PLANE_IP}/"; then
   skip "this host does not own the control-plane IP ${CONTROL_PLANE_IP} — memguard not applicable"
   return 0 2>/dev/null || exit 0
 fi
+
+# Swap buffer (+2 GB, lower priority than /swapfile): provisioned here, persistent via fstab, never at runtime
+# under pressure (zram is not available on this kernel).
+if [[ ! -f /swapfile2 ]]; then
+  info "creating /swapfile2 (2 GB)"
+  sudo fallocate -l 2G /swapfile2 && sudo chmod 600 /swapfile2 && sudo mkswap -q /swapfile2
+fi
+grep -qE '^/swapfile2[[:space:]]' /etc/fstab || echo '/swapfile2 none swap sw,pri=-3 0 0' | sudo tee -a /etc/fstab >/dev/null
+swapon --show=NAME --noheadings | grep -qx /swapfile2 || sudo swapon -p -3 /swapfile2 || warn "could not enable /swapfile2"
+command -v python3 >/dev/null && python3 -c 'import dbus' 2>/dev/null || sudo apt-get install -y -qq python3-dbus >/dev/null
 
 for s in hermes-memguard hermes-testcap hermes-capped; do
   sudo install -m 0755 "$REPO_ROOT/scripts/$s" "/usr/local/bin/$s"

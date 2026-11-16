@@ -26,6 +26,10 @@ _L.exec_module(tc)
     ["/repo/node_modules/.bin/playwright", "test", "--project=chromium"],
     ["cargo", "test", "--workspace"],
     ["/usr/local/go/bin/go", "test", "./..."],
+    ["python3", "-X", "importtime", "-m", "pytest"],
+    ["node", "--max-old-space-size=4096", "/repo/node_modules/.bin/vitest", "run"],
+    ["node", "-r", "ts-node/register", "/repo/node_modules/jest/bin/jest.js"],
+    ["/repo/node_modules/.bin/vitest", "run"],
 ])
 def test_matches_test_runners(argv):
     assert tc.is_test_runner(argv)
@@ -44,6 +48,14 @@ def test_matches_test_runners(argv):
     ["cargo", "build"],
     ["go", "build", "./..."],
     ["vim", "test_foo.py"],
+    ["vim", "jest"],                                  # Codex r1: argument named like a runner
+    ["grep", "vitest", "log.txt"],
+    ["node", "server.js", "jest"],
+    ["node", "server.js", "vitest"],
+    ["python3", "-c", "import pytest"],
+    ["python3", "-m", "pip", "install", "pytest"],
+    ["node", "-e", "require('jest')"],
+    ["less", "/repo/node_modules/.bin/playwright"],
 ])
 def test_ignores_everything_else(argv):
     assert not tc.is_test_runner(argv)
@@ -60,3 +72,12 @@ def test_in_testcap():
     assert tc.in_testcap("/testcap.slice/testcap-12.scope")
     assert not tc.in_testcap("/user.slice/user-0.slice/session-c1.scope")
     assert not tc.in_testcap(None)
+
+
+def test_scope_properties_one_entry_per_property_for_many_pids():
+    """Codex r1 BLOCKER: the property count must not grow with the number of processes."""
+    props = tc.scope_properties([11, 12, 13, 14], ["pytest"])
+    names = [n for n, _, _ in props]
+    assert names == ["PIDFDs", "Slice", "MemoryMax", "MemorySwapMax", "CollectMode", "Description"]
+    assert props[0] == ("PIDFDs", "ah", [11, 12, 13, 14])
+    assert dict((n, v) for n, _, v in props)["MemoryMax"] == 6 << 30

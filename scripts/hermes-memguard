@@ -4,7 +4,7 @@
 # 1) Under pressure FIRST: end Hermes terminal sessions idle > 12 h (Dan's rule), logging resume commands.
 # 2) OOM priorities: protect the access chain + Chief + Herdr; sacrifice idle sessions/helpers/non-default Desktop
 #    backends first.
-# 3) +2 GB swap file (buffer; zram module not available on this kernel).
+# 3) Report swap (the +2 GB /swapfile2 buffer is provisioned by the bootstrap module, not at runtime).
 #
 # Must finish even while the host thrashes (2026-11-15: a run hung > 120 s on blocked docker/herdr/systemctl calls
 # and systemd killed it at the exact moment it was needed). So: every external call is time-boxed (T / timeout=),
@@ -71,33 +71,45 @@ for p in panes:
     if l==me or t is None or (now-t) < 12*3600: continue
     idle.append((p,l,t))
 if not idle: sys.exit(0)
-# one /proc pass for all idle panes (not one per pane)
-want={f"HERDR_PANE_ID={p['pane_id']}".encode():p['pane_id'] for p,_,_ in idle}
+# one /proc pass for all idle panes (not one per pane). Each match is pinned with a pidfd and re-verified, and
+# both signals go through that fd, so a recycled PID can never be signalled.
+want={f"HERDR_PANE_ID={p['pane_id']}".encode()+b'\0':p['pane_id'] for p,_,_ in idle}
+def is_tui(pid):
+    try:
+        cmd=open(f'/proc/{pid}/cmdline','rb').read(); env=open(f'/proc/{pid}/environ','rb').read()+b'\0'
+    except Exception: return None
+    if b'tui_gateway.entry' not in cmd and b'ui-tui/dist/entry.js' not in cmd: return None
+    for k,pane in want.items():
+        if (b'\0'+k) in (b'\0'+env): return pane
+    return None
 bypane={}
 for d in os.listdir('/proc'):
     if not d.isdigit(): continue
-    try:
-        env=open(f'/proc/{d}/environ','rb').read(); cmd=open(f'/proc/{d}/cmdline','rb').read()
-    except Exception: continue
-    if b'tui_gateway.entry' not in cmd and b'ui-tui/dist/entry.js' not in cmd: continue
-    for k,pid in want.items():
-        if k+b'\0' in env+b'\0': bypane.setdefault(pid,[]).append(int(d))
+    pane=is_tui(d)
+    if pane is None: continue
+    try: fd=os.pidfd_open(int(d))
+    except OSError: continue
+    if is_tui(d)!=pane: os.close(fd); continue      # re-verify after pinning
+    bypane.setdefault(pane,[]).append((int(d),fd))
 ended=[]
 for p,l,t in idle:
-    pids=bypane.get(p['pane_id'],[])
-    if not pids: continue
+    pf=bypane.get(p['pane_id'],[])
+    if not pf: continue
     if not dry:
-        for q in pids:
-            try: os.kill(q, signal.SIGTERM)
+        for _,fd in pf:
+            try: signal.pidfd_send_signal(fd, signal.SIGTERM)
             except Exception: pass
-    ended.append((pids, f"  {'WOULD END' if dry else 'ended'} pane {p['pane_id']} '{(p.get('terminal_title_stripped') or '')[:45]}' idle {(now-t)/3600:.0f}h pids {pids} -> resume: hermes --resume {l}"))
+    pids=[q for q,_ in pf]
+    ended.append((pf, f"  {'WOULD END' if dry else 'ended'} pane {p['pane_id']} '{(p.get('terminal_title_stripped') or '')[:45]}' idle {(now-t)/3600:.0f}h pids {pids} -> resume: hermes --resume {l}"))
 if ended and not dry:
     time.sleep(5)
-    for pids,_ in ended:
-        for q in pids:
-            if os.path.exists(f'/proc/{q}'):
-                try: os.kill(q, signal.SIGKILL)
-                except Exception: pass
+    for pf,_ in ended:
+        for _,fd in pf:
+            try: signal.pidfd_send_signal(fd, signal.SIGKILL)
+            except ProcessLookupError: pass          # exited on SIGTERM
+            except Exception: pass
+for fds in bypane.values():
+    for _,fd in fds: os.close(fd)
 if ended:
     txt="\n".join(x for _,x in ended); open(log,'a').write(txt+"\n"); print(txt)
 PY
@@ -121,12 +133,8 @@ adj 700 "tool helper: chromium"                      $(pgrep -f 'chromium-[0-9]+
 adj 700 "tool helper: pyright LSP"                   $(pgrep -f pyright-langserver)
 adj 200 "hermes terminal sessions (TUI)"             $(pgrep -f 'tui_gateway.entry') $(pgrep -f 'ui-tui/dist/entry.js')
 
-# --- 3) swap buffer --------------------------------------------------------------------------------------------
-[ "$QUIET" = 1 ] || say "## Swap buffer"
-if ! swapon --show=NAME --noheadings | grep -q /swapfile2; then
-  if [ "$DRY" = 1 ]; then say "  would add /swapfile2 (dry-run)"
-  else fallocate -l 2G /swapfile2 && chmod 600 /swapfile2 && mkswap -q /swapfile2 && swapon -p -3 /swapfile2 && say "  added /swapfile2 (2 GB, lower priority than /swapfile)"; fi
-else [ "$QUIET" = 1 ] || say "  /swapfile2 already active"; fi
+# --- 3) swap buffer: provisioned by lib/S1-memguard.sh (fstab), never created here under pressure -----------------
+[ "$QUIET" = 1 ] || say "## Swap: $(swapon --show=NAME,SIZE,USED --noheadings | tr '\n' ' ')"
 
 [ "$QUIET" = 1 ] || say "After: $(free -m | awk '/Mem:/{print "avail "$7"MB"} /Swap:/{print "swap "$3"/"$2"MB"}' | tr '\n' ' ') load $(cut -d' ' -f1-3 /proc/loadavg)"
 [ "$QUIET" = 1 ] || say "Log: $LOG"
