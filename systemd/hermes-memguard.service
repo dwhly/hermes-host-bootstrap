@@ -13,7 +13,7 @@ CPUWeight=1000
 IOWeight=1000
 MemoryMin=128M
 OOMScoreAdjust=-900
-TimeoutStartSec=90
-# On timeout: SIGKILL at once (no extra stop grace), so a stuck run never outlives its slot.
+TimeoutStartSec=300
+# 300 s: archiving exports (calm memory only) can take ~10 s per session. On timeout: SIGKILL at once (no extra stop grace), so a stuck run never outlives its slot.
 TimeoutStartFailureMode=kill
 TimeoutStopSec=10
