@@ -1,0 +1,12 @@
+[Unit]
+Description=fleet-company-db %i backup (pgBackRest)
+After=postgresql@16-main.service
+# Requisite, not Requires: a backup run must never start a cluster that install left stopped.
+Requisite=postgresql@16-main.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fleet-company-db backup %i
+MemoryMax=300M
+Nice=10
+IOSchedulingClass=idle

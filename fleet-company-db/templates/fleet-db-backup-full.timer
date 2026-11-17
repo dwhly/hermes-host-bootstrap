@@ -1,0 +1,11 @@
+[Unit]
+Description=fleet-company-db weekly full backup
+
+[Timer]
+OnCalendar=@@BACKUP_FULL_CALENDAR@@
+RandomizedDelaySec=900
+Persistent=true
+Unit=fleet-db-backup@full.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=fleet-company-db health + RPO probe every minute (closes the record for writes when WAL stops reaching the bucket)
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

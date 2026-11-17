@@ -1,0 +1,11 @@
+# Throwaway systemd "node" for tests/fleet-company-db/proto.sh (IMG=fleet-company-db-node:noble).
+# Rebuild: docker build -t fleet-company-db-node:noble -f tests/fleet-company-db/Dockerfile.node tests/fleet-company-db
+# Recovered verbatim from the image's history (2026-11-17) before the image was pruned to free disk on h-do1.
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -q && apt-get install -y -q --no-install-recommends \
+      systemd systemd-sysv dbus ca-certificates python3 sudo procps iproute2 curl \
+    && rm -f /etc/systemd/system/*.wants/* /lib/systemd/system/multi-user.target.wants/getty* \
+    && systemctl mask systemd-logind.service getty.target console-getty.service
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

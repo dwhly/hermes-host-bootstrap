@@ -1,0 +1,11 @@
+[Unit]
+Description=fleet-company-db daily differential backup
+
+[Timer]
+OnCalendar=@@BACKUP_DIFF_CALENDAR@@
+RandomizedDelaySec=900
+Persistent=true
+Unit=fleet-db-backup@diff.service
+
+[Install]
+WantedBy=timers.target
