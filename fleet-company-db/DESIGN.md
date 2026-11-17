@@ -25,7 +25,7 @@ fresh host can rebuild the database from the bucket plus two secrets (D5).
 | Memory | systemd drop-in `MemoryHigh/MemoryMax` on the unit; h-af 768M/1G with `shared_buffers=256MB`; h-btp 384M/512M with `128MB` | Baseline (`edd/evidence/fleet-architecture/memory-baseline-2026-11-15.md`) + live 2026-11-15: h-af 23.4 GB available of 32 GB; h-btp 7.0 GB available of 16 GB with swap 2034/2047 MB used. Measured: 93 MiB idle, 137 MiB peak under the workload (cap 1 GiB). |
 | Network | `listen_addresses=localhost`; pg_hba: postgres by peer on the socket, `fleet_gate`/`fleet_worker` by scram-sha-256 on 127.0.0.1/::1 to `fleet_<company>` only; everything else refused | The gate runs on the same node; nothing listens on the tailnet. |
 | Roles | `fleet_owner` NOLOGIN owns everything; `fleet_gate` SELECT on what it authorizes + EXECUTE on the write functions; `fleet_worker` EXECUTE on job claim/renew/complete only; PUBLIC nothing (a global default revoke is in place before the first migration, and each migration commits together with the grants); nobody can become the owner | EDD §4.1 "enforced, not just a library". History/audit/job_events/task_requests are append-only even for the superuser (triggers); no record is ever deleted. The gate may record **refusals only** (`origin='gate'`); every success is written by the mutation function itself (`origin='db'`). |
-| Secrets | resolved by the node's own read-only 1Password service account into `/etc/pgbackrest/conf.d/50-secrets.conf` (root:postgres 0640); the token is passed only to each `op read`, never exported; gate/worker passwords generated on the node (`/etc/fleet-company-db/*.password|*.dsn`, root 0600), and the server only ever receives the SCRAM verifier | Values never in git, argv, logs or chat. |
+| Secrets | resolved by the node's own read/write 1Password service account (Dan 2026-11-16; the drill host's stays read-only) into `/etc/pgbackrest/conf.d/50-secrets.conf` (root:postgres 0640); the token is passed only to each `op read`, never exported; gate/worker passwords generated on the node (`/etc/fleet-company-db/*.password|*.dsn`, root 0600), and the server only ever receives the SCRAM verifier | Values never in git, argv, logs or chat. |
 | OS user | the `postgresql-common` package creates the system user `postgres` (and group) on first install | Creating an OS user needs Dan's approval: part of "roll it out" (Needs Dan). No login shell use; no SSH key; peer auth on the local socket only. |
 
 ## How convergence installs and upgrades it
@@ -44,7 +44,7 @@ fresh host can rebuild the database from the bucket plus two secrets (D5).
 
 ## Owner steps (Dan; nothing here was created by T2)
 Per company (AmForge in AmForge's Cloudflare + 1Password; BTP in BTP's):
-1. **R2 bucket** in the company's own Cloudflare account: `amforge-fleet-db` / `btp-fleet-db`, location hint
+1. **R2 bucket** in the company's own Cloudflare account: `fleet-db-amforge` / `fleet-db-btp`, location hint
    nearest the node (h-af/h-btp: North America). **R2 has no object versioning** (D4 assumed it; Cloudflare's S3 API
    table lists `PutBucketVersioning` and Object Lock as unimplemented — review r1 [10]). The R2 equivalent is a
    **Bucket Lock rule** (prefix + age). Do **not** add a lock or lifecycle rule yet: both are Needs Dan.
@@ -57,16 +57,16 @@ Per company (AmForge in AmForge's Cloudflare + 1Password; BTP in BTP's):
    - item **`fleet-db-backup-key`** (Password): field **`passphrase`** = a generated password of ≥ 48 characters.
      This is the key to every backup: share the item with Dan + one named person per company (D5); keep an offline
      copy (printed, sealed) with each.
-4. **Node service account** (read-only, that vault only): h-af already has one (`/root/.config/amforge/op_sa_token`);
+4. **Node service account** (read/write, that vault only; Dan 2026-11-16): h-af already has one (`/root/.config/amforge/op_sa_token`);
    make sure it can read the two items. h-btp has **none**: create a 1Password service account for the BTP vault
-   (read-only) and place its token at `/root/.config/btp/op_sa_token` (root 0600) — or tell T2 where it should live.
+   (read/write) and place its token at `/root/.config/btp/op_sa_token` (root 0600) — or tell T2 where it should live.
 5. Tell T2 (or edit the reviewed desired file): the vault name and the Account ID, replacing `owner-step-pending`
    in `config/fleet-company-db/<host>.env`.
 
 ### Drill host (D5), per company, QUARTERLY (Dan 2026-11-16: "I think we should do them quarterly") and after every major change
 - A **fresh** Ubuntu 24.04 droplet/VM **in the company's own account** (DigitalOcean for BTP like h-btp; AmForge's
   provider for AmForge), 2 vCPU / 4 GB is plenty, on the tailnet with a `tag:drill` (no inbound from the internet).
-- On it, as root: install `op` + a read-only service-account token for that company's vault (same as step 4), copy
+- On it, as root: install `op` + a **read-only** service-account token for that company's vault (deliberately read-only: a drill only restores), copy
   the payload and the host's desired file from git, then
   `fleet-company-db drill-restore --desired h-<x>.env --latest` (and once `--target '<timestamp>+00'`). The drill copy
   runs with archiving **off**, so it can never write into the production bucket.
@@ -112,8 +112,8 @@ Backups before the change (standing rule): `/root/legacy-capture/<date>-fleet-co
      `repo1-retention-full=35`). No blind R2 lifecycle rule, because R2 can't tell which WAL a kept backup needs.
    - The alternative is a dated `owner-waiver-YYYY-MM-DD`.
 3. **Owner steps** above, per company: the R2 bucket, the scoped token in the company vault, and the cipher
-   passphrase. h-btp also needs a read-only 1Password service account for the BTP vault: it has none today.
-4. **Drill hosts** (D5) in each company's account, monthly.
+   passphrase. h-btp needs a new read/write 1Password service account for the BTP vault (its existing one is read-only and can't be upgraded).
+4. **Drill hosts** (D5) in each company's account, quarterly (Dan 2026-11-16).
 
 ## Evidence
 `tests/fleet-company-db/proto.sh` (h-do1, throwaway containers) — results in
@@ -126,7 +126,9 @@ Backups before the change (standing rule): `/root/legacy-capture/<date>-fleet-co
   Until then nothing is expired.
 - **Drills:** quarterly per company, plus after every major change.
 - **Bucket protection (D4 correction accepted):** R2 Bucket Lock `wal-35d`, 35 days, prefix
-  `pgbackrest/archive/<stanza>/16-` only. AmForge's is live and proven (see `config/fleet-company-db/h-af.env`).
+  `pgbackrest/archive/<stanza>/16-` only. AmForge's stanza is `fleet-amforge` (see `config/fleet-company-db/h-af.env`).
+  **Never put a probe inside a stanza's archive path before `stanza-create`:** pgBackRest refuses a non-empty
+  archive path, and a locked probe can't be removed. Verify the rule's prefix text from its form instead.
 - **h-af roll-out:** "roll it out", including creating the `postgres` OS user.
 - **1Password service accounts are read/write** on the company vault. h-af uses `Hermes-af-2`. For BTP, a new
   read/write account is needed: 1Password can't add write access to the existing read-only one.
