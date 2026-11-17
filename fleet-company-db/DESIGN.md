@@ -63,7 +63,7 @@ Per company (AmForge in AmForge's Cloudflare + 1Password; BTP in BTP's):
 5. Tell T2 (or edit the reviewed desired file): the vault name and the Account ID, replacing `owner-step-pending`
    in `config/fleet-company-db/<host>.env`.
 
-### Drill host (D5), per company, monthly (D5: "a monthly drill restores each one") and after every major change
+### Drill host (D5), per company, QUARTERLY (Dan 2026-11-16: "I think we should do them quarterly") and after every major change
 - A **fresh** Ubuntu 24.04 droplet/VM **in the company's own account** (DigitalOcean for BTP like h-btp; AmForge's
   provider for AmForge), 2 vCPU / 4 GB is plenty, on the tailnet with a `tag:drill` (no inbound from the internet).
 - On it, as root: install `op` + a read-only service-account token for that company's vault (same as step 4), copy
@@ -119,3 +119,14 @@ Backups before the change (standing rule): `/root/legacy-capture/<date>-fleet-co
 `tests/fleet-company-db/proto.sh` (h-do1, throwaway containers) — results in
 `/root/code/chief/docs/edd/evidence/fleet-architecture/T2-company-db-proto-2026-11-15.md`.
 `tests/fleet-company-db/quick-sql.sh` — the schema/roles behaviour suite in a throwaway postgres:16 (~30 s).
+
+## Owner decisions, 2026-11-16/17 (Dan)
+- **Expiry:** "Definitely let backups older than 35 days expire after the first drill." After the first live drill
+  passes, a reviewed change sets `expire-auto=y`, `repo1-retention-full-type=time`, `repo1-retention-full=35`.
+  Until then nothing is expired.
+- **Drills:** quarterly per company, plus after every major change.
+- **Bucket protection (D4 correction accepted):** R2 Bucket Lock `wal-35d`, 35 days, prefix
+  `pgbackrest/archive/<stanza>/16-` only. AmForge's is live and proven (see `config/fleet-company-db/h-af.env`).
+- **h-af roll-out:** "roll it out", including creating the `postgres` OS user.
+- **1Password service accounts are read/write** on the company vault. h-af uses `Hermes-af-2`. For BTP, a new
+  read/write account is needed: 1Password can't add write access to the existing read-only one.
