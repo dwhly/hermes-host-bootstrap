@@ -17,7 +17,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(cd "$HERE/../.." && pwd)"
 OUT="${OUT:-${TMPDIR:-/tmp}/fcdb-proto-$(date -u +%Y%m%dT%H%M%SZ)}"; mkdir -p "$OUT"; chmod 0700 "$OUT"
 NET=fcdb-proto-net; MINIO=fcdb-minio; NODE=fcdb-node; DRILL1=fcdb-drill-latest; DRILL2=fcdb-drill-pitr
-IMG=fleet-company-db-node:noble
+IMG=fleet-company-db-node:noble  # build: docker build -t $IMG -f tests/fleet-company-db/Dockerfile.node tests/fleet-company-db
 MINIO_IMG=minio/minio:RELEASE.2025-09-07T16-13-09Z; MC_IMG=minio/mc:RELEASE.2025-08-13T08-35-41Z
 TASK=00000000-0000-4000-8000-00000000a001; ED=00000000-0000-4000-8000-0000000000e1
 FIX=/opt/bootstrap/tests/fleet-company-db/fixtures
