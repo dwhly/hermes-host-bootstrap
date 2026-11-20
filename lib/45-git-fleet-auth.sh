@@ -6,14 +6,15 @@
 # Macs got the code via rsync-from-h-do1 WITHOUT .git, which blocks real
 # `git clone`/`git fetch`/`git checkout` — and therefore blocks fleet
 # convergence (the converger fetches+checks-out a target ref; the node resolves
-# installed_refs via `git rev-parse`). This module wires a READ-ONLY,
-# repo-scoped GitHub token (a fine-grained PAT, Contents:Read on just the 5
-# chief repos) so every host can clone/fetch directly from origin.
+# installed_refs via `git rev-parse`). This module wires a GitHub token so
+# every host can clone/fetch directly from origin.
 #
 # Security posture:
-#   - The token is READ-ONLY and scoped to the chief repos only (no push, no
-#     admin, no other repos). Minted in GitHub, stored in 1Password
-#     (item GitHub-Hermes-Fleet2, field token), distributed via the existing
+#   - Owner decision 2026-11-17: the fleet uses the "Github - Build credentials"
+#     fine-grained PAT. It covers ALL dwhly repos with admin rights and has no
+#     expiry. The original read-only GitHub-Hermes-Fleet* PATs had expired
+#     (HTTP 401). Stored in 1Password
+#     (item "Github - Build credentials", field credential), distributed via the existing
 #     .env.template -> op inject path (lib/35-secrets.sh) as CHIEF_FLEET_GIT_TOKEN.
 #   - Stored on-host in a 0600 credentials file readable only by the user, NOT
 #     embedded in git config plaintext (so `git config --list` can't leak it).
@@ -35,7 +36,7 @@ if is_skipped git-fleet-auth; then
 fi
 
 # Load the resolved token from ~/.hermes/.env (produced by lib/35-secrets.sh via
-# op inject of CHIEF_FLEET_GIT_TOKEN=op://hermes/GitHub-Hermes-Fleet2/token).
+# op inject of CHIEF_FLEET_GIT_TOKEN=op://hermes/Github - Build credentials/credential).
 ENV_FILE="${HERMES_HOME:-$HOME/.hermes}/.env"
 TOKEN=""
 if [[ -f "$ENV_FILE" ]]; then
@@ -47,7 +48,7 @@ TOKEN="${CHIEF_FLEET_GIT_TOKEN:-$TOKEN}"
 
 if [[ -z "$TOKEN" || "$TOKEN" == op://* ]]; then
   warn "CHIEF_FLEET_GIT_TOKEN not resolved (got '${TOKEN:0:6}…')."
-  warn "  Ensure .env.template has CHIEF_FLEET_GIT_TOKEN=op://hermes/GitHub-Hermes-Fleet2/token"
+  warn "  Ensure .env.template has CHIEF_FLEET_GIT_TOKEN=op://hermes/Github - Build credentials/credential"
   warn "  and that op inject ran (lib/35-secrets.sh) — then re-run bootstrap."
   ok "Git fleet auth step complete (no token; skipped wiring)"
   return 0 2>/dev/null || exit 0
