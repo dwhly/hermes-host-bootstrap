@@ -506,6 +506,10 @@ def inspect(row):
         row["result"] = "held:atomic_restore_unavailable"
         return
     backup = save_backup(name, entry, resolved, prefix, old)
+    # The backup copy can take a while; re-check that no agent started meanwhile.
+    if in_use():
+        row["result"] = "deferred:in_use"
+        return
 
     def install(version, fallback=False):
         if row["method"] == "native":

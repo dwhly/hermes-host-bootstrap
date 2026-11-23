@@ -72,7 +72,7 @@ with open(path, "wb") as stream:
                    "EnvironmentVariables": {"HOME": home},
                    "StandardOutPath": home + "/.local/state/fleet-update-tools/launchd.stdout.log",
                    "StandardErrorPath": home + "/.local/state/fleet-update-tools/launchd.stderr.log",
-                   "ProcessType": "Background", "LowPriorityIO": True, "ExitTimeOut": 900}, stream)
+                   "ProcessType": "Background", "LowPriorityIO": True, "ExitTimeOut": 1200}, stream)
 PY
   plutil -lint "$tmp/agent.plist" >/dev/null
   if ! launchctl print "$domain" >/dev/null 2>&1; then
@@ -130,7 +130,7 @@ with open(sys.argv[1], "w") as stream:
     stream.write('[Unit]\nDescription=Update installed fleet coding CLIs\n'
                  'Wants=network-online.target\nAfter=network-online.target\n\n'
                  '[Service]\nType=oneshot\nUser=' + user + '\nEnvironment="HOME=' + home + '"\n'
-                 'ExecStart=/bin/bash "' + script + '"\nTimeoutStartSec=infinity\nTimeoutStopSec=15min\nKillMode=mixed\nNice=10\n')
+                 'ExecStart=/bin/bash "' + script + '"\nTimeoutStartSec=2h\nTimeoutStopSec=20min\nKillMode=mixed\nNice=10\n')
 PY
   cat >"$tmp/$unit.timer" <<'UNIT'
 [Unit]
