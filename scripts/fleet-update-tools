@@ -5,15 +5,26 @@ set -euo pipefail
 export PATH="${PATH:+$PATH:}$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 main() {
-  local dry=0 lock_rc=0 state="$HOME/.local/state/fleet-update-tools"
+  local dry=0 lock_rc=0 canary_tool="" canary_version="" state="$HOME/.local/state/fleet-update-tools"
+  local python=python3
+  if [[ "$(uname -s)" == Darwin ]]; then
+    if [[ -x /opt/homebrew/bin/python3 ]]; then python=/opt/homebrew/bin/python3
+    elif [[ -x /usr/local/bin/python3 ]]; then python=/usr/local/bin/python3
+    elif [[ "$(command -v python3)" == /usr/bin/python3 ]] && ! xcode-select -p >/dev/null 2>&1; then
+      echo "fleet-update-tools: Python 3 required (install Homebrew Python)" >&2; return 1
+    fi
+  fi
   case "${1:-}" in
     --dry-run) dry=1; shift ;;
-    -h|--help) echo 'Usage: fleet-update-tools [--dry-run]'; return 0 ;;
+    --canary-check)
+      [[ $# == 3 ]] || { echo 'Usage: fleet-update-tools --canary-check {claude|codex} VERSION' >&2; return 2; }
+      canary_tool="$2"; canary_version="$3"; shift 3 ;;
+    -h|--help) echo 'Usage: fleet-update-tools [--dry-run | --canary-check {claude|codex} VERSION]'; return 0 ;;
     '') ;;
     *) echo "Unknown argument: $1" >&2; return 2 ;;
   esac
   [[ $# == 0 ]] || { echo 'Unexpected arguments' >&2; return 2; }
-  if [[ "$dry" == 0 ]]; then
+  if [[ "$dry" == 0 && -z "$canary_tool" ]]; then
     mkdir -p "$state"
     exec 8>>"$state/lock"
     perl -MFcntl=:flock -e 'open(my $f, ">>&=", 8) or exit 2; exit(flock($f, LOCK_EX|LOCK_NB) ? 0 : 1)' || lock_rc=$?
@@ -23,8 +34,10 @@ main() {
       *) echo 'error:lock_failed' >&2; return 1 ;;
     esac
   fi
-  python3 - "${BASH_SOURCE[0]}" "$dry" <<'PY'
+  exec "$python" - "${BASH_SOURCE[0]}" "$dry" "$canary_tool" "$canary_version" <<'PY'
+import ctypes
 import datetime
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -36,9 +49,13 @@ import socket
 import subprocess
 import sys
 import tempfile
+import urllib.request
+import urllib.error
 
 root = Path(sys.argv[1]).resolve().parent.parent
 dry = sys.argv[2] == "1"
+canary_tool, canary_version = sys.argv[3:5]
+canary = bool(canary_tool)
 home = Path.home()
 state = home / ".local/state/fleet-update-tools"
 env = dict(os.environ, LC_ALL="C", HOMEBREW_NO_AUTO_UPDATE="1", HOMEBREW_NO_ANALYTICS="1",
@@ -52,11 +69,18 @@ class Failure(Exception):
     pass
 
 
+stop_signal = None
+termination_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
+
+
 def interrupted(signum, frame):
-    raise SystemExit(128 + signum)
+    # The transaction blocks these signals. Outside it, finish the current
+    # bounded read and write status before exiting.
+    global stop_signal
+    stop_signal = signum
 
 
-for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+for sig in termination_signals:
     signal.signal(sig, interrupted)
 
 
@@ -66,13 +90,17 @@ def run(command, cap=30, extra_env=None):
     with subprocess.Popen([str(arg) for arg in command], env=command_env,
                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, start_new_session=True,
-                          pass_fds=() if dry else (8,)) as child:
+                          pass_fds=() if dry else (8,),
+                          preexec_fn=lambda: signal.pthread_sigmask(
+                              signal.SIG_UNBLOCK, termination_signals)) as child:
         try:
             out, err = child.communicate(timeout=cap)
             return subprocess.CompletedProcess(command, child.returncode,
                                                out.decode(errors="replace"), err.decode(errors="replace"))
-        except subprocess.TimeoutExpired:
-            raise Failure("timeout")
+        except subprocess.TimeoutExpired as exc:
+            failure = Failure("timeout")
+            failure.stderr = (exc.stderr or b"").decode(errors="replace")
+            raise failure
         finally:
             # Also reap descendants if their parent exited early. Keep fd 8 until
             # the group has received KILL, including on interruption.
@@ -112,7 +140,10 @@ def brew_owns(name, entry, resolved):
         return False
     package = "claude-code" if name == "claude" else "codex"
     for kind in ("--formula", "--cask"):
-        listing = run([brew, "list", kind, package])
+        try:
+            listing = run([brew, "list", kind, package], cap=60)
+        except Failure:
+            return None
         if listing.returncode:
             continue
         for line in listing.stdout.splitlines():
@@ -128,35 +159,49 @@ def brew_owns(name, entry, resolved):
 
 
 def in_use():
-    process = run(["ps", "-u", str(os.getuid()), "-o", "comm=", "-o", "args="])
+    process = run(["ps", "-axwwo", "uid=,args="])
     if process.returncode:
         raise Failure("process_check_failed")
+
     def agent_executable(token):
         return (Path(token).name in ("claude", "codex", "codex.js") or
                 token.startswith(str(home / ".local/share/claude/versions") + "/") or
                 any("/node_modules/" + pkg + "/" in token for pkg in packages.values()))
 
+    value_flags = {"-r", "--require", "--import", "--loader", "--experimental-loader",
+                   "--max-old-space-size", "--max_old_space_size", "--stack-size",
+                   "--stack_size", "--conditions", "-C", "--icu-data-dir",
+                   "--openssl-config", "--title", "--redirect-warnings",
+                   "--diagnostic-dir", "--env-file", "--env-file-if-exists"}
     for line in process.stdout.splitlines():
-        try:
-            words = shlex.split(line)
-        except ValueError:
-            words = line.split()
-        if not words:
+        fields = line.strip().split(None, 1)
+        if len(fields) != 2 or fields[0] != str(os.getuid()):
             continue
-        if agent_executable(words[0]):
+        try:
+            args = shlex.split(fields[1])
+        except ValueError:
+            args = fields[1].split()
+        if not args:
+            continue
+        if agent_executable(args[0]):
             return True
-        # Node/npm and shell wrappers expose the CLI in argv rather than comm.
-        # Inspect only the executable/script, never prompts passed as arguments.
-        args = words[1:]
-        if args and agent_executable(args[0]):
-            return True
-        if args and Path(args[0]).name in ("node", "nodejs", "bash", "sh", "zsh"):
-            for arg in args[1:]:
-                if arg.startswith("-"):
-                    continue
-                if agent_executable(arg):
-                    return True
-                break
+        if Path(args[0]).name not in ("node", "nodejs", "bash", "sh", "zsh"):
+            continue
+        skip_value = False
+        for arg in args[1:]:
+            if skip_value:
+                skip_value = False
+                continue
+            if arg in ("-e", "--eval", "-p", "--print", "-c"):
+                break  # Subsequent text is code or a prompt, not a script path.
+            if arg in value_flags:
+                skip_value = True
+                continue
+            if arg.startswith("-"):
+                continue
+            if agent_executable(arg):
+                return True
+            break
     return False
 
 
@@ -193,23 +238,27 @@ def npm_command(npm, *args):
     return [npm] + list(args)
 
 
-def target_version(npm, package):
-    latest = run(npm_command(npm, "view", package, "version"), cap=60)
-    dates = run(npm_command(npm, "view", package, "time", "--json"), cap=60)
-    if latest.returncode or dates.returncode:
+def target_version(package):
+    # Full packument includes publication times and deprecated release metadata.
+    url = "https://registry.npmjs.org/" + package.replace("/", "%2f")
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response:
+            metadata = json.load(response)
+    except (OSError, urllib.error.URLError):
         raise Failure("registry_failed")
-    latest_version = latest.stdout.strip()
-    if not version_token.fullmatch(latest_version):
+    except (ValueError, TypeError):
         raise Failure("registry_invalid")
     try:
-        published = json.loads(dates.stdout)
-        if not isinstance(published, dict):
-            raise ValueError("not a mapping")
+        latest_version = metadata["dist-tags"]["latest"]
+        if not version_token.fullmatch(latest_version):
+            raise ValueError("invalid latest")
+        published = metadata["time"]
+        versions = metadata["versions"]
         cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=24)
         candidates = []
         latest_key = tuple(map(int, latest_version.split("."))) if stable.fullmatch(latest_version) else None
         for version, timestamp in published.items():
-            if not stable.fullmatch(version):
+            if not stable.fullmatch(version) or version not in versions or versions[version].get("deprecated"):
                 continue
             key = tuple(map(int, version.split(".")))
             if latest_key is not None and key > latest_key:
@@ -220,14 +269,178 @@ def target_version(npm, package):
             if when <= cutoff:
                 candidates.append((key, version))
         return max(candidates)[1] if candidates else None
-    except (ValueError, TypeError, AttributeError):
+    except (KeyError, ValueError, TypeError, AttributeError):
         raise Failure("registry_invalid")
+
+
+def off_path(name):
+    patterns = [".nvm/versions/node/*/bin/" + name,
+                ".local/share/fnm/node-versions/*/installation/bin/" + name,
+                ".fnm/node-versions/*/installation/bin/" + name,
+                ".local/share/claude/versions/*" if name == "claude" else ".npm-global/bin/codex",
+                ".npm-global/bin/" + name, "tools/*/bin/" + name]
+    return any(any(home.glob(pattern)) for pattern in patterns)
+
+
+def remove(path):
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def copy_entry(source, target):
+    if source.is_symlink():
+        target.symlink_to(os.readlink(source))
+    elif source.is_dir():
+        shutil.copytree(source, target, symlinks=True)
+    else:
+        shutil.copy2(source, target)
+
+
+def atomic_exchange(left, right):
+    # Directory replacement must have no missing-path window. Linux and macOS
+    # expose atomic exchanges for nonempty directories through libc.
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        rename = libc.renamex_np
+        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        args = (os.fsencode(left), os.fsencode(right), 2)  # RENAME_SWAP
+    else:
+        rename = libc.renameat2
+        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                           ctypes.c_char_p, ctypes.c_uint]
+        args = (-100, os.fsencode(left), -100, os.fsencode(right), 2)  # RENAME_EXCHANGE
+    rename.restype = ctypes.c_int
+    if rename(*args):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def exchange_supported(parent):
+    # Check the actual prefix filesystem before allowing a destructive install.
+    with tempfile.TemporaryDirectory(prefix=".fleet-probe-", dir=str(parent)) as tmp:
+        left, right = Path(tmp) / "left", Path(tmp) / "right"
+        left.mkdir()
+        right.mkdir()
+        (left / "probe").touch()
+        (right / "probe").touch()
+        try:
+            atomic_exchange(left, right)
+            return True
+        except (OSError, AttributeError):
+            return False
+
+
+def restore_entry(source, target):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=".fleet-restore-", dir=str(target.parent)))
+    try:
+        copy_entry(source, stage / "ready")
+        if target.is_dir() and not target.is_symlink():
+            atomic_exchange(stage / "ready", target)
+        else:
+            os.replace(stage / "ready", target)
+    finally:
+        shutil.rmtree(stage)
+
+
+def save_backup(name, entry, resolved, prefix, old):
+    directory = state / "backup" / name
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix="." + name + "-", dir=str(directory.parent)))
+    try:
+        if prefix is not None:
+            copy_entry(prefix / "lib/node_modules" / packages[name], stage / "package")
+            copy_entry(prefix / "bin" / name, stage / "bin")
+        else:
+            # Dereference: installers may prune versions/ during the update.
+            shutil.copy2(resolved, stage / old)
+        copy_entry(entry, stage / "entry")
+        (stage / "version").write_text(old + "\n")
+        remove(directory)
+        os.replace(stage, directory)
+    finally:
+        remove(stage)
+    return directory
+
+
+def install_diagnostics(row, stderr):
+    lines = [line for line in stderr.splitlines()
+             if not re.search(r"token|auth|key|password", line, re.I)]
+    if lines:
+        row.setdefault("install_stderr", []).extend(line[:1000] for line in lines[-20:])
+        row["install_stderr"] = row["install_stderr"][-20:]
+
+
+def prepare_canary(name):
+    global home, state, env
+    original = shutil.which(name)
+    if not original:
+        raise Failure("canary_tool_missing")
+    resolved = Path(original).resolve()
+    npm, prefix = npm_install(resolved, packages[name])
+    native = name == "claude" and inside(resolved, home / ".local/share/claude/versions")
+    if not native and not npm:
+        raise Failure("canary_unsupported_install")
+    sandbox = Path(tempfile.mkdtemp(prefix="fleet-tools-canary-"))
+    home = sandbox / "home"
+    home.mkdir()
+    state = home / ".local/state/fleet-update-tools"
+    state.mkdir(parents=True)
+    fd = os.open(str(state / "lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    if fd != 8:
+        os.dup2(fd, 8)
+        os.close(fd)
+    fcntl.flock(8, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    local_bin = home / ".local/bin"
+    local_bin.mkdir(parents=True)
+    if native:
+        copied = home / ".local/share/claude/versions" / resolved.name
+        copied.parent.mkdir(parents=True)
+        shutil.copy2(resolved, copied)
+        (local_bin / name).symlink_to(copied)
+    else:
+        copied_prefix = home / "prefix"
+        (copied_prefix / "bin").mkdir(parents=True)
+        pkg = packages[name]
+        target = copied_prefix / "lib/node_modules" / pkg
+        target.parent.mkdir(parents=True)
+        # Dereference links in the sandbox so no canary writes reach the source.
+        shutil.copytree(prefix / "lib/node_modules" / pkg, target, symlinks=False)
+        copied = copied_prefix / resolved.relative_to(prefix)
+        (copied_prefix / "bin" / name).symlink_to(copied)
+        (local_bin / name).symlink_to(copied_prefix / "bin" / name)
+        npm_source = npm.resolve()
+        if npm_source.name == "npm-cli.js":
+            npm_root = npm_source.parent.parent
+            npm_target = copied_prefix / "lib/node_modules/npm"
+            shutil.copytree(npm_root, npm_target, symlinks=False)
+            (copied_prefix / "bin/npm").symlink_to(npm_target / "bin/npm-cli.js")
+        else:
+            shutil.copy2(npm_source, copied_prefix / "bin/npm")
+        node = prefix / "bin/node"
+        if not node.is_file():
+            node = Path(shutil.which("node") or "/missing-node")
+        shutil.copy2(node, copied_prefix / "bin/node")
+    env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"),
+               XDG_CACHE_HOME=str(home / ".cache"), XDG_DATA_HOME=str(home / ".local/share"),
+               XDG_STATE_HOME=str(home / ".local/state"), CLAUDE_CONFIG_DIR=str(home / ".claude"),
+               npm_config_cache=str(home / ".npm"), npm_config_userconfig=str(home / ".npmrc"),
+               npm_config_globalconfig=str(home / ".global-npmrc"),
+               npm_config_prefix=str(home / "prefix"),
+               PATH=str(local_bin) + ":" + str(home / "prefix/bin") + ":" + env["PATH"])
+    os.environ["HOME"] = str(home)
+    print("Canary HOME (retained for inspection): " + str(home), flush=True)
+    return local_bin / name
 
 
 def inspect(row):
     name = row["name"]
-    found = shutil.which(name)
+    found = str(canary_entry) if canary else shutil.which(name)
     if not found:
+        if off_path(name):
+            row["result"] = "held:not_on_path"
         return
     entry = Path(found).absolute()
     resolved = entry.resolve()
@@ -249,28 +462,34 @@ def inspect(row):
     if in_use():
         row["result"] = "deferred:in_use"
         return
-    if brew_owns(name, entry, resolved):
+    owned = False if canary else brew_owns(name, entry, resolved)
+    if owned is None:
+        row["result"] = "held:brew_unknown"
+        return
+    if owned:
         row.update(method="brew", result="held:brew_managed")
         return
     if row["method"] == "unknown":
         row["result"] = "held:unknown_install"
         return
-    if not npm:
-        found_npm = shutil.which("npm")
-        if not found_npm:
-            row["result"] = "held:npm_missing"
-            return
-        npm = Path(found_npm)
+    writable = ([prefix / "lib/node_modules", prefix / "lib/node_modules" / packages[name],
+                 (prefix / "lib/node_modules" / packages[name]).parent, prefix / "bin"]
+                if prefix else [entry.parent, resolved.parent])
+    if not all(os.access(path, os.W_OK) for path in writable):
+        row["result"] = "held:not_writable"
+        return
     old = health(entry, prefix)
     if old is None or not stable.fullmatch(old):
         raise Failure("previous_version_unknown")
     row["from"] = row["to"] = old
-    target = target_version(npm, packages[name])
+    target = canary_version if canary else target_version(packages[name])
     row["target"] = target
     if target is None:
         row["result"] = "held:no_soaked_version"
         return
-    if tuple(map(int, old.split("."))) >= tuple(map(int, target.split("."))):
+    if canary and target == old:
+        raise Failure("canary_requires_different_version")
+    if not canary and tuple(map(int, old.split("."))) >= tuple(map(int, target.split("."))):
         row["result"] = "current"
         return
     if (home / ".config/fleet-update/pause-tools").exists():
@@ -280,33 +499,94 @@ def inspect(row):
         row["result"] = "deferred:in_use"
         return
 
-    def install(version):
-        if row["method"] == "native":
-            # Preserve the old native executable as the rollback installer even
-            # if the new symlink target cannot execute.
-            return run([resolved, "install", version], cap=300).returncode == 0
-        return run(npm_command(npm, "i", "-g", packages[name] + "@" + version,
-                               "--prefix", str(prefix)), cap=300).returncode == 0
+    if stop_signal:
+        row["result"] = "held:interrupted"
+        return
+    if prefix and not exchange_supported((prefix / "lib/node_modules" / packages[name]).parent):
+        row["result"] = "held:atomic_restore_unavailable"
+        return
+    backup = save_backup(name, entry, resolved, prefix, old)
 
-    reason = "install_failed"
+    def install(version, fallback=False):
+        if row["method"] == "native":
+            # The saved executable survives vendor pruning of versions/.
+            command = [backup / old if fallback else resolved, "install", version]
+        else:
+            command = npm_command(npm, "i", "-g", packages[name] + "@" + version,
+                                  "--prefix", str(prefix))
+            if fallback:
+                command.append("--prefer-offline")
+        proc = run(command, cap=300)
+        install_diagnostics(row, proc.stderr)
+        return proc.returncode == 0
+
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, termination_signals)
     try:
-        if install(target):
-            reason = "health_check_failed"
-            if health(entry, prefix) == target:
-                row["to"] = target
-                row["result"] = "updated {}->{}".format(old, target)
-                return
-    except (OSError, Failure):
-        pass
-    row["to"] = None
-    try:
-        if install(old) and health(entry, prefix) == old:
-            row["to"] = old
-            row["result"] = "rolled_back:" + reason
+        if stop_signal or termination_signals & signal.sigpending():
+            row["result"] = "held:interrupted"
             return
-    except (OSError, Failure):
-        pass
-    row["result"] = "error:rollback_failed"
+        reason = "install_failed"
+        try:
+            installed = install(target)
+            actual = health(entry, prefix)
+            if termination_signals & signal.sigpending() or stop_signal:
+                reason = "interrupted"
+            elif installed:
+                reason = "health_check_failed"
+                if actual == target:
+                    if canary:
+                        row["canary_target_verified"] = True
+                        reason = "canary_forced_failure"
+                    else:
+                        row.update(to=target, result="updated {}->{}".format(old, target))
+                        return
+        except Exception as exc:
+            install_diagnostics(row, getattr(exc, "stderr", str(exc)))
+        # If a failed installer left the old CLI healthy, do not mutate it again.
+        if health(entry, prefix) == old:
+            row.update(to=old, result="rolled_back:" + reason)
+            return
+        row["to"] = None
+        try:
+            if prefix:
+                restore_entry(backup / "package", prefix / "lib/node_modules" / packages[name])
+                restore_entry(backup / "bin", prefix / "bin" / name)
+                if entry != prefix / "bin" / name:
+                    restore_entry(backup / "entry", entry)
+            else:
+                # Repoint offline first, even if the installer removed old versions.
+                saved_link = backup / "restore-link"
+                saved_link.symlink_to(backup / old)
+                try:
+                    restore_entry(saved_link, entry)
+                finally:
+                    saved_link.unlink()
+            if health(entry, prefix) == old:
+                if not prefix:
+                    # Keep future detection and backups on the vendor layout.
+                    restore_entry(backup / old, resolved)
+                    restored_link = backup / "restore-link"
+                    restored_link.symlink_to(resolved)
+                    try:
+                        restore_entry(restored_link, entry)
+                    finally:
+                        restored_link.unlink()
+                    if health(entry) != old:
+                        raise Failure("native_restore_health_failed")
+                row.update(to=old, result="rolled_back:" + reason)
+                return
+        except Exception as exc:
+            install_diagnostics(row, getattr(exc, "stderr", str(exc)))
+        try:
+            if install(old, fallback=True) and health(entry, prefix) == old:
+                row.update(to=old, result="rolled_back:" + reason)
+                return
+        except Exception as exc:
+            install_diagnostics(row, getattr(exc, "stderr", str(exc)))
+        row["result"] = "error:rollback_failed"
+    finally:
+        # Delivery is deferred until the transaction has committed or recovered.
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def atomic_write(path, content):
@@ -345,31 +625,54 @@ def checkout_version():
     return "unknown"
 
 
+canary_entry = None
+if canary:
+    if canary_tool not in packages or not stable.fullmatch(canary_version):
+        print("Canary requires claude|codex and a stable X.Y.Z version", file=sys.stderr)
+        sys.exit(2)
+    try:
+        canary_entry = prepare_canary(canary_tool)
+    except (Failure, OSError) as exc:
+        print("fleet-update-tools: " + str(exc), file=sys.stderr)
+        sys.exit(1)
+
+report = dict(host=socket.gethostname(),
+              ran_at=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              version=checkout_version(), tools=[])
 try:
-    report = dict(host=socket.gethostname(),
-                  ran_at=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                  version=checkout_version(), tools=[])
-    for name in packages:
+    for name in ([canary_tool] if canary else packages):
         row = dict(name=name, path=None, method=None, result="skipped:absent",
                    **{"from": None, "to": None, "target": None})
+        report["tools"].append(row)
         try:
-            inspect(row)
+            if stop_signal:
+                row["result"] = "held:interrupted"
+            else:
+                inspect(row)
         except Failure as exc:
             row["result"] = "error:" + str(exc)
         except Exception:
             row["result"] = "error:inspection_failed"
-        report["tools"].append(row)
         print("{}: {}".format(name, row["result"]))
+finally:
     if not dry:
-        atomic_write(state / "status.json", json.dumps(report, indent=2) + "\n")
-        log = state / "log"
-        lines = log.read_text().splitlines() if log.exists() else []
-        lines.append(json.dumps(report, separators=(",", ":")))
-        atomic_write(log, "\n".join(lines[-500:]) + "\n")
-    sys.exit(1 if any(row["result"].startswith("error:") for row in report["tools"]) else 0)
-except (OSError, ValueError):
-    print("fleet-update-tools: error:status_failed", file=sys.stderr)
-    sys.exit(1)
+        try:
+            atomic_write(state / "status.json", json.dumps(report, indent=2) + "\n")
+            log = state / "log"
+            lines = log.read_text().splitlines() if log.exists() else []
+            lines.append(json.dumps(report, separators=(",", ":")))
+            atomic_write(log, "\n".join(lines[-500:]) + "\n")
+        except (OSError, ValueError):
+            print("fleet-update-tools: error:status_failed", file=sys.stderr)
+            sys.exit(1)
+if stop_signal:
+    sys.exit(128 + stop_signal)
+if canary:
+    row = report["tools"][0]
+    passed = row["result"] == "rolled_back:canary_forced_failure" and row.get("canary_target_verified")
+    print("Canary " + ("PASS" if passed else "FAIL") + "; evidence: " + str(state / "status.json"))
+    sys.exit(0 if passed else 1)
+sys.exit(1 if any(row["result"].startswith("error:") for row in report["tools"]) else 0)
 PY
 }
 main "$@"; exit $?

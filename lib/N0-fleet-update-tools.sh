@@ -10,6 +10,16 @@ source "$REPO_ROOT/lib/common.sh"
 # common.sh adds Homebrew first; preserve caller shims for this module.
 export PATH="$original_path:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
+python=python3
+if [[ "$OS" == macos ]]; then
+  if [[ -x /opt/homebrew/bin/python3 ]]; then python=/opt/homebrew/bin/python3
+  elif [[ -x /usr/local/bin/python3 ]]; then python=/usr/local/bin/python3
+  elif [[ "$(command -v python3)" == /usr/bin/python3 ]] && ! xcode-select -p >/dev/null 2>&1; then
+    warn "fleet-update-tools requires Python 3; install Homebrew Python"
+    exit 0
+  fi
+fi
+
 step "Fleet coding CLI updater"
 if ! tier_allows E; then
   skip "fleet-update-tools: unsupported tier"
@@ -52,7 +62,7 @@ if [[ "$OS" == macos ]]; then
   domain="gui/$(id -u)"
   mkdir -p "$HOME/Library/LaunchAgents"
   plist="$HOME/Library/LaunchAgents/$label.plist"
-  python3 - "$tmp/agent.plist" "$script" "$HOME" "$label" <<'PY'
+  "$python" - "$tmp/agent.plist" "$script" "$HOME" "$label" <<'PY'
 import plistlib
 import sys
 path, script, home, label = sys.argv[1:]
@@ -62,9 +72,14 @@ with open(path, "wb") as stream:
                    "EnvironmentVariables": {"HOME": home},
                    "StandardOutPath": home + "/.local/state/fleet-update-tools/launchd.stdout.log",
                    "StandardErrorPath": home + "/.local/state/fleet-update-tools/launchd.stderr.log",
-                   "ProcessType": "Background", "LowPriorityIO": True}, stream)
+                   "ProcessType": "Background", "LowPriorityIO": True, "ExitTimeOut": 900}, stream)
 PY
   plutil -lint "$tmp/agent.plist" >/dev/null
+  if ! launchctl print "$domain" >/dev/null 2>&1; then
+    install -m 0644 "$tmp/agent.plist" "$plist"
+    warn "$domain unavailable; LaunchAgent saved and will load at the next GUI login"
+    exit 0
+  fi
   # Hold the same open-file-description lock as the updater throughout reload.
   # An unchanged, loaded agent needs no reload and must not wait on a busy run.
   if ! cmp -s "$tmp/agent.plist" "$plist" || ! launchctl print "$domain/$label" >/dev/null 2>&1; then
@@ -103,7 +118,7 @@ else
   systemd_dir="${HERMES_SYSTEMD_DIR:-/etc/systemd/system}"
   unit=hermes-fleet-update-tools
   # Escape systemd specifiers and quoted ExecStart paths.
-  python3 - "$tmp/$unit.service" "$script" "$HOME" "$(id -un)" <<'PY'
+  "$python" - "$tmp/$unit.service" "$script" "$HOME" "$(id -un)" <<'PY'
 import sys
 
 def quote(value):
@@ -115,7 +130,7 @@ with open(sys.argv[1], "w") as stream:
     stream.write('[Unit]\nDescription=Update installed fleet coding CLIs\n'
                  'Wants=network-online.target\nAfter=network-online.target\n\n'
                  '[Service]\nType=oneshot\nUser=' + user + '\nEnvironment="HOME=' + home + '"\n'
-                 'ExecStart=/bin/bash "' + script + '"\nTimeoutStartSec=30min\nNice=10\n')
+                 'ExecStart=/bin/bash "' + script + '"\nTimeoutStartSec=infinity\nTimeoutStopSec=15min\nKillMode=mixed\nNice=10\n')
 PY
   cat >"$tmp/$unit.timer" <<'UNIT'
 [Unit]
@@ -147,7 +162,8 @@ UNIT
     $SUDO systemctl daemon-reload
     exec 8>&-
   fi
-  # Enabling only: do not trigger a Persistent timer catch-up during bootstrap.
+  # Start the timer, never the service.
   $SUDO systemctl enable "$unit.timer"
-  ok "$unit.timer enabled (daily at 03:41, persistent; starts at next boot)"
+  $SUDO systemctl start "$unit.timer"
+  ok "$unit.timer enabled and started (daily at 03:41, persistent)"
 fi

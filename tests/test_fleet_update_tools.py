@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import plistlib
 import shutil
+import signal
+import sys
 import subprocess
 import time
 
@@ -38,7 +40,7 @@ CLI = '''#!/usr/bin/env python3
 import json, os, pathlib, shutil, sys
 cfg = json.loads(pathlib.Path(os.environ['TEST_CONFIG']).read_text())
 me = pathlib.Path(__file__).resolve()
-native = me.parent == pathlib.Path.home() / '.local/share/claude/versions'
+native = me.name.count('.') == 2 and me.name[0].isdigit()
 name = 'claude' if native or 'claude-code' in me.parts else 'codex'
 version_file = None if native else me.parent / 'version.txt'
 version = me.name if native else version_file.read_text()
@@ -54,7 +56,7 @@ assert native and sys.argv[1] == 'install'
 v = sys.argv[2]
 if v == '1.0.0' and name in cfg.get('rollback_fail', []):
     sys.exit(1)
-new = me.parent / v
+new = pathlib.Path.home() / '.local/share/claude/versions' / v
 if new != me:
     shutil.copy2(me, new)
 link = pathlib.Path.home() / '.local/bin/claude'
@@ -104,7 +106,7 @@ class Fleet:
             "2.0.0": (now - datetime.timedelta(hours=30)).isoformat()})
         self.env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin) + ":/usr/bin:/bin",
                         TEST_ROOT=str(tmp), TEST_CONFIG=str(self.config), TEST_CALLS=str(self.calls),
-                        TEST_BUSY=str(tmp / "busy"), PYTHONDONTWRITEBYTECODE="1")
+                        TEST_BUSY=str(tmp / "busy"), TMPDIR=str(tmp), PYTHONDONTWRITEBYTECODE="1")
         # Appended system paths must never expose real installed CLIs to tests.
         patches = tmp / "patches"
         patches.mkdir()
@@ -117,16 +119,27 @@ def which(name, *args, **kwargs):
             return None
     return found
 shutil.which = which
+import io, json, urllib.request, urllib.error
+def urlopen(url, timeout=None):
+    assert url.startswith('https://registry.npmjs.org/') and timeout == 60
+    cfg = json.loads(pathlib.Path(os.environ['TEST_CONFIG']).read_text())
+    name = 'claude' if 'claude-code' in url else 'codex'
+    if name in cfg.get('registry_fail', []): raise urllib.error.URLError('offline')
+    if cfg.get('become_busy'): pathlib.Path(os.environ['TEST_BUSY']).touch()
+    return io.StringIO(json.dumps({'dist-tags': {'latest': cfg['latest']}, 'time': cfg['times'],
+        'versions': {v: {'deprecated': 'bad release' if v in cfg.get('deprecated', []) else ''}
+                     for v in cfg['times']}}))
+urllib.request.urlopen = urlopen
 ''')
         self.env["PYTHONPATH"] = str(patches)
         executable(self.bin / "npm", NPM)
         executable(self.bin / "ps", '''#!/usr/bin/env python3
 import json, os, pathlib, sys
 cfg = json.loads(pathlib.Path(os.environ['TEST_CONFIG']).read_text())
-assert sys.argv[1:3] == ['-u', str(os.getuid())]
+assert sys.argv[1:] == ['-axwwo', 'uid=,args=']
 if cfg.get('ps_fail'): sys.exit(1)
-print(cfg.get('processes', ''))
-if pathlib.Path(os.environ['TEST_BUSY']).exists(): print('node node /tmp/lib/node_modules/@openai/codex/bin/codex.js')
+print(str(cfg.get('process_uid', os.getuid())) + ' ' + cfg.get('processes', ''))
+if pathlib.Path(os.environ['TEST_BUSY']).exists(): print(str(os.getuid()) + ' node /tmp/lib/node_modules/@openai/codex/bin/codex.js')
 ''')
         self.script = SCRIPT
 
@@ -222,7 +235,7 @@ def test_no_soaked_version(fleet):
     assert not fleet.installs()
 
 
-@pytest.mark.parametrize("process", ["claude /tmp/claude -p hello", "codex /tmp/codex exec hi", "node node /tmp/lib/node_modules/@anthropic-ai/claude-code/cli.js -p hi", "node node /tmp/lib/node_modules/@openai/codex/bin/codex.js"])
+@pytest.mark.parametrize("process", ["/tmp/claude -p hello", "/tmp/codex exec hi", "node /tmp/lib/node_modules/@anthropic-ai/claude-code/cli.js -p hi", "node --max-old-space-size 4096 --require setup.js /tmp/lib/node_modules/@openai/codex/bin/codex.js"])
 def test_any_agent_defers_both(fleet, process):
     fleet.install("claude", "native")
     fleet.install("codex")
@@ -233,13 +246,13 @@ def test_any_agent_defers_both(fleet, process):
 
 def test_process_arguments_are_not_agents(fleet):
     fleet.install("claude", "native")
-    fleet.cfg["processes"] = 'python3 python3 worker.py "ask claude or codex"'
+    fleet.cfg["processes"] = 'python3 worker.py "ask claude or codex"'
     assert fleet.row()["result"].startswith("updated")
 
 
 def test_native_version_path_is_in_use(fleet):
     binary = fleet.install("claude", "native")
-    fleet.cfg["processes"] = "{} {} -p hello".format(binary, binary)
+    fleet.cfg["processes"] = "{} -p hello".format(binary)
     assert fleet.row()["result"] == "deferred:in_use"
     assert not fleet.calls.exists()
 
@@ -279,22 +292,22 @@ def test_rollback(fleet, name, method, reason):
     row = fleet.row(name)
     assert row["result"] == "rolled_back:" + reason
     assert row["from"] == row["to"] == "1.0.0" and row["target"] == "2.0.0"
-    assert len(fleet.installs()) == 2
+    assert len(fleet.installs()) == 1
 
 
 @pytest.mark.parametrize("failure", ["install", "health"])
 def test_rollback_failure(fleet, failure):
     fleet.install("codex")
     fleet.cfg["bad_versions"] = {"codex": ["2.0.0"]}
+    # Make the local restore fail its health check, then exercise npm fallback.
     if failure == "install":
         fleet.cfg["rollback_fail"] = ["codex"]
-    else:
-        # Health starts failing for the old release only AFTER the update.
-        executable(fleet.home / "tools/node-22/bin/npm", NPM.replace(
-            "sys.exit(1 if name in cfg.get('install_fail'",
-            "cfg['bad_versions']['codex'].append('1.0.0')\npathlib.Path(os.environ['TEST_CONFIG']).write_text(json.dumps(cfg))\nsys.exit(1 if name in cfg.get('install_fail'"))
+    executable(fleet.home / "tools/node-22/bin/npm", NPM.replace(
+        "sys.exit(1 if name in cfg.get('install_fail'",
+        "cfg['bad_versions']['codex'].append('1.0.0')\npathlib.Path(os.environ['TEST_CONFIG']).write_text(json.dumps(cfg))\nsys.exit(1 if name in cfg.get('install_fail'"))
     row = fleet.row("codex", expected=1)
     assert row["result"] == "error:rollback_failed" and row["to"] is None
+    assert "--prefer-offline" in fleet.installs()[-1]
 
 
 def test_absent_status_and_log_shape(fleet):
@@ -360,11 +373,11 @@ def test_dry_run_changes_nothing(fleet, existing_state):
 def test_auth_files_untouched(fleet):
     fleet.install("claude", "native")
     fleet.install("codex")
-    for path in (".codex/auth.json", ".config/claude/oauth-token", "Library/Keychains/login.keychain-db"):
+    for path in (".codex/auth.json", ".claude/.credentials.json", ".claude.json", "Library/Keychains/login.keychain-db"):
         target = fleet.home / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(b"test secret\x00")
-    before = {p: (fleet.home / p).read_bytes() for p in (".codex/auth.json", ".config/claude/oauth-token", "Library/Keychains/login.keychain-db")}
+    before = {p: (fleet.home / p).read_bytes() for p in (".codex/auth.json", ".claude/.credentials.json", ".claude.json", "Library/Keychains/login.keychain-db")}
     fleet.run()
     assert all((fleet.home / p).read_bytes() == content for p, content in before.items())
 
@@ -406,6 +419,7 @@ def module(tmp_path):
     (repo / "verify.sh").write_text("verify_human() { :; }\n")
     executable(bins / "uname", '#!/bin/sh\nif [ "$1" = -s ]; then echo "$TEST_OS"; else /usr/bin/uname "$@"; fi\n')
     executable(bins / "systemctl", '#!/bin/sh\nprintf "%s\\n" "$*" >> "$TEST_CALLS"\n')
+    executable(bins / "xcode-select", "#!/bin/sh\necho /test/CommandLineTools\n")
     executable(bins / "sleep", '#!/bin/sh\nexit 0\n')
     executable(bins / "plutil", "#!/usr/bin/env python3\nimport plistlib, sys\nplistlib.load(open(sys.argv[-1], 'rb'))\n")
     executable(bins / "launchctl", """#!/usr/bin/env python3
@@ -415,6 +429,7 @@ s = pathlib.Path(os.environ['TEST_LOADED'])
 with open(os.environ['TEST_CALLS'], 'a') as f:
     f.write(' '.join(a) + '\\n')
 if a[0] == 'print':
+    if '/' not in a[1][4:]: sys.exit(1 if os.environ.get('TEST_NO_GUI') else 0)
     if s.exists() and s.read_text().startswith('draining'):
         n = int(s.read_text().split(':')[1])
         if n == 0: s.unlink()
@@ -448,6 +463,7 @@ def test_module_mac_calendar_idempotent_reload(module):
     data = plistlib.loads(plist.read_bytes())
     assert data["StartCalendarInterval"] == {"Hour": 3, "Minute": 41}
     assert "StartInterval" not in data and "RunAtLoad" not in data
+    assert data["ExitTimeOut"] == 900
     assert data["ProgramArguments"] == ["/bin/bash", str(repo / "scripts/fleet-update-tools")]
     state = home / ".local/state/fleet-update-tools"
     assert Path(data["StandardOutPath"]).parent == state
@@ -561,24 +577,25 @@ def test_module_linux_units_idempotent(module):
     units = Path(env["HERMES_SYSTEMD_DIR"])
     service = units / "hermes-fleet-update-tools.service"
     timer = units / "hermes-fleet-update-tools.timer"
-    assert "User=root\n" in service.read_text()
+    assert "User=" + __import__("pwd").getpwuid(os.getuid()).pw_name + "\n" in service.read_text()
+    assert "TimeoutStartSec=infinity\nTimeoutStopSec=15min\nKillMode=mixed\n" in service.read_text()
     assert str(repo / "scripts/fleet-update-tools") in service.read_text()
     assert "OnCalendar=*-*-* 03:41:00\n" in timer.read_text()
     assert "Persistent=true\n" in timer.read_text()
     calls = Path(env["TEST_CALLS"])
     assert calls.read_text().splitlines() == [
-        "daemon-reload", "enable hermes-fleet-update-tools.timer"]
+        "daemon-reload", "enable hermes-fleet-update-tools.timer", "start hermes-fleet-update-tools.timer"]
     before = snapshot(units)
     calls.write_text("")
     bootstrap(module, "--role=server")
     assert snapshot(units) == before and "daemon-reload" not in calls.read_text()
-    assert calls.read_text().splitlines() == ["enable hermes-fleet-update-tools.timer"]
+    assert calls.read_text().splitlines() == ["enable hermes-fleet-update-tools.timer", "start hermes-fleet-update-tools.timer"]
     timer.write_text("stale")
     calls.write_text("")
     bootstrap(module, "--role=server")
     assert snapshot(units) == before
     assert calls.read_text().splitlines() == [
-        "daemon-reload", "enable hermes-fleet-update-tools.timer"]
+        "daemon-reload", "enable hermes-fleet-update-tools.timer", "start hermes-fleet-update-tools.timer"]
     if shutil.which("systemd-analyze"):
         command(["systemd-analyze", "verify", service, timer], env)
 
@@ -657,14 +674,10 @@ if sys.argv[1:] == ['--version']:''')
     assert status.returncode or status.stdout.strip().startswith("Z")
 
 
-def test_registry_timeout_has_60_second_cap(fleet):
+def test_registry_network_failure(fleet):
     fleet.install("codex")
-    npm = fleet.home / "tools/node-22/bin/npm"
-    executable(npm, NPM.replace("if a[0] == 'view':", "if a[0] == 'view':\n    time.sleep(60)"))
-    accelerated_timeouts(fleet)
-    assert fleet.row("codex", expected=1)["result"] == "error:timeout"
-    caps = [json.loads(line) for line in (fleet.tmp / "timeouts").read_text().splitlines()]
-    assert any("view" in args and cap == 60 for args, cap in caps)
+    fleet.cfg["registry_fail"] = ["codex"]
+    assert fleet.row("codex", expected=1)["result"] == "error:registry_failed"
     assert not fleet.installs()
 
 
@@ -704,3 +717,243 @@ os.execv('/usr/bin/python3', ['/usr/bin/python3'] + sys.argv[1:])
 ''')
     executable(fleet.bin / "node", "#!/bin/sh\nexit 91\n")
     assert fleet.row("codex")["result"] == "updated 1.0.0->2.0.0"
+
+
+def test_native_without_npm_and_deprecated_versions(fleet):
+    fleet.install('claude', 'native')
+    (fleet.bin / 'npm').unlink()
+    fleet.cfg['deprecated'] = ['2.0.0']
+    assert fleet.row()['result'] == 'current'
+    assert not fleet.installs()
+
+
+def test_other_uid_is_not_in_use(fleet):
+    fleet.install('codex')
+    fleet.cfg.update(process_uid=os.getuid() + 1, processes='claude -p hello')
+    assert fleet.row('codex')['result'].startswith('updated')
+
+
+def test_installed_off_path_is_held(fleet):
+    fleet.install('codex', flavor='.nvm/versions/node/v22.0.0')
+    (fleet.home / '.local/bin/codex').unlink()
+    assert fleet.row('codex')['result'] == 'held:not_on_path'
+    assert not fleet.installs()
+
+
+def test_unwritable_prefix_held_before_install(fleet):
+    fleet.install('codex')
+    # Root can write chmod(0555); emulate the effective access check for all UIDs.
+    with (fleet.tmp / 'patches/sitecustomize.py').open('a') as stream:
+        stream.write('''
+original_access = os.access
+def access(path, mode, *a, **kw):
+    if mode == os.W_OK and str(path).endswith('/lib/node_modules'): return False
+    return original_access(path, mode, *a, **kw)
+os.access = access
+''')
+    assert fleet.row('codex')['result'] == 'held:not_writable'
+    assert not fleet.installs()
+
+
+def test_install_failure_without_change_needs_no_rollback(fleet):
+    fleet.install('codex')
+    npm = fleet.home / 'tools/node-22/bin/npm'
+    executable(npm, NPM.replace("(prefix / 'lib/node_modules' / pkg / 'bin/version.txt').write_text(version)",
+                               'sys.exit(1)'))
+    assert fleet.row('codex')['result'] == 'rolled_back:install_failed'
+    assert len(fleet.installs()) == 1
+
+
+@pytest.mark.parametrize('method,name', [('npm', 'codex'), ('native', 'claude')])
+def test_offline_rollback_preserves_package_and_links(fleet, method, name):
+    target = fleet.install(name, method)
+    before = snapshot(fleet.home / ('tools' if method == 'npm' else '.local/share/claude'))
+    fleet.cfg['bad_versions'] = {name: ['2.0.0']}
+    # Every fallback install is offline. Native updater also prunes the old file.
+    fleet.cfg['rollback_fail'] = [name]
+    if method == 'native':
+        executable(target, CLI.replace("link.symlink_to(new)",
+                                        "link.symlink_to(new)\nif v != '1.0.0': me.unlink()"))
+        before = snapshot(fleet.home / '.local/share/claude')
+    else:
+        npm = fleet.home / 'tools/node-22/bin/npm'
+        executable(npm, NPM.replace("sys.exit(1 if name in cfg.get('install_fail'",
+            "(prefix / 'bin' / name).unlink()\nsys.exit(1 if name in cfg.get('install_fail'"))
+        before = snapshot(fleet.home / 'tools')
+    row = fleet.row(name)
+    assert row['result'] == 'rolled_back:health_check_failed'
+    assert row['from'] == row['to'] == '1.0.0'
+    assert len(fleet.installs()) == 1
+    after = snapshot(fleet.home / ('tools' if method == 'npm' else '.local/share/claude'))
+    assert all(after[p] == content for p, content in before.items())
+    assert (fleet.state / 'backup' / name / 'version').read_text() == '1.0.0\n'
+
+
+@pytest.mark.parametrize('sig', [signal.SIGTERM, signal.SIGHUP, signal.SIGINT])
+def test_signal_mid_install_finishes_offline_rollback_and_status(fleet, sig):
+    fleet.install('codex')
+    npm = fleet.home / 'tools/node-22/bin/npm'
+    executable(npm, NPM.replace("sys.exit(1 if name in cfg.get('install_fail'", '''
+if version == '2.0.0':
+    pathlib.Path(os.environ['TEST_READY']).write_text(str(os.getppid()))
+    while not pathlib.Path(os.environ['TEST_RELEASE']).exists(): time.sleep(.02)
+sys.exit(1 if name in cfg.get('install_fail' '''))
+    ready, release = fleet.tmp / 'ready', fleet.tmp / 'release'
+    fleet.env.update(TEST_READY=str(ready), TEST_RELEASE=str(release))
+    fleet.cfg['rollback_fail'] = ['codex']
+    fleet.config.write_text(json.dumps(fleet.cfg))
+    with subprocess.Popen(['bash', str(fleet.script)], env=fleet.env,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+        try:
+            deadline = time.monotonic() + 10
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(.02)
+            assert ready.exists()
+            # bash execs Python, so scheduler signals reach the transaction owner.
+            assert int(ready.read_text()) == process.pid
+            process.send_signal(sig)
+            time.sleep(.1)
+            assert process.poll() is None
+            release.touch()
+            out, err = process.communicate(timeout=10)
+            assert process.returncode == 128 + sig, out + err
+        finally:
+            release.touch()
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=10)
+    report = json.loads((fleet.state / 'status.json').read_text())
+    row = next(r for r in report['tools'] if r['name'] == 'codex')
+    assert row['result'] == 'rolled_back:interrupted'
+    assert row['to'] == '1.0.0'
+    assert json.loads((fleet.state / 'log').read_text()) == report
+    assert len(fleet.installs()) == 1
+
+
+@pytest.mark.parametrize('argv,detached', [(['claude', '-p', 'hello'], False),
+    (['node', '--max-old-space-size', '4096', '/tmp/lib/node_modules/@openai/codex/bin/codex.js'], False),
+    (['claude', '-p', 'headless'], True)])
+def test_real_ps_detects_agents(fleet, argv, detached):
+    # This is the platform's actual ps, with no mock output or process filter.
+    (fleet.bin / 'ps').unlink()
+    fleet.install('claude', 'native')
+    fleet.install('codex')
+    source = fleet.tmp / 'sleeper.c'
+    source.write_text('#include <unistd.h>\nint main(void) { for (;;) pause(); }\n')
+    binary = fleet.tmp / 'sleeper'
+    command(['cc', source, '-o', binary], fleet.env)
+    with subprocess.Popen(argv, executable=str(binary), start_new_session=detached,
+                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL) as process:
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                listing = subprocess.check_output(['ps', '-axwwo', 'uid=,args='], text=True)
+                if ' '.join(argv) in listing:
+                    break
+                time.sleep(.02)
+            assert ' '.join(argv) in listing
+            if detached:
+                tty = subprocess.check_output(['ps', '-p', str(process.pid), '-o', 'tty='], text=True).strip()
+                assert tty in ('?', '??', '-')
+            assert all(row['result'] == 'deferred:in_use' for row in fleet.run()['tools'])
+            assert not fleet.installs()
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+
+
+def test_install_stderr_redacts_sensitive_lines(fleet):
+    fleet.install('codex')
+    npm = fleet.home / 'tools/node-22/bin/npm'
+    executable(npm, NPM.replace("pkg, version =", "print('network unavailable\\nAUTH secret\\nTOKEN secret\\nkey secret\\npassword secret', file=sys.stderr)\npkg, version ="))
+    row = fleet.row('codex')
+    assert row['install_stderr'] == ['network unavailable']
+    assert 'secret' not in (fleet.state / 'log').read_text()
+
+
+def test_brew_timeout_holds(fleet):
+    fleet.install('codex')
+    executable(fleet.bin / 'brew', '#!/bin/sh\nsleep 60\n')
+    accelerated_timeouts(fleet)
+    assert fleet.row('codex')['result'] == 'held:brew_unknown'
+    caps = [json.loads(line) for line in (fleet.tmp / 'timeouts').read_text().splitlines()]
+    assert any('list' in args and cap == 60 for args, cap in caps)
+    assert not fleet.installs()
+
+
+def test_module_mac_without_gui_saves_agent(module):
+    _, home, env = module
+    env['TEST_NO_GUI'] = '1'
+    result = bootstrap(module)
+    assert 'next GUI login' in result.stdout
+    assert (home / 'Library/LaunchAgents/com.hermes.fleet-update-tools.plist').is_file()
+    assert 'bootstrap ' not in Path(env['TEST_CALLS']).read_text()
+
+
+@pytest.mark.parametrize('name,method', [('claude', 'native'), ('codex', 'npm')])
+def test_canary_isolated_real_transaction_with_forced_failure(fleet, name, method):
+    fleet.install(name, method)
+    if method == 'npm':
+        executable(fleet.home / 'tools/node-22/bin/node', '#!/bin/sh\nexit 1\n')
+    before = snapshot(fleet.home)
+    proc = fleet.run('--canary-check', name, '2.0.0')
+    assert 'Canary PASS' in proc.stdout
+    assert snapshot(fleet.home) == before
+    evidence = Path(proc.stdout.split('evidence: ', 1)[1].strip())
+    row = json.loads(evidence.read_text())['tools'][0]
+    assert row['canary_target_verified'] and row['result'] == 'rolled_back:canary_forced_failure'
+    assert row['to'] == row['from'] == '1.0.0'
+    assert len(fleet.installs()) == 1
+
+
+def test_unsupported_atomic_exchange_holds_before_install(fleet):
+    fleet.install('codex')
+    with (fleet.tmp / 'patches/sitecustomize.py').open('a') as stream:
+        stream.write('''
+import ctypes
+def no_exchange(*args, **kwargs):
+    raise OSError('filesystem cannot exchange directories')
+ctypes.CDLL = no_exchange
+''')
+    assert fleet.row('codex')['result'] == 'held:atomic_restore_unavailable'
+    assert not fleet.installs()
+
+
+def test_local_restore_failure_uses_prefer_offline_fallback(fleet):
+    fleet.install('codex')
+    fleet.cfg['bad_versions'] = {'codex': ['2.0.0']}
+    with (fleet.tmp / 'patches/sitecustomize.py').open('a') as stream:
+        stream.write('''
+original_copytree = shutil.copytree
+def copytree(src, dst, *args, **kwargs):
+    if '/backup/codex/package' in str(src): raise OSError('simulate local restore failure')
+    return original_copytree(src, dst, *args, **kwargs)
+shutil.copytree = copytree
+''')
+    row = fleet.row('codex')
+    assert row['result'] == 'rolled_back:health_check_failed'
+    assert row['to'] == '1.0.0'
+    assert len(fleet.installs()) == 2
+    assert fleet.installs()[-1][-1] == '--prefer-offline'
+
+
+@pytest.mark.parametrize('failure', ['install', 'health', 'same_version'])
+def test_canary_cannot_pass_without_real_target_verification(fleet, failure):
+    fleet.install('claude', 'native')
+    if failure == 'install': fleet.cfg['install_fail'] = ['claude']
+    if failure == 'health': fleet.cfg['bad_versions'] = {'claude': ['2.0.0']}
+    version = '1.0.0' if failure == 'same_version' else '2.0.0'
+    before = snapshot(fleet.home)
+    proc = fleet.run('--canary-check', 'claude', version, expected=1)
+    assert 'Canary FAIL' in proc.stdout
+    assert 'Canary PASS' not in proc.stdout
+    assert snapshot(fleet.home) == before
+
+
+def test_native_remains_updatable_after_offline_rollback(fleet):
+    fleet.install('claude', 'native')
+    fleet.cfg['bad_versions'] = {'claude': ['2.0.0']}
+    assert fleet.row()['result'] == 'rolled_back:health_check_failed'
+    fleet.cfg['bad_versions'] = {}
+    assert fleet.row()['result'] == 'updated 1.0.0->2.0.0'
