@@ -970,7 +970,7 @@ def test_module_linux_installs_for_another_user(module, tmp_path, case):
     # Record every runuser call, then run the command (tests cannot switch users).
     executable(bins / "runuser", '#!/bin/sh\nprintf "runuser %s\\n" "$*" >> "$TEST_CALLS"\nshift 3\nexec "$@"\n')
     executable(bins / "systemctl", '#!/bin/sh\nprintf "%s\\n" "$*" >> "$TEST_CALLS"\n'
-               'if [ "$1" = is-active ]; then [ -n "$TEST_ACTIVE" ]; exit $?; fi\n')
+               'if [ "$1" = show ]; then [ -n "$TEST_ACTIVE" ] && echo activating || echo inactive; fi\n')
     env.update(TEST_OS="Linux", FLEET_TOOLS_USER="clihost")
     if case == "running":
         env["TEST_ACTIVE"] = "1"

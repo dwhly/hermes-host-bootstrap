@@ -174,7 +174,8 @@ UNIT
   if [[ "$changed" == 1 ]]; then
     if [[ "$tools_user" != "$(id -un)" ]]; then
       # Never open a path in another user's home as root; the unit's own state says whether a run is live.
-      if $SUDO systemctl is-active --quiet "$unit.service"; then
+      state="$($SUDO systemctl show -p ActiveState --value "$unit.service" 2>/dev/null || true)"
+      if [[ "$state" =~ ^(active|activating|deactivating|reloading)$ ]]; then
         warn "$unit is running; skipping reload"
         exit 0
       fi
