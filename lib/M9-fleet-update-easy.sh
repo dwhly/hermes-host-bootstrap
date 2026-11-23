@@ -74,6 +74,7 @@ PY
   # Hold the same open-file-description lock as the updater throughout reload.
   # An unchanged, loaded agent needs no reload and must not wait on a busy run.
   if ! cmp -s "$tmp/agent.plist" "$plist" || ! launchctl print "$domain/$label" >/dev/null 2>&1; then
+    mkdir -p "$HOME/.local/state/fleet-update-easy"
     exec 8>>"$HOME/.local/state/fleet-update-easy/lock"
     if ! perl -MFcntl=:flock -e 'open(my $f, ">>&=", 8) or exit 2; $SIG{ALRM} = sub { exit 1 }; alarm 300; flock($f, LOCK_EX) or exit 2; alarm 0;'; then
       warn "$label updater lock unavailable after waiting up to 300 s; skipping reload"
@@ -94,6 +95,8 @@ PY
     fi
     install -m 0644 "$tmp/agent.plist" "$plist"
   fi
+  # Release the updater lock before (re)loading, so the RunAtLoad run is not "busy" and no child inherits fd 8.
+  exec 8>&-
   if ! launchctl print "$domain/$label" >/dev/null 2>&1; then
     launchctl enable "$domain/$label"
     launchctl bootstrap "$domain" "$plist"
