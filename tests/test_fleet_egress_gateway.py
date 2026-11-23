@@ -176,6 +176,42 @@ class Tunnel(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(got), 1500)
 
 
+class SlowReader(unittest.IsolatedAsyncioTestCase):
+    async def test_all_bytes_delivered_after_upstream_eof(self):
+        """Upstream sends 256 KiB then EOFs; a slow, small-buffer client must still get every byte."""
+        import socket
+        payload = bytes(range(256)) * 1024
+
+        async def burst(_r, w):
+            w.write(payload); await w.drain(); w.close()
+        up = await asyncio.start_server(burst, "127.0.0.1", 0)
+
+        async def handler(cr, cw):
+            # Make the gateway hold queued bytes at EOF time (small kernel buffer, high asyncio watermark),
+            # which is exactly when an abort() would truncate the response.
+            cw.transport.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            cw.transport.set_write_buffer_limits(high=1 << 20)
+            ur, uw = await asyncio.open_connection("127.0.0.1", up.sockets[0].getsockname()[1])
+            await gw._tunnel(cr, cw, ur, uw, idle=3, tick=0.1)
+        front = await asyncio.start_server(handler, "127.0.0.1", 0)
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        s.connect(front.sockets[0].getsockname())
+        s.setblocking(False)
+        got = bytearray()
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                await asyncio.sleep(0.002)          # slow reader
+                chunk = await asyncio.wait_for(loop.sock_recv(s, 2048), 5)
+                if not chunk:
+                    break
+                got += chunk
+        finally:
+            s.close(); front.close(); up.close()
+        self.assertEqual(bytes(got), payload)
+
+
 class Accounting(unittest.IsolatedAsyncioTestCase):
     async def test_uncapped_usage_is_pruned_on_the_request_path(self):
         import time as _t

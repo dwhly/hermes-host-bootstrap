@@ -256,10 +256,12 @@ async def _tunnel(cr, cw, ur, uw, idle=None, tick=None):
             act[0] = time.monotonic()
 
     tasks = [asyncio.ensure_future(pump(cr, uw)), asyncio.ensure_future(pump(ur, cw))]
+    graceful = False
     try:
         while True:
             done, _ = await asyncio.wait(tasks, timeout=tick, return_when=asyncio.FIRST_COMPLETED)
-            if done:          # one side finished (EOF/error): half-close is not needed for CONNECT use
+            if done:  # one side reached EOF (graceful) or errored (abort)
+                graceful = all(not t.cancelled() and t.exception() is None for t in done)
                 break
             if time.monotonic() - act[0] > idle:
                 log.debug("tunnel idle > %ss, closing", idle)
@@ -268,12 +270,27 @@ async def _tunnel(cr, cw, ur, uw, idle=None, tick=None):
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        for w in (uw, cw):
+        await asyncio.gather(*(_close(w, graceful, idle) for w in (uw, cw)), return_exceptions=True)
+
+
+async def _close(w, graceful: bool, flush_deadline: float) -> None:
+    """Graceful EOF: close() so already-queued bytes are flushed, bounded by a deadline (a peer that
+    stops reading can't hold us). Idle expiry / errors: abort() immediately."""
+    tr = getattr(w, "transport", None)
+    try:
+        if graceful:
+            w.close()
             try:
-                tr = getattr(w, "transport", None)
-                (tr.abort() if tr is not None else w.close())
+                await asyncio.wait_for(w.wait_closed(), flush_deadline)
+                return
             except Exception:
                 pass
+        if tr is not None:
+            tr.abort()
+        else:
+            w.close()
+    except Exception:
+        pass
 
 
 def _expand_env(obj):
