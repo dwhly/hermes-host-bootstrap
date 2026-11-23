@@ -120,7 +120,7 @@ if have op && [[ -f "$ENV_TEMPLATE" ]] && ! is_skipped op-resolve; then
       if [[ -f "$ENV_TEMPLATE_HOST" ]]; then
         info "applying per-host overlay: $ENV_TEMPLATE_HOST"
         if op inject --force -i "$ENV_TEMPLATE_HOST" -o "$ENV_RESOLVED.host.tmp" 2>/dev/null; then
-          overlay_keys=$(grep -E '^[A-Z_][A-Z0-9_]*=' "$ENV_RESOLVED.host.tmp" | cut -d= -f1 | sort -u)
+          overlay_keys=$( { grep -E '^[A-Z_][A-Z0-9_]*=' "$ENV_RESOLVED.host.tmp" || true; } | cut -d= -f1 | sort -u)
           if [[ -n "$overlay_keys" ]]; then
             grep -vE "^($(echo "$overlay_keys" | paste -sd'|' -))=" "$ENV_RESOLVED.tmp" > "$ENV_RESOLVED.base.tmp" || true
             mv -f "$ENV_RESOLVED.base.tmp" "$ENV_RESOLVED.tmp"
@@ -128,7 +128,7 @@ if have op && [[ -f "$ENV_TEMPLATE" ]] && ! is_skipped op-resolve; then
           {
             echo ""
             echo "# ── per-host overlay ($(basename "$ENV_TEMPLATE_HOST")) ──"
-            grep -E '^[A-Z_][A-Z0-9_]*=' "$ENV_RESOLVED.host.tmp"
+            grep -E '^[A-Z_][A-Z0-9_]*=' "$ENV_RESOLVED.host.tmp" || true
           } >> "$ENV_RESOLVED.tmp"
           rm -f "$ENV_RESOLVED.host.tmp"
         else
