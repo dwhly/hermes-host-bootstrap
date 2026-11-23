@@ -48,11 +48,30 @@ fi
 
 script="$REPO_ROOT/scripts/fleet-update-tools"
 bash -n "$script"
-mkdir -p "$HOME/.local/bin" "$HOME/.local/state/fleet-update-tools"
-target="$HOME/.local/bin/fleet-update-tools"
+# Linux: root may install the job for the user who owns the CLIs (h-btp: hermes, which has no sudo).
+tools_user="$(id -un)"
+tools_home="$HOME"
+if [[ "$OS" != macos && -n "${FLEET_TOOLS_USER:-}" && "$FLEET_TOOLS_USER" != "$tools_user" ]]; then
+  if [[ "$(id -u)" != 0 ]]; then
+    warn "fleet-update-tools: FLEET_TOOLS_USER requires root; skipping"
+    exit 0
+  fi
+  tools_home="$(getent passwd "$FLEET_TOOLS_USER" | cut -d: -f6)"
+  if [[ -z "$tools_home" || ! -d "$tools_home" ]]; then
+    warn "fleet-update-tools: user $FLEET_TOOLS_USER has no home; skipping"
+    exit 0
+  fi
+  tools_user="$FLEET_TOOLS_USER"
+fi
+for dir in "$tools_home/.local" "$tools_home/.local/bin" "$tools_home/.local/state" "$tools_home/.local/state/fleet-update-tools"; do
+  [[ -d "$dir" ]] || install -d -m 0755 "$dir"
+  [[ "$tools_user" == "$(id -un)" ]] || chown "$tools_user:" "$dir"
+done
+target="$tools_home/.local/bin/fleet-update-tools"
 if [[ ! -L "$target" || "$(readlink "$target")" != "$script" ]]; then
   rm -f "$target"
   ln -s "$script" "$target"
+  [[ "$tools_user" == "$(id -un)" ]] || chown -h "$tools_user:" "$target"
 fi
 
 tmp="$(mktemp -d)"
@@ -118,7 +137,7 @@ else
   systemd_dir="${HERMES_SYSTEMD_DIR:-/etc/systemd/system}"
   unit=hermes-fleet-update-tools
   # Escape systemd specifiers and quoted ExecStart paths.
-  "$python" - "$tmp/$unit.service" "$script" "$HOME" "$(id -un)" <<'PY'
+  "$python" - "$tmp/$unit.service" "$script" "$tools_home" "$tools_user" <<'PY'
 import sys
 
 def quote(value):
@@ -150,7 +169,7 @@ UNIT
     fi
   done
   if [[ "$changed" == 1 ]]; then
-    exec 8>>"$HOME/.local/state/fleet-update-tools/lock"
+    exec 8>>"$tools_home/.local/state/fleet-update-tools/lock"
     if ! perl -MFcntl=:flock -e 'open(my $f, ">>&=", 8) or exit 2; $SIG{ALRM} = sub { exit 1 }; alarm 300; flock($f, LOCK_EX) or exit 2; alarm 0;'; then
       warn "$unit updater lock unavailable after waiting up to 300 s; skipping reload"
       exit 0

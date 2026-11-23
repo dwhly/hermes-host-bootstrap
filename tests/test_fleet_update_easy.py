@@ -680,3 +680,17 @@ def test_module_linux_units_idempotent(module):
         "restart hermes-fleet-update-easy.timer"]
     if shutil.which("systemd-analyze"):
         command(["systemd-analyze", "verify", service, timer], env)
+
+
+@pytest.mark.parametrize("host", ["h-btp", "h-af"])
+@pytest.mark.parametrize("marked", [False, True])
+def test_module_preserved_hosts_need_marker(module, host, marked):
+    _, home, env = module
+    env.update(TEST_OS="Linux", HERMES_HOSTNAME=host)
+    if marked:
+        marker = home / ".config/fleet-update/preserve-hermes-config"
+        marker.parent.mkdir(parents=True)
+        marker.touch()
+    bootstrap(module, "--role=server")
+    installed = (Path(env["HERMES_SYSTEMD_DIR"]) / "hermes-fleet-update-easy.timer").exists()
+    assert installed == marked

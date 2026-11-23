@@ -957,3 +957,30 @@ def test_native_remains_updatable_after_offline_rollback(fleet):
     assert fleet.row()['result'] == 'rolled_back:health_check_failed'
     fleet.cfg['bad_versions'] = {}
     assert fleet.row()['result'] == 'updated 1.0.0->2.0.0'
+
+
+@pytest.mark.parametrize("has_home", [True, False])
+def test_module_linux_installs_for_another_user(module, tmp_path, has_home):
+    _, home, env = module
+    other = tmp_path / "other-home"
+    if has_home:
+        other.mkdir()
+    bins = Path(env["PATH"].split(":")[0])
+    executable(bins / "getent", '#!/bin/sh\n[ "$2" = clihost ] && echo "clihost:x:4242:4242::' + str(other) + ':/bin/sh"\n')
+    executable(bins / "chown", '#!/bin/sh\nprintf "chown %s\\n" "$*" >> "$TEST_CALLS"\n')
+    env.update(TEST_OS="Linux", FLEET_TOOLS_USER="clihost")
+    result = bootstrap(module, "--role=server")
+    service = Path(env["HERMES_SYSTEMD_DIR"]) / "hermes-fleet-update-tools.service"
+    if os.getuid() != 0:
+        assert not service.exists() and "requires root" in result.stdout + result.stderr
+        return
+    if not has_home:
+        assert not service.exists() and "has no home" in result.stdout + result.stderr
+        return
+    text = service.read_text()
+    assert "User=clihost\n" in text and 'Environment="HOME=' + str(other) + '"' in text
+    assert (other / ".local/bin/fleet-update-tools").is_symlink()
+    assert not (home / ".local/bin/fleet-update-tools").exists()
+    calls = Path(env["TEST_CALLS"]).read_text()
+    assert "chown clihost: " + str(other / ".local/state/fleet-update-tools") in calls
+    assert "chown -h clihost: " + str(other / ".local/bin/fleet-update-tools") in calls

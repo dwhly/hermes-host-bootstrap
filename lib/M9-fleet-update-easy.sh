@@ -35,10 +35,18 @@ else
     exit 0
   fi
   host_short="${HERMES_HOSTNAME:-$(hostname -s)}"
-  if [[ "${host_short%.local}" != h-do1 ]]; then
-    skip "fleet-update-easy: Linux schedule is scoped to h-do1"
-    exit 0
-  fi
+  case "${host_short%.local}" in
+    h-do1) ;;
+    h-af|h-btp)
+      # Preserved hosts: fail closed unless their own ~/.hermes is marked protected.
+      if [[ ! -f "$HOME/.config/fleet-update/preserve-hermes-config" ]]; then
+        skip "fleet-update-easy: preserved host without ~/.config/fleet-update/preserve-hermes-config"
+        exit 0
+      fi ;;
+    *)
+      skip "fleet-update-easy: Linux schedule is scoped to h-do1, h-af and h-btp"
+      exit 0 ;;
+  esac
 fi
 
 script="$REPO_ROOT/scripts/fleet-update-easy"
