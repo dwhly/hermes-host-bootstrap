@@ -551,6 +551,24 @@ def test_draft_create_and_trash_guard(env, monkeypatch):
 # ---------------- no send path (structural) ----------------
 ALLOWED_SEND_NAMES = {"calendar_send_invites", "send_updates", "updates"}
 SEND_URL = re.compile(r"/send\b|:send\b|\bdrafts\.send\b|\bmessages\.send\b|gmail\.send|sendAs|/send-?as", re.I)
+SEND_PIECE = re.compile(r"(^|/)send($|[/?:])", re.I)
+
+
+def _flat_strings(n) -> str:
+    """Constant text of a string-building expression (a + b, f-strings, '...'.join([...])), joined."""
+    if isinstance(n, ast.Constant) and isinstance(n.value, str):
+        return n.value
+    if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Add, ast.Mod)):
+        return _flat_strings(n.left) + _flat_strings(n.right)
+    if isinstance(n, ast.JoinedStr):
+        return "".join(_flat_strings(v) if isinstance(v, ast.Constant) else "{}" for v in n.values)
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in ("join", "format"):
+        parts = [_flat_strings(a) for a in n.args]
+        for a in n.args:
+            if isinstance(a, (ast.List, ast.Tuple)):
+                parts += [_flat_strings(e) for e in a.elts]
+        return _flat_strings(n.func.value) + "/".join(parts)
+    return ""
 
 
 def send_findings(src: str) -> list[str]:
@@ -570,8 +588,13 @@ def send_findings(src: str) -> list[str]:
             names.append(n.arg)
         elif isinstance(n, ast.alias):
             names.append(n.asname or n.name)
-        elif isinstance(n, ast.Constant) and isinstance(n.value, str) and SEND_URL.search(n.value):
+        if isinstance(n, ast.Constant) and isinstance(n.value, str) and (SEND_URL.search(n.value)
+                                                                          or SEND_PIECE.search(n.value)):
             bad.append(f"string: {n.value[:60]!r}")
+        if isinstance(n, (ast.BinOp, ast.JoinedStr, ast.Call)):
+            flat = _flat_strings(n)
+            if flat and SEND_URL.search(flat.replace("//", "/")):
+                bad.append(f"composed: {flat[:60]!r}")
         for nm in names:
             if "send" in nm.lower() and nm not in ALLOWED_SEND_NAMES:
                 bad.append(f"name: {nm}")
@@ -592,6 +615,11 @@ def test_no_send_path(f):
     "x = obj.send(1)\n",
     "def f(sendit=1):\n    pass\n",
     "S = 'https://www.googleapis.com/auth/gmail.send'\n",
+    # r1 #9: composed endpoints
+    "def deliver(subject, raw):\n    u = G + '/messages/' + 'send'\n    return u\n",
+    "def deliver(subject, raw):\n    return '/'.join([G, 'drafts', 'send'])\n",
+    "def deliver(mid):\n    return f'{G}/messages/{mid}' + '/se' + 'nd'\n",
+    "VERB = 'send'\n",
 ])
 def test_no_send_checker_bites(mutant):
     src = (PKG / "fleet_google_dwd.py").read_text() + "\n" + mutant
@@ -686,6 +714,127 @@ def test_check_other_failures(env, capsys):
 def test_check_config_error(env, capsys):
     rc = _check_tool(env).main(["--company", "btp"])     # no config written
     assert rc == 2 and "config: FAILED" in capsys.readouterr().out
+
+
+# ---------------- r1 regression tests ----------------
+def test_r1_1_op_stderr_never_shown(env, capsys):
+    env.write_cfg("btp")
+    (env.fop / "fail").write_text(f"[ERROR] token {OP_TOKEN} -----BEGIN PRIVATE KEY----- isn't an item\n")
+    m = env.mod
+    m.configure("btp")
+    with pytest.raises(RuntimeError) as ei:
+        m.access_token("dwhaley@btpautomation.com", [GMAIL])
+    assert OP_TOKEN not in str(ei.value) and "PRIVATE" not in str(ei.value)
+    assert "item or vault not found" in str(ei.value)
+    rc = _check_tool(env).main(["--company", "btp"])
+    out = capsys.readouterr()
+    assert rc == 1 and OP_TOKEN not in out.out + out.err and "PRIVATE" not in out.out + out.err
+
+
+def test_r1_3_parent_symlink_refused(env):
+    c = env.write_cfg("btp")
+    m = env.mod
+    m.configure("btp")
+    led = Path(c["draft_ledger"])
+    led.parent.parent.mkdir(parents=True)
+    elsewhere = env.tmp / "elsewhere"
+    elsewhere.mkdir()
+    led.parent.symlink_to(elsewhere)                 # .../state -> elsewhere
+    with pytest.raises(OSError):
+        m._ledger_add("dwhaley@btpautomation.com", "r1", "m1", ["a@b.com"], "s")
+    assert list(elsewhere.iterdir()) == []
+    led.parent.unlink()
+    led.parent.mkdir()
+    os.chmod(led.parent, 0o777)                      # group/other-writable parent
+    with pytest.raises(RuntimeError, match="not group/other-writable"):
+        m._ledger_add("dwhaley@btpautomation.com", "r1", "m1", ["a@b.com"], "s")
+    os.chmod(led.parent, 0o700)
+    m._ledger_add("dwhaley@btpautomation.com", "r1", "m1", ["a@b.com"], "s")   # control
+    assert led.exists()
+
+
+def test_r1_3_op_token_parent_symlink_refused(env):
+    c = env.write_cfg("btp")
+    tf = Path(c["op_token_file"])
+    real = env.tmp / "realsecret"
+    shutil.move(tf.parent, real)
+    tf.parent.symlink_to(real)
+    env.mod.configure("btp")
+    with pytest.raises(RuntimeError, match="1Password token file"):
+        env.mod.access_token("dwhaley@btpautomation.com", [GMAIL])
+    assert env.op_calls() == []
+
+
+def test_r1_4_rotated_item_clears_key(env):
+    env.write_cfg("btp")
+    m = env.mod
+    m.configure("btp")
+    m.access_token("dwhaley@btpautomation.com", [GMAIL])
+    env.write_cfg("btp", op_item="Rotated Google Service Account BTP")
+    m.configure("btp")
+    assert m._key_cache is None and m._tok_cache == {}
+    m.access_token("dwhaley@btpautomation.com", [GMAIL])
+    assert env.op_calls()[-1].split()[2:4] == ["Rotated", "Google"]
+    assert len(env.op_calls()) == 2
+    m.configure("btp")                                 # same identity: caches kept
+    assert m._key_cache is not None and m._tok_cache
+
+
+def test_r1_5_drive_roles_as_original(env):
+    env.write_cfg("amforge")
+    m = env.mod
+    m.configure("amforge")
+    for role in ("organizer", "fileOrganizer", "writer"):
+        m.drive_share("dwhaley@amforge.com", "drive1", ["amendez@amforge.com"], role=role)
+    assert sum(1 for meth, u, _ in env.fake.requests if meth == "POST" and "/permissions" in u) == 3
+
+
+def test_r1_6_legacy_mixed_case_ledger(env, monkeypatch):
+    c = env.write_cfg("amforge")
+    m = env.mod
+    m.configure("amforge")
+    led = Path(c["draft_ledger"])
+    led.parent.mkdir(parents=True)
+    led.write_text(json.dumps({"subject": "DWHALEY@amforge.com", "draft_id": "r123", "session": "sess-1"}) + "\n")
+    os.chmod(led, 0o600)
+    monkeypatch.setenv("HERMES_SESSION_ID", "sess-1")
+    m.gmail_trash_draft("DWHALEY@amforge.com", "r123")
+    assert env.fake.requests[-1][:2] == ("POST", f"{m.G}/messages/m123/trash")
+    with pytest.raises(m.Refused):
+        m.gmail_trash_draft("becki@amforge.com", "r123")          # subject still must match
+
+
+def test_r1_7_audit_0700_repaired(env):
+    c = env.write_cfg("btp")
+    m = env.mod
+    m.configure("btp")
+    p = Path(c["audit_log"])
+    p.parent.mkdir(parents=True)
+    p.write_text("")
+    os.chmod(p, 0o700)
+    m._audit("x")
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600
+
+
+def test_r1_8_long_unauthorized_body(env, capsys):
+    env.write_cfg("btp")
+    env.fake.token_error = (400, {"error": "unauthorized_client", "error_description": "x" * 300})
+    rc = _check_tool(env).main(["--company", "btp"])
+    assert rc == 3 and capsys.readouterr().out.count("NOT AUTHORISED YET") == 3
+
+
+@pytest.mark.parametrize("run_as,msg", [("root", "does not match run_as.user"),
+                                        ("hermes-nonexistent-x", "does not match run_as.user")])
+def test_r1_2_installer_run_as_must_match(tmp_path, run_as, msg):
+    cfg = tmp_path / "cfg"
+    shutil.copytree(CFG_SRC, cfg)
+    (cfg / "hosts" / "h-test.env").write_text(f"ROLLOUT=go\nCOMPANY=btp\nRUN_AS={run_as}\nPYTHON=/usr/bin/python3\n")
+    before = Path("/usr/local/lib/fleet-google-dwd").exists(), Path("/etc/fleet-google-dwd").exists()
+    r = subprocess.run(["bash", str(REPO / "lib" / "63-fleet-google-dwd.sh")], cwd=REPO,
+                       env={**os.environ, "FLEET_HOST_ID": "h-test", "REPO_ROOT": str(REPO), "FGD_CONFIG_DIR": str(cfg)},
+                       capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    assert r.returncode != 0 and msg in r.stdout + r.stderr
+    assert (Path("/usr/local/lib/fleet-google-dwd").exists(), Path("/etc/fleet-google-dwd").exists()) == before
 
 
 # ---------------- installer module ----------------

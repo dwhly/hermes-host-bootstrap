@@ -47,19 +47,25 @@ fgd_key() {
 }
 COMPANY="$(fgd_key COMPANY)"
 PY="$(fgd_key PYTHON)"
+RUN_AS="$(fgd_key RUN_AS)"
 [[ "$COMPANY" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || { err "COMPANY '$COMPANY' is not a valid name"; exit 1; }
 [[ "$PY" =~ ^/[A-Za-z0-9._/-]+$ && "$PY" != *..* ]] || { err "PYTHON must be an absolute path"; exit 1; }
+[[ "$RUN_AS" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { err "RUN_AS '$RUN_AS' is not a valid user name"; exit 1; }
 CFG="$FGD_CONFIG_DIR/companies/$COMPANY.yaml"
 [[ -f "$CFG" ]] || { err "no company config $CFG"; exit 1; }
+# The host file's RUN_AS must be the company yaml's run_as.user (the module enforces the same at runtime).
+[[ "$(grep -A2 -x 'run_as:' "$CFG" | grep -cx "  user: $RUN_AS")" == 1 ]] \
+  || { err "RUN_AS=$RUN_AS does not match run_as.user in $CFG"; exit 1; }
+id -u "$RUN_AS" >/dev/null 2>&1 || { err "user $RUN_AS does not exist on $FGD_HOST"; exit 1; }
 [[ -x "$PY" ]] || { err "PYTHON $PY is not executable on $FGD_HOST"; exit 1; }
 require_sudo
 
-# Dependency check runs as the interpreter's owner (never root running a user-owned venv).
-PY_OWNER="$(stat -c %U "$PY")"
-if [[ "$PY_OWNER" == root ]]; then
-  "$PY" -c 'import yaml, cryptography' || { err "$PY lacks PyYAML/cryptography"; exit 1; }
+# The interpreter only ever runs as the company's run_as user: a venv that user can write (site-packages, .pth)
+# must never execute as root just because the python binary itself is root-owned.
+if [[ "$RUN_AS" == root ]]; then
+  sudo "$PY" -c 'import yaml, cryptography' </dev/null || { err "$PY lacks PyYAML/cryptography"; exit 1; }
 else
-  sudo runuser -u "$PY_OWNER" -- "$PY" -c 'import yaml, cryptography' </dev/null \
+  sudo runuser -u "$RUN_AS" -- "$PY" -c 'import yaml, cryptography' </dev/null \
     || { err "$PY lacks PyYAML/cryptography"; exit 1; }
 fi
 
@@ -88,9 +94,9 @@ sudo mv -T /etc/fleet-google-dwd/host-company.new /etc/fleet-google-dwd/host-com
 WRAP="$(mktemp)"
 cat > "$WRAP" <<EOF
 #!/bin/sh
-# Installed by hermes-host-bootstrap lib/63-fleet-google-dwd.sh. Run as the company's run_as user.
-if [ "\$(id -u)" = 0 ] && [ "\$(stat -c %u '$PY')" != 0 ]; then
-  echo "fleet-google-dwd-check: run it as $PY_OWNER (runuser -u $PY_OWNER -- fleet-google-dwd-check)" >&2; exit 2
+# Installed by hermes-host-bootstrap lib/63-fleet-google-dwd.sh. Runs ONLY as $RUN_AS (never root-runs a user venv).
+if [ "\$(id -un)" != '$RUN_AS' ]; then
+  echo "fleet-google-dwd-check: run it as $RUN_AS (e.g. runuser -u $RUN_AS -- fleet-google-dwd-check)" >&2; exit 2
 fi
 exec '$PY' /usr/local/lib/fleet-google-dwd/current/bin/fleet-google-dwd-check "\$@"
 EOF

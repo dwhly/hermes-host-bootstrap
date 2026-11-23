@@ -246,8 +246,9 @@ def configure(company: str | None = None) -> str:
             if not n:
                 raise ConfigError(f"policy SYSTEM_READ_SUBJECTS has a bad address {e!r}")
             sys_read.add(n)
-    if company != COMPANY:
-        _key_cache, _tok_cache = None, {}
+    ident = (company, c["op_vault"], c["op_item"], str(c["op_token_file"]))
+    if ident != (COMPANY, OP_VAULT, OP_ITEM_ID, str(OP_TOKEN_FILE) if OP_TOKEN_FILE else None):
+        _key_cache, _tok_cache = None, {}      # a different company or credential: nothing carries over
     COMPANY, CONFIG_PATH = company, CONFIG_DIR / f"{company}.yaml"
     OP_TOKEN_FILE, OP_VAULT, OP_ITEM_ID = c["op_token_file"], c["op_vault"], c["op_item"]
     AUDIT_LOG, DRAFT_LEDGER = c["audit_log"], c["draft_ledger"]
@@ -263,15 +264,58 @@ def _ensure():
         configure()
 
 
-# ---------------- private files (audit log, ledger) ----------------
-def _open_private(path: Path, flags: int) -> int:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+# ---------------- private files (audit log, ledger, op token) ----------------
+def _check_dir(fd: int, where: str):
+    st = os.fstat(fd)
+    sticky_root = st.st_uid == 0 and st.st_mode & stat.S_ISVTX
+    if st.st_uid not in (0, os.geteuid()) or (st.st_mode & 0o022 and not sticky_root):
+        raise RuntimeError(f"{where}: every directory on the path must be owned by root or the running user "
+                           "and not group/other-writable")
+
+
+def _open_dir(d: Path, create: bool) -> int:
+    """An fd for directory `d`, walked from / one component at a time without following any symlink; each
+    directory is checked (owner root or euid, not g/o-writable unless a root-owned sticky dir). Missing
+    components are created 0700 when `create`."""
+    if not d.is_absolute():
+        raise RuntimeError(f"{d} is not absolute")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open("/", flags)
+    try:
+        _check_dir(fd, "/")
+        cur = Path("/")
+        for name in d.parts[1:]:
+            cur = cur / name
+            try:
+                nfd = os.open(name, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(name, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                nfd = os.open(name, flags, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+            _check_dir(fd, str(cur))
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _open_private(path: Path, flags: int, create_dirs: bool = True) -> int:
+    dfd = _open_dir(path.parent, create_dirs)
+    try:
+        fd = os.open(path.name, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+    finally:
+        os.close(dfd)
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
         os.close(fd)
         raise RuntimeError(f"{path} must be a regular file owned by the running user")
-    if st.st_mode & 0o077:
+    if stat.S_IMODE(st.st_mode) != 0o600:
         os.fchmod(fd, 0o600)
     return fd
 
@@ -310,9 +354,15 @@ def subject_allowed(subject: str) -> bool:
 # ---------------- key + token ----------------
 def _read_op_token() -> str:
     try:
-        fd = os.open(OP_TOKEN_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        dfd = _open_dir(OP_TOKEN_FILE.parent, create=False)
+        try:
+            fd = os.open(OP_TOKEN_FILE.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dfd)
+        finally:
+            os.close(dfd)
     except OSError as e:
         raise RuntimeError(f"1Password token file {OP_TOKEN_FILE} not readable ({e.strerror})") from None
+    except RuntimeError as e:
+        raise RuntimeError(f"1Password token file {OP_TOKEN_FILE}: {e}") from None
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
@@ -336,7 +386,14 @@ def _load_key() -> dict:
                            env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
         del tok, env
         if r.returncode != 0:
-            raise RuntimeError("1Password fetch failed: " + r.stderr.decode(errors="replace")[:200])
+            # op's stderr is never shown: it can echo arguments or token fragments. Fixed, classified text only.
+            err = r.stderr.decode(errors="replace").lower()
+            why = ("item or vault not found" if ("isn't an item" in err or "not found" in err or "no item" in err)
+                   else "service-account token rejected" if ("unauthorized" in err or "authentication" in err
+                                                              or "invalid token" in err or "401" in err)
+                   else "see `op` directly")
+            del err
+            raise RuntimeError(f"1Password fetch failed (op exit {r.returncode}: {why})")
         try:
             k = json.loads(r.stdout)
         except ValueError:
@@ -418,11 +475,13 @@ def access_token(subject: str, scopes: list[str], *, read_only: bool = False) ->
     try:
         resp = json.load(_urlopen(k["token_uri"], data, timeout=30))
     except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")[:300]
+        full = e.read(65536).decode(errors="replace")
         try:
-            err = str(json.loads(body).get("error", ""))[:60]
+            err = str(json.loads(full).get("error", ""))[:60]
         except Exception:
             err = ""
+        body = full[:300]
+        del full
         _audit("token_error", subject=subject, scopes=scopes, status=e.code, detail=body)
         raise TokenError(f"token mint failed ({e.code}): {body}", e.code, err) from None
     if not isinstance(resp, dict) or not isinstance(resp.get("access_token"), str):
@@ -545,18 +604,23 @@ def _ledger_add(subject: str, draft_id: str, message_id: str, to, subj: str):
 
 
 def _ledger_lookup(subject: str, draft_id: str) -> dict | None:
-    if not DRAFT_LEDGER.exists():
+    try:
+        fd = _open_private(DRAFT_LEDGER, os.O_RDONLY, create_dirs=False)
+    except FileNotFoundError:
         return None
-    fd = _open_private(DRAFT_LEDGER, os.O_RDONLY)
     with os.fdopen(fd, "r") as f:
         text = f.read()
+    want = normalize_subject(subject) or subject
     hit = None
     for line in text.splitlines():
         try:
             r = json.loads(line)
         except Exception:
             continue
-        if isinstance(r, dict) and r.get("draft_id") == draft_id and r.get("subject") == subject:
+        if not isinstance(r, dict) or r.get("draft_id") != draft_id:
+            continue
+        rs = r.get("subject")
+        if rs == subject or (isinstance(rs, str) and (normalize_subject(rs) or rs) == want):
             hit = r
     return hit
 
@@ -648,8 +712,6 @@ def drive_share(subject: str, file_id: str, emails: list[str], role: str = "writ
     """Share a Drive file with specific people (never 'anyone'/domain links)."""
     _ensure()
     _refuse_system_write(subject, "drive.share", drive=True)
-    if role not in ("reader", "commenter", "writer"):
-        raise Refused("role must be reader|commenter|writer")
     tok = access_token(subject, [KNOWN_SCOPES["drive"]])
     out = []
     for e in emails:
