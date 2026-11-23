@@ -1,9 +1,9 @@
 # BTP: Google Workspace via domain-wide delegation (reviewed; git-tracked; no secrets here).
 # Installed root:root 0644 as /etc/fleet-google-dwd/btp.yaml by lib/63-fleet-google-dwd.sh.
 company: btp
-op_vault: BTP Automation Agent
-op_item: Google Service Account BTP        # 1Password Document item holding the hermes-dwd SA JSON key
-op_token_file: /home/hermes/.config/btp/op_sa_token   # owner step: hermes:hermes 0600, read-only SA for that vault
+op_vault: iyktnqfzgmtz2uciqo5dmdxfwe   # vault "Agent" (shown as BTP Automation > Agent); by ID so a rename cannot break it
+op_item: vv7olza4h5wc7kemplkdu4gv7a    # Document "Google Service Account BTP" (hermes-dwd SA JSON key)
+op_token_file: /home/hermes/.config/btp/op_sa_token   # owner step: hermes:hermes 0600, a 1Password SA that can read vault Agent
 run_as:
   user: hermes
   home: /home/hermes
