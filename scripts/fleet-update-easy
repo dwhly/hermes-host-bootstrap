@@ -7,7 +7,7 @@ set -euo pipefail
 export PATH="${PATH:+$PATH:}/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 main() {
-  local dry=0 lock_rc=0 state="$HOME/.local/state/fleet-update-easy"
+  local dry=0 lock_rc=0 no_git=0 state="$HOME/.local/state/fleet-update-easy"
   case "${1:-}" in
     --dry-run) dry=1; shift ;;
     -h|--help) echo 'Usage: fleet-update-easy [--dry-run]'; return 0 ;;
@@ -25,7 +25,10 @@ main() {
       *) echo 'Cannot acquire updater lock' >&2; return 1 ;;
     esac
   fi
-  python3 - "${BASH_SOURCE[0]}" "$dry" <<'PY'
+  if [[ "$(uname -s)" == Darwin ]] && ! xcode-select -p >/dev/null 2>&1; then
+    no_git=1
+  fi
+  python3 - "${BASH_SOURCE[0]}" "$dry" "$no_git" <<'PY'
 import datetime
 import json
 import os
@@ -34,22 +37,50 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 
 root = Path(sys.argv[1]).resolve().parent.parent
 dry = sys.argv[2] == "1"
+no_git = sys.argv[3] == "1"
 home = Path.home()
 state = home / ".local/state/fleet-update-easy"
 env = dict(os.environ, LC_ALL="C", GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")
+ssh_defaults = {}
 
 
 def git(path, *args, capped=False, check=True):
     command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0",
                "-c", "maintenance.auto=false", "-c", "merge.autoStash=false",
-               "-c", "submodule.recurse=false", "-C", str(path)] + list(args)
+               "-c", "submodule.recurse=false", "-c", "core.quotePath=false",
+               "-C", str(path)]
+    if "GIT_SSH_COMMAND" not in env:
+        if path not in ssh_defaults:
+            configured = subprocess.run(command + ["config", "--get", "core.sshCommand"],
+                                        env=env, stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            ssh_defaults[path] = configured.returncode == 1
+        if ssh_defaults[path]:
+            command += ["-c", "core.sshCommand=ssh -o BatchMode=yes"]
+    command += list(args)
     if capped:
-        command = ["perl", "-e", "alarm 120; exec @ARGV", "--"] + command
-    proc = subprocess.run(command, env=env, stdin=subprocess.DEVNULL,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+            timed_out = False
+            try:
+                stdout, stderr = child.communicate(timeout=120)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                child.terminate()
+                try:
+                    stdout, stderr = child.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    stdout, stderr = child.communicate()
+            proc = subprocess.CompletedProcess(command, 124 if timed_out else child.returncode,
+                                               stdout, stderr)
+    else:
+        proc = subprocess.run(command, env=env, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if check and proc.returncode:
         raise RuntimeError(proc.stderr.decode(errors="replace").strip() or
                            "git failed: " + " ".join(args))
@@ -60,9 +91,14 @@ def value(path, *args):
     return git(path, *args).stdout.decode().strip()
 
 
-def inspect(name, path):
-    row = dict(name=name, path=str(path), result="skipped:absent",
-               **{"from": None, "to": None, "behind_after": None, "files": []})
+def inspect(row, path):
+    name = row["name"]
+    if no_git:
+        row["result"] = "skipped:no_git"
+        return row
+    if path.exists() and path.stat().st_uid != os.geteuid():
+        row["result"] = "held:not_owner"
+        return row
     # Do not accidentally operate on an enclosing checkout or a bare repository.
     if not (path / ".git").exists():
         return row
@@ -86,21 +122,25 @@ def inspect(name, path):
         fetch = None
     else:
         fetch = git(path, "fetch", "--no-recurse-submodules", remote, capped=True, check=False)
+    if fetch is not None and fetch.returncode:
+        row["result"] = "held:fetch_failed"
+        return row
     row["behind_after"] = int(value(path, "rev-list", "--count", "HEAD..@{u}"))
     if dry:
         print("{}: would fetch {}; rev-list --count HEAD..@{{u}} = {} (cached)".format(
             name, remote, row["behind_after"]))
-    if fetch is not None and fetch.returncode:
-        row["result"] = "held:fetch_failed"
-        return row
     default_proc = git(path, "symbolic-ref", "--quiet", "refs/remotes/" + remote + "/HEAD", check=False)
     default = default_proc.stdout.decode().strip()
+    if not default and dry:
+        row["result"] = "unknown_default"
+        return row
     # Clones record the remote's default branch. For manually initialized repos,
     # query HEAD without changing refs; if it cannot be established, hold safely.
     if not default and not dry:
         head = git(path, "ls-remote", "--symref", remote, "HEAD", capped=True, check=False)
         if head.returncode:
             row["result"] = "held:fetch_failed"
+            row["behind_after"] = None
             return row
         for line in head.stdout.decode().splitlines():
             if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
@@ -113,13 +153,33 @@ def inspect(name, path):
         return row
     count = row["behind_after"]
     row["result"] = "current"
+    if git(path, "config", "--get", "filter.lfs.required", check=False).returncode == 0:
+        row["result"] = "held:lfs"
+        return row
     if not count:
         return row
+    if name == "hermes-config":
+        # NUL delimiters preserve spaces, tabs, newlines and non-UTF-8 paths.
+        changed = git(path, "diff", "--name-only", "--no-renames", "-z", "HEAD", "@{u}").stdout
+        cutoff = time.time() - 300
+        for filename in changed.split(b"\0"):
+            if not filename:
+                continue
+            candidate = path / os.fsdecode(filename)
+            try:
+                recent = candidate.lstat().st_mtime >= cutoff
+            except FileNotFoundError:
+                continue
+            if recent:
+                row["files"].append(os.fsdecode(filename))
+        if row["files"]:
+            row["result"] = "held:recently_written"
+            return row
     if dry:
-        print("{}: would merge --ff-only @{{u}}; cached behind={}".format(name, count))
+        print("{}: would merge --ff-only --no-overwrite-ignore @{{u}}; cached behind={}".format(name, count))
         row["result"] = "would_update (+{})".format(count)
         return row
-    merge = git(path, "merge", "--ff-only", "@{u}", check=False)
+    merge = git(path, "merge", "--ff-only", "--no-overwrite-ignore", "@{u}", check=False)
     if merge.returncode:
         error = merge.stderr.decode(errors="replace")
         if "would be overwritten by merge" in error:
@@ -128,13 +188,13 @@ def inspect(name, path):
             # untracked collisions. Decode Git's quoted unusual filenames too.
             for line in error.splitlines():
                 if line.startswith("\t"):
-                    name = line[1:]
-                    if name.startswith('"'):
+                    filename = line[1:]
+                    if filename.startswith('"'):
                         try:
-                            name = json.loads(name)
+                            filename = json.loads(filename)
                         except ValueError:
                             pass
-                    row["files"].append(name)
+                    row["files"].append(filename)
         elif int(value(path, "rev-list", "--count", "@{u}..HEAD")):
             row["result"] = "held:diverged"
         else:
@@ -160,16 +220,29 @@ def atomic_write(path, content):
 
 
 try:
-    version = git(root, "rev-parse", "HEAD", check=False).stdout.decode().strip() or "unknown"
+    version = "unknown"
+    if not no_git and root.stat().st_uid == os.geteuid():
+        try:
+            version = value(root, "rev-parse", "HEAD")
+        except (OSError, ValueError, RuntimeError):
+            pass  # The repository's inspection below records the error.
     report = dict(host=socket.gethostname(),
                   ran_at=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                   version=version, repos=[])
     for name, path in [("hermes-config", home / ".hermes"),
                        ("hermes-host-bootstrap", root),
                        ("hermes-automation-wiki", home / "code/hermes-automation-wiki")]:
-        row = inspect(name, path)
+        row = dict(name=name, path=str(path), result="skipped:absent",
+                   **{"from": None, "to": None, "behind_after": None, "files": []})
+        try:
+            inspect(row, path)
+        except Exception as exc:
+            row["result"] = "error"
+            row["message"] = " ".join(str(exc).split())[:300]
+            row["behind_after"] = None
         report["repos"].append(row)
         print("{}: {}{}".format(name, row["result"],
+              " " + row["message"] if "message" in row else
               " " + json.dumps(row["files"]) if row["files"] else ""))
     if not dry:
         atomic_write(state / "status.json", json.dumps(report, indent=2) + "\n")
@@ -179,9 +252,11 @@ try:
         lines = log.read_text().splitlines(keepends=True)
         if len(lines) > 500:
             atomic_write(log, "".join(lines[-500:]))
+    if any(row["result"] == "error" for row in report["repos"]):
+        sys.exit(1)
 except (OSError, ValueError, RuntimeError) as exc:
     print("fleet-update-easy: " + str(exc), file=sys.stderr)
     sys.exit(1)
 PY
 }
-main "$@"
+main "$@"; exit $?

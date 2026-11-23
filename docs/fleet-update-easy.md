@@ -18,13 +18,19 @@ installation untouched.
 
 Calendar runs missed while a Mac sleeps coalesce into one run on wake. Reinstalling
 an unchanged LaunchAgent does not reload it. Changed definitions boot out, wait
-until unloaded, then bootstrap; a failed unload is reported as an error. Linux
-reruns restart the oneshot and timer, reasserting the installed behavior.
+until unloaded, then bootstrap; a failed unload is reported as an error. Before
+reloading or loading, M9 takes the updater lock, waiting up to 300 seconds for an
+active run. If it remains busy, M9 warns and skips the reload. LaunchAgent stdout
+and stderr go to `launchd.stdout.log` and `launchd.stderr.log` in the state directory.
+Linux enables and starts only the timer, restarting it only when the unit files
+change. M9 never starts or restarts the oneshot service.
 
 Run `hmu` (or `fleet-update-easy`) for an immediate update. `--dry-run` only prints
 the fetch/merge plan and reads cached `rev-list --count` counts; it does not fetch
 objects, change refs, acquire/create the state lock, or write status files. Cached
-counts can lag the remote. Fetches in normal runs have a 120-second cap.
+counts can lag the remote; a missing cached remote HEAD reports `unknown_default`.
+Fetches in normal runs have a 120-second cap, followed by SIGTERM and up to 10
+seconds for Git to clean up its locks before a forced kill.
 
 Each normal run writes `~/.local/state/fleet-update-easy/status.json` atomically
 and appends a JSON line to `log`, retaining its last 500 lines. `version` records
@@ -32,14 +38,27 @@ the bootstrap HEAD at the start of the run. `from` and `to` are full commit IDs;
 `behind_after` is the upstream distance, or null when unavailable. A missing repo
 or upstream is `skipped:absent`; detached or nondefault branches are held. An
 existing upstream branch can be ahead of the remote and still be held as diverged.
-Local edits only block when Git refuses the fast-forward; unrelated dirty files
-are preserved. Blocking paths appear in `files`. Untracked collisions also hold.
+Local edits block when Git refuses the fast-forward; unrelated dirty files
+are preserved. Blocking paths appear in `files`. Untracked and ignored-file
+collisions also hold, preserving the local bytes. For `~/.hermes` only, any path
+changed between HEAD and upstream with a modification time in the last five
+minutes causes `held:recently_written`. This reduces the chance of overwriting
+an active Hermes writer; it cannot eliminate writes racing after that check.
+Repositories with `filter.lfs.required` set are held as `held:lfs` before merging.
+Checkouts owned by another user are `held:not_owner`, with no Git invocation or
+writes in that tree. Macs without Command Line Tools report `skipped:no_git`
+without invoking Git or triggering an install dialog.
 Git hooks, auto-stash, recursive submodule updates, and automatic maintenance are
-disabled for these operations. A concurrent invocation prints `busy` and exits 0.
+disabled for these operations. SSH defaults to `BatchMode=yes` only when neither
+`core.sshCommand` nor `GIT_SSH_COMMAND` is set. A concurrent invocation prints
+`busy` and exits 0.
 
 No stash, reset, checkout, rebase, or commit is performed. Holds and fetch failures
-exit 0; unexpected runtime errors exit nonzero. Human intervention is needed to
-resolve a hold; the updater does not reconcile or discard local work.
+exit 0; fetch failures have a null `behind_after`. An unexpected repository error
+records `result: error` and a short `message`, then processing continues with the
+other repositories. Status and log are written before exiting 1 if any repository
+errored. Human intervention is needed to resolve a hold; the updater does not
+reconcile or discard local work.
 
 ## Convergence cutover inventory
 

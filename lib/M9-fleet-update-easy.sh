@@ -66,9 +66,20 @@ with open(path, "wb") as stream:
                    "RunAtLoad": True,
                    "StartCalendarInterval": [{"Hour": h, "Minute": 17} for h in range(0, 24, 2)],
                    "EnvironmentVariables": {"HOME": home},
+                   "StandardOutPath": home + "/.local/state/fleet-update-easy/launchd.stdout.log",
+                   "StandardErrorPath": home + "/.local/state/fleet-update-easy/launchd.stderr.log",
                    "ProcessType": "Background", "LowPriorityIO": True}, stream)
 PY
   plutil -lint "$tmp/agent.plist" >/dev/null
+  # Hold the same open-file-description lock as the updater throughout reload.
+  # An unchanged, loaded agent needs no reload and must not wait on a busy run.
+  if ! cmp -s "$tmp/agent.plist" "$plist" || ! launchctl print "$domain/$label" >/dev/null 2>&1; then
+    exec 8>>"$HOME/.local/state/fleet-update-easy/lock"
+    if ! perl -MFcntl=:flock -e 'open(my $f, ">>&=", 8) or exit 2; $SIG{ALRM} = sub { exit 1 }; alarm 300; flock($f, LOCK_EX) or exit 2; alarm 0;'; then
+      warn "$label updater lock unavailable after waiting up to 300 s; skipping reload"
+      exit 0
+    fi
+  fi
   if ! cmp -s "$tmp/agent.plist" "$plist"; then
     if launchctl print "$domain/$label" >/dev/null 2>&1; then
       launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
@@ -117,9 +128,7 @@ WantedBy=timers.target
 UNIT
   $SUDO install -d -m 0755 "$systemd_dir"
   changed=0
-  installed_units=()
   for kind in service timer; do
-    installed_units+=("$unit.$kind")
     if ! cmp -s "$tmp/$unit.$kind" "$systemd_dir/$unit.$kind"; then
       $SUDO install -m 0644 "$tmp/$unit.$kind" "$systemd_dir/$unit.$kind"
       changed=1
@@ -128,7 +137,9 @@ UNIT
   if [[ "$changed" == 1 ]]; then
     $SUDO systemctl daemon-reload
   fi
-  $SUDO systemctl enable "$unit.timer"
-  $SUDO systemctl restart "${installed_units[@]}"
+  $SUDO systemctl enable --now "$unit.timer"
+  if [[ "$changed" == 1 ]]; then
+    $SUDO systemctl restart "$unit.timer"
+  fi
   ok "$unit.timer enabled (every 2 h at :17, persistent)"
 fi

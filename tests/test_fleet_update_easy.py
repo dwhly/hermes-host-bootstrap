@@ -1,5 +1,7 @@
 """Local bare remotes and fake schedulers only; never runs the fleet's checkouts."""
+import ast
 import datetime
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -13,6 +15,12 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = Path(os.environ.get("FLEET_EASY_TEST_SCRIPT", ROOT / "scripts/fleet-update-easy"))
 REAL_GIT = shutil.which("git")
+REAL_PERL = shutil.which("perl")
+
+
+def age(path):
+    old = time.time() - 600
+    os.utime(path, (old, old))
 
 
 def command(args, env, check=True):
@@ -39,15 +47,28 @@ class Fleet:
                         GIT_AUTHOR_NAME="Test", GIT_AUTHOR_EMAIL="test@example.invalid",
                         GIT_COMMITTER_NAME="Test", GIT_COMMITTER_EMAIL="test@example.invalid",
                         TEST_ROOT=str(tmp), TEST_CALLS=str(self.calls), REAL_GIT=REAL_GIT)
+        self.env.pop("GIT_SSH_COMMAND", None)
         # The PATH shim both proves PATH ordering and refuses any real checkout.
         executable(self.bin / "git", """#!/usr/bin/env python3
-import os, pathlib, sys, time
+import os, pathlib, signal, sys, time
 a = sys.argv[1:]
 assert '-C' in a
 p = pathlib.Path(a[a.index('-C') + 1]).resolve()
 assert pathlib.Path(os.environ['TEST_ROOT']) in p.parents
 with open(os.environ['TEST_CALLS'], 'a') as f:
     f.write(repr(a) + '\\n')
+if 'fetch' in a and str(p) == os.environ.get('TEST_HANG'):
+    lock = p / '.git/fake-fetch.lock'
+    lock.touch()
+    pathlib.Path(os.environ['TEST_PID']).write_text(str(os.getpid()))
+    def term(signum, frame):
+        pathlib.Path(os.environ['TEST_TERM']).touch()
+        if not os.environ.get('TEST_IGNORE_TERM'):
+            lock.unlink()
+            sys.exit(0)
+    signal.signal(signal.SIGTERM, term)
+    while True:
+        time.sleep(.02)
 if 'fetch' in a and os.environ.get('TEST_BLOCK'):
     pathlib.Path(os.environ['TEST_BLOCK']).touch()
     while not pathlib.Path(os.environ['TEST_BLOCK'] + '.release').exists():
@@ -74,6 +95,8 @@ os.execv(os.environ['REAL_GIT'], [os.environ['REAL_GIT']] + a)
             self.git(seed, "push", "-u", "origin", "main")
             path.parent.mkdir(parents=True, exist_ok=True)
             self.git(tmp, "clone", str(remote), str(path))
+            age(path / "tracked.txt")
+            age(path / "other.txt")
             self.repos[name] = path
             self.seeds[name] = seed
         self.script = self.repos["hermes-host-bootstrap"] / "scripts/fleet-update-easy"
@@ -138,6 +161,7 @@ def test_held_local_edits_unchanged(fleet, staged, autostash):
     fleet.advance()
     fleet.git(repo, "config", "merge.autoStash", str(autostash).lower())
     (repo / "tracked.txt").write_text("local work\n")
+    age(repo / "tracked.txt")
     if staged:
         fleet.git(repo, "add", "tracked.txt")
     before = fleet.git(repo, "status", "--porcelain")
@@ -160,6 +184,7 @@ def test_untracked_collision_preserved(fleet):
     repo = fleet.repos["hermes-config"]
     fleet.advance(file="new.txt")
     (repo / "new.txt").write_text("untracked local work\n")
+    age(repo / "new.txt")
     row = fleet.row()
     assert row["result"] == "held:local_edits" and row["files"] == ["new.txt"]
     assert (repo / "new.txt").read_text() == "untracked local work\n"
@@ -202,7 +227,192 @@ def test_missing_cached_default(fleet):
 def test_fetch_failure(fleet):
     repo = fleet.repos["hermes-config"]
     fleet.git(repo, "remote", "set-url", "origin", str(fleet.tmp / "missing.git"))
-    assert fleet.row()["result"] == "held:fetch_failed"
+    row = fleet.row()
+    assert row["result"] == "held:fetch_failed"
+    assert row["behind_after"] is None
+
+
+def test_ignored_collision_preserves_bytes(fleet):
+    repo = fleet.repos["hermes-config"]
+    (repo / ".git/info/exclude").write_text("secret.txt\n")
+    secret = repo / "secret.txt"
+    secret.write_bytes(b"local secret\x00\xff\n")
+    age(secret)
+    before = secret.read_bytes()
+    fleet.advance(file="secret.txt")
+    row = fleet.row()
+    assert row["result"] == "held:local_edits"
+    assert row["files"] == ["secret.txt"]
+    assert row["from"] == row["to"] and row["behind_after"] == 1
+    assert secret.read_bytes() == before
+
+
+def test_index_lock_error_isolated_and_status_rewritten(fleet):
+    fleet.run()
+    previous = (fleet.state / "status.json").read_bytes()
+    for name in fleet.repos:
+        fleet.advance(name)
+    repo = fleet.repos["hermes-config"]
+    (repo / ".git/index.lock").write_text("another git owns this\n")
+    result = command(["bash", fleet.script], fleet.env, check=False)
+    assert result.returncode == 1
+    assert (fleet.state / "status.json").read_bytes() != previous
+    report = json.loads((fleet.state / "status.json").read_text())
+    error, *others = report["repos"]
+    assert error["result"] == "error" and "index.lock" in error["message"]
+    assert len(error["message"]) <= 300 and "\n" not in error["message"]
+    assert all(row["result"].startswith("updated ") for row in others)
+    assert (repo / "tracked.txt").read_text() == "original\n"
+    assert (repo / ".git/index.lock").read_text() == "another git owns this\n"
+    assert json.loads((fleet.state / "log").read_text().splitlines()[-1]) == report
+
+
+@pytest.mark.parametrize("ignore_term", [False, True])
+def test_hanging_fetch_terminates_then_kills_if_needed(fleet, ignore_term):
+    # Accelerate only the real fetch process's waits; record the production caps.
+    patches = fleet.tmp / "python-patches"
+    patches.mkdir()
+    (patches / "sitecustomize.py").write_text('''import os, subprocess
+original = subprocess.Popen.communicate
+def communicate(self, input=None, timeout=None):
+    if isinstance(self.args, list) and "fetch" in self.args:
+        with open(os.environ["TEST_TIMEOUTS"], "a") as stream:
+            stream.write(str(timeout) + "\\n")
+        timeout = {120: .3, 10: .3}.get(timeout, timeout)
+    return original(self, input=input, timeout=timeout)
+subprocess.Popen.communicate = communicate
+''')
+    repo = fleet.repos["hermes-config"]
+    term = fleet.tmp / "term"
+    pid = fleet.tmp / "pid"
+    timeouts = fleet.tmp / "timeouts"
+    fleet.env.update(PYTHONPATH=str(patches), TEST_HANG=str(repo), TEST_TERM=str(term),
+                     TEST_PID=str(pid), TEST_TIMEOUTS=str(timeouts))
+    if ignore_term:
+        fleet.env["TEST_IGNORE_TERM"] = "1"
+    fleet.advance("hermes-automation-wiki")
+    report = fleet.run()
+    row = report["repos"][0]
+    assert row["result"] == "held:fetch_failed" and row["behind_after"] is None
+    assert report["repos"][-1]["result"].startswith("updated ")
+    assert term.exists()
+    assert timeouts.read_text().splitlines()[:2] == ["120", "10"]
+    if ignore_term:
+        assert timeouts.read_text().splitlines()[2] == "None"
+    else:
+        assert not (repo / ".git/fake-fetch.lock").exists()
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid.read_text()), 0)
+
+
+def test_updater_can_replace_its_own_script(fleet):
+    name = "hermes-host-bootstrap"
+    seed = fleet.seeds[name]
+    replacement = '#!/bin/bash\necho "replacement executed unexpectedly"\nexit 91\n'
+    (seed / "scripts/fleet-update-easy").write_text(replacement)
+    fleet.git(seed, "add", "scripts/fleet-update-easy")
+    fleet.git(seed, "commit", "-m", "replace updater")
+    fleet.git(seed, "push")
+    fleet.advance("hermes-automation-wiki")
+    report = fleet.run()
+    assert report["repos"][1]["result"].startswith("updated ")
+    assert report["repos"][2]["result"].startswith("updated ")
+    assert fleet.script.read_text() == replacement
+    assert json.loads((fleet.state / "log").read_text()) == report
+
+
+@pytest.mark.parametrize("name", ["hermes-config", "hermes-host-bootstrap", "hermes-automation-wiki"])
+def test_recently_written_hold_only_hermes(fleet, name):
+    fleet.advance(name)
+    repo = fleet.repos[name]
+    os.utime(repo / "tracked.txt", None)  # Clean, but recently written by Hermes.
+    row = fleet.row(name)
+    if name == "hermes-config":
+        assert row["result"] == "held:recently_written"
+        assert row["files"] == ["tracked.txt"]
+        assert (repo / "tracked.txt").read_text() == "original\n"
+        age(repo / "tracked.txt")
+        assert fleet.row(name)["result"].startswith("updated ")
+    else:
+        assert row["result"].startswith("updated ")
+
+
+@pytest.mark.parametrize("setting", ["true", "false"])
+@pytest.mark.parametrize("behind", [False, True])
+def test_lfs_required_set_holds(fleet, setting, behind):
+    repo = fleet.repos["hermes-config"]
+    if behind:
+        fleet.advance()
+    fleet.git(repo, "config", "filter.lfs.required", setting)
+    row = fleet.row()
+    assert row["result"] == "held:lfs" and row["from"] == row["to"]
+    assert "'merge', '--ff-only'" not in fleet.calls.read_text()
+
+
+def test_dry_run_missing_remote_head(fleet):
+    fleet.git(fleet.repos["hermes-config"], "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+    result = fleet.run("--dry-run")
+    assert "hermes-config: unknown_default" in result.stdout
+    assert "'ls-remote'" not in fleet.calls.read_text()
+
+
+def test_unicode_collision_filename(fleet):
+    repo = fleet.repos["hermes-config"]
+    filename = "mémoire.txt"
+    fleet.advance(file=filename)
+    (repo / filename).write_text("local\n")
+    age(repo / filename)
+    row = fleet.row()
+    assert row["result"] == "held:local_edits" and row["files"] == [filename]
+
+
+def test_mac_without_clt_never_invokes_git(fleet):
+    executable(fleet.bin / "uname", '#!/bin/sh\necho Darwin\n')
+    executable(fleet.bin / "xcode-select", '#!/bin/sh\nexit 1\n')
+    executable(fleet.bin / "git", '#!/bin/sh\necho "git invoked" >> "$TEST_CALLS"\nexit 91\n')
+    report = fleet.run()
+    assert all(row["result"] == "skipped:no_git" for row in report["repos"])
+    assert report["version"] == "unknown"
+    assert not fleet.calls.exists()
+
+
+@pytest.mark.parametrize("setting", ["unset", "config", "env", "empty_env"])
+def test_ssh_batch_mode_preserves_user_command(fleet, setting):
+    repo = fleet.repos["hermes-config"]
+    if setting == "config":
+        fleet.git(repo, "config", "core.sshCommand", "ssh -o CustomOption=yes")
+    elif setting in ("env", "empty_env"):
+        fleet.env["GIT_SSH_COMMAND"] = "ssh -o CustomOption=yes" if setting == "env" else ""
+    fleet.run()
+    calls = [ast.literal_eval(line) for line in fleet.calls.read_text().splitlines()]
+    fetch = next(call for call in calls if "fetch" in call and str(repo) in call)
+    assert ("core.sshCommand=ssh -o BatchMode=yes" in fetch) == (setting == "unset")
+
+
+@pytest.mark.parametrize("name", ["hermes-config", "hermes-host-bootstrap", "hermes-automation-wiki"])
+def test_foreign_owner_never_invokes_git_or_writes_tree(fleet, name):
+    repo = fleet.repos[name]
+    fleet.advance(name)
+    before = snapshot(repo)
+    # Simulate a foreign UID even in containers that cannot chown to another UID.
+    patches = fleet.tmp / "python-patches"
+    patches.mkdir()
+    (patches / "sitecustomize.py").write_text('''import os, pathlib
+original = pathlib.Path.stat
+def stat(self, *args, **kwargs):
+    result = original(self, *args, **kwargs)
+    if str(self) == os.environ["TEST_FOREIGN_OWNER"]:
+        fields = list(result)
+        fields[4] = result.st_uid + 1
+        return os.stat_result(fields)
+    return result
+pathlib.Path.stat = stat
+''')
+    fleet.env.update(PYTHONPATH=str(patches), TEST_FOREIGN_OWNER=str(repo))
+    row = fleet.row(name)
+    assert row["result"] == "held:not_owner"
+    assert str(repo) not in fleet.calls.read_text()
+    assert snapshot(repo) == before
 
 
 @pytest.mark.parametrize("mode", ["absent", "no_git", "no_upstream"])
@@ -320,6 +530,9 @@ def test_module_mac_calendar_idempotent_reload(module):
     assert data["StartCalendarInterval"] == [{"Hour": h, "Minute": 17} for h in range(0, 24, 2)]
     assert "StartInterval" not in data and data["RunAtLoad"] is True
     assert data["ProgramArguments"] == ["/bin/bash", str(repo / "scripts/fleet-update-easy")]
+    state = home / ".local/state/fleet-update-easy"
+    assert Path(data["StandardOutPath"]).parent == state
+    assert Path(data["StandardErrorPath"]).parent == state
     assert (home / ".local/bin/fleet-update-easy").resolve() == repo / "scripts/fleet-update-easy"
     calls = Path(env["TEST_CALLS"])
     calls.write_text("")
@@ -343,6 +556,65 @@ def test_module_mac_reload_fails_if_still_loaded(module):
     assert "still loaded after bootout" in result.stdout + result.stderr
     assert "bootstrap " not in Path(env["TEST_CALLS"]).read_text()
     assert plist.read_text() == "stale"
+
+
+@pytest.mark.parametrize("mode", ["release", "timeout", "unchanged"])
+def test_module_mac_waits_for_updater_before_reload(module, mode):
+    repo, home, env = module
+    bootstrap(module)
+    plist = home / "Library/LaunchAgents/com.hermes.fleet-update-easy.plist"
+    if mode != "unchanged":
+        plist.write_text("stale")
+    calls = Path(env["TEST_CALLS"])
+    calls.write_text("")
+    ready = repo.parent / "waiting"
+    env.update(TEST_WAITING=str(ready), REAL_PERL=REAL_PERL)
+    # Keep real blocking flock, reducing only the 300-second alarm in this test.
+    executable(repo.parent / "bin/perl", '''#!/usr/bin/env python3
+import os, pathlib, sys
+a = sys.argv[1:]
+code = a[a.index('-e') + 1]
+assert 'alarm 300' in code and 'LOCK_EX' in code and 'LOCK_NB' not in code
+a[a.index('-e') + 1] = code.replace('alarm 300', 'alarm 1')
+pathlib.Path(os.environ['TEST_WAITING']).touch()
+os.execv(os.environ['REAL_PERL'], [os.environ['REAL_PERL']] + a)
+''')
+    with (home / ".local/state/fleet-update-easy/lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with subprocess.Popen(["bash", str(repo / "bootstrap.sh"), "--only=M9-fleet-update-easy"],
+                              env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True) as process:
+            try:
+                if mode == "unchanged":
+                    stdout, stderr = process.communicate(timeout=10)
+                    assert not ready.exists()
+                else:
+                    deadline = time.monotonic() + 10
+                    while not ready.exists() and time.monotonic() < deadline:
+                        time.sleep(.02)
+                    assert ready.exists()
+                    time.sleep(.1)
+                    assert process.poll() is None
+                    assert "bootout" not in calls.read_text()
+                    assert "bootstrap " not in calls.read_text()
+                    assert plist.read_text() == "stale"
+                    if mode == "release":
+                        fcntl.flock(lock, fcntl.LOCK_UN)
+                    stdout, stderr = process.communicate(timeout=10)
+                assert process.returncode == 0
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate(timeout=10)
+    if mode == "release":
+        assert "bootout" in calls.read_text() and "bootstrap " in calls.read_text()
+        assert plistlib.loads(plist.read_bytes())["Label"] == "com.hermes.fleet-update-easy"
+    else:
+        assert "bootout" not in calls.read_text() and "bootstrap " not in calls.read_text()
+        if mode == "timeout":
+            assert "skipping reload" in stdout + stderr
+            assert plist.read_text() == "stale"
 
 
 @pytest.mark.parametrize("args,os_name,host", [(["--skip=fleet-update-easy"], "Darwin", "h-mini"),
@@ -375,11 +647,21 @@ def test_module_linux_units_idempotent(module):
     assert str(repo / "scripts/fleet-update-easy") in service.read_text()
     assert "OnCalendar=*-*-* 00/2:17:00\n" in timer.read_text()
     assert "Persistent=true\n" in timer.read_text()
-    before = snapshot(units)
     calls = Path(env["TEST_CALLS"])
+    assert calls.read_text().splitlines() == [
+        "daemon-reload", "enable --now hermes-fleet-update-easy.timer",
+        "restart hermes-fleet-update-easy.timer"]
+    before = snapshot(units)
     calls.write_text("")
     bootstrap(module, "--role=server")
     assert snapshot(units) == before and "daemon-reload" not in calls.read_text()
-    assert "restart hermes-fleet-update-easy.service hermes-fleet-update-easy.timer" in calls.read_text()
+    assert calls.read_text().splitlines() == ["enable --now hermes-fleet-update-easy.timer"]
+    timer.write_text("stale")
+    calls.write_text("")
+    bootstrap(module, "--role=server")
+    assert snapshot(units) == before
+    assert calls.read_text().splitlines() == [
+        "daemon-reload", "enable --now hermes-fleet-update-easy.timer",
+        "restart hermes-fleet-update-easy.timer"]
     if shutil.which("systemd-analyze"):
         command(["systemd-analyze", "verify", service, timer], env)
