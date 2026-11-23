@@ -580,7 +580,7 @@ def test_module_linux_units_idempotent(module):
     assert "User=" + __import__("pwd").getpwuid(os.getuid()).pw_name + "\n" in service.read_text()
     assert "TimeoutStartSec=2h\nTimeoutStopSec=20min\nKillMode=mixed\n" in service.read_text()
     assert str(repo / "scripts/fleet-update-tools") in service.read_text()
-    assert "OnCalendar=*-*-* 03:41:00\n" in timer.read_text()
+    assert "OnCalendar=*-*-* 03:41:00 America/Los_Angeles\n" in timer.read_text()
     assert "Persistent=true\n" in timer.read_text()
     calls = Path(env["TEST_CALLS"])
     assert calls.read_text().splitlines() == [

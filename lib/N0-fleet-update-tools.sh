@@ -137,7 +137,7 @@ PY
 Description=Update installed fleet coding CLIs daily
 
 [Timer]
-OnCalendar=*-*-* 03:41:00
+OnCalendar=*-*-* 03:41:00 America/Los_Angeles
 Persistent=true
 
 [Install]
