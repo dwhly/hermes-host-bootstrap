@@ -7,12 +7,15 @@
 
 Strategy chain (first success wins; every attempt is reported on stderr with -v):
   0. cache        ~/.cache/fleet/yt-transcripts/<id>.<lang>.json (transcripts don't change)
-  1. direct       youtube-transcript-api from this host (works on residential hosts)
-  2. egress       same, via the fleet-egress gateway (residential egress for cloud hosts)
-  3. yt-dlp       subtitles via yt-dlp through the gateway (independent extractor, if the
+  1. egress       youtube-transcript-api via the fleet-egress gateway (paid rotating residential
+                  pool first; Dan's home IP only as the gateway's capped last-resort reserve)
+  2. yt-dlp       subtitles via yt-dlp through the gateway (independent extractor, if the
                   library breaks on a YouTube change)
-  4. supadata     hosted transcript API if SUPADATA_API_KEY is set (incl. AI fallback for
+  3. supadata     hosted transcript API if SUPADATA_API_KEY is set (incl. AI fallback for
                   videos with no captions: --ai)
+  (direct)        from this host's own IP — NOT in the default chain: on a home Mac that is the
+                  household IP with no caps (owner policy 2026-11-22). Opt in explicitly with
+                  FLEET_YT_STRATEGIES=direct,... only when you know the host's IP is expendable.
 Exit 0 + transcript on stdout, or exit 2 with a per-strategy failure report.
 Env: FLEET_EGRESS_PROXY (default http://100.122.202.37:3128), SUPADATA_API_KEY,
      FLEET_YT_STRATEGIES (comma list to override order).
@@ -155,7 +158,7 @@ def main():
     result, report = None, []
     if not a.no_cache and cache_f.exists():
         result = json.load(open(cache_f)); result["strategy"] = "cache"; log("cache hit")
-    order = os.environ.get("FLEET_YT_STRATEGIES", "direct,egress,ytdlp,supadata").split(",")
+    order = os.environ.get("FLEET_YT_STRATEGIES", "egress,ytdlp,supadata").split(",")
     plan = {"direct": lambda: via_library(vid, langs, None),
             "egress": lambda: via_library(vid, langs, EGRESS),
             "ytdlp": lambda: via_ytdlp(vid, langs, EGRESS),
