@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# Tier 1 easy repos only. Installed as a symlink by M9-fleet-update-easy.
+# --dry-run prints the fetch plan and cached rev-list counts; no state writes.
+# Keep the entire runner in a function: fast-forwarding this checkout may replace
+# this script while it is running. Bash parses the function before invoking it.
+set -euo pipefail
+export PATH="${PATH:+$PATH:}/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+main() {
+  local dry=0 lock_rc=0 state="$HOME/.local/state/fleet-update-easy"
+  case "${1:-}" in
+    --dry-run) dry=1; shift ;;
+    -h|--help) echo 'Usage: fleet-update-easy [--dry-run]'; return 0 ;;
+    '') ;;
+    *) echo "Unknown argument: $1" >&2; return 2 ;;
+  esac
+  [[ $# == 0 ]] || { echo 'Unexpected arguments' >&2; return 2; }
+  if [[ "$dry" == 0 ]]; then
+    mkdir -p "$state"
+    exec 8>>"$state/lock"
+    perl -MFcntl=:flock -e 'open(my $f, ">>&=", 8) or exit 2; exit(flock($f, LOCK_EX|LOCK_NB) ? 0 : 1)' || lock_rc=$?
+    case "$lock_rc" in
+      0) ;;
+      1) echo busy; return 0 ;;
+      *) echo 'Cannot acquire updater lock' >&2; return 1 ;;
+    esac
+  fi
+  python3 - "${BASH_SOURCE[0]}" "$dry" <<'PY'
+import datetime
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import tempfile
+
+root = Path(sys.argv[1]).resolve().parent.parent
+dry = sys.argv[2] == "1"
+home = Path.home()
+state = home / ".local/state/fleet-update-easy"
+env = dict(os.environ, LC_ALL="C", GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")
+
+
+def git(path, *args, capped=False, check=True):
+    command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0",
+               "-c", "maintenance.auto=false", "-c", "merge.autoStash=false",
+               "-c", "submodule.recurse=false", "-C", str(path)] + list(args)
+    if capped:
+        command = ["perl", "-e", "alarm 120; exec @ARGV", "--"] + command
+    proc = subprocess.run(command, env=env, stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and proc.returncode:
+        raise RuntimeError(proc.stderr.decode(errors="replace").strip() or
+                           "git failed: " + " ".join(args))
+    return proc
+
+
+def value(path, *args):
+    return git(path, *args).stdout.decode().strip()
+
+
+def inspect(name, path):
+    row = dict(name=name, path=str(path), result="skipped:absent",
+               **{"from": None, "to": None, "behind_after": None, "files": []})
+    # Do not accidentally operate on an enclosing checkout or a bare repository.
+    if not (path / ".git").exists():
+        return row
+    if git(path, "rev-parse", "--verify", "HEAD", check=False).returncode:
+        return row
+    row["from"] = row["to"] = value(path, "rev-parse", "HEAD")
+    branch_proc = git(path, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+    if branch_proc.returncode:
+        row["result"] = "held:not_on_default"
+        return row
+    branch = branch_proc.stdout.decode().strip()
+    upstream_proc = git(path, "rev-parse", "--symbolic-full-name", "@{u}", check=False)
+    if upstream_proc.returncode:
+        return row  # No upstream is outside the updater's scope.
+    upstream = upstream_proc.stdout.decode().strip()
+    remote = value(path, "config", "--get", "branch." + branch + ".remote")
+    merge_branch = value(path, "config", "--get", "branch." + branch + ".merge")
+    if dry:
+        # Even fetch --dry-run can download objects into .git. Print the plan
+        # instead; cached counts are intentionally not a claim about the remote.
+        fetch = None
+    else:
+        fetch = git(path, "fetch", "--no-recurse-submodules", remote, capped=True, check=False)
+    row["behind_after"] = int(value(path, "rev-list", "--count", "HEAD..@{u}"))
+    if dry:
+        print("{}: would fetch {}; rev-list --count HEAD..@{{u}} = {} (cached)".format(
+            name, remote, row["behind_after"]))
+    if fetch is not None and fetch.returncode:
+        row["result"] = "held:fetch_failed"
+        return row
+    default_proc = git(path, "symbolic-ref", "--quiet", "refs/remotes/" + remote + "/HEAD", check=False)
+    default = default_proc.stdout.decode().strip()
+    # Clones record the remote's default branch. For manually initialized repos,
+    # query HEAD without changing refs; if it cannot be established, hold safely.
+    if not default and not dry:
+        head = git(path, "ls-remote", "--symref", remote, "HEAD", capped=True, check=False)
+        if head.returncode:
+            row["result"] = "held:fetch_failed"
+            return row
+        for line in head.stdout.decode().splitlines():
+            if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
+                default = "refs/remotes/" + remote + "/" + line.split("\t")[0][16:]
+    if merge_branch != "refs/heads/" + branch or upstream != default:
+        row["result"] = "held:not_on_default"
+        return row
+    if int(value(path, "rev-list", "--count", "@{u}..HEAD")):
+        row["result"] = "held:diverged"
+        return row
+    count = row["behind_after"]
+    row["result"] = "current"
+    if not count:
+        return row
+    if dry:
+        print("{}: would merge --ff-only @{{u}}; cached behind={}".format(name, count))
+        row["result"] = "would_update (+{})".format(count)
+        return row
+    merge = git(path, "merge", "--ff-only", "@{u}", check=False)
+    if merge.returncode:
+        error = merge.stderr.decode(errors="replace")
+        if "would be overwritten by merge" in error:
+            row["result"] = "held:local_edits"
+            # Git lists exactly the blocking paths, including staged edits and
+            # untracked collisions. Decode Git's quoted unusual filenames too.
+            for line in error.splitlines():
+                if line.startswith("\t"):
+                    name = line[1:]
+                    if name.startswith('"'):
+                        try:
+                            name = json.loads(name)
+                        except ValueError:
+                            pass
+                    row["files"].append(name)
+        elif int(value(path, "rev-list", "--count", "@{u}..HEAD")):
+            row["result"] = "held:diverged"
+        else:
+            raise RuntimeError("{}: {}".format(path, error.strip()))
+    else:
+        row["to"] = value(path, "rev-parse", "HEAD")
+        row["result"] = "updated {}..{} (+{})".format(row["from"][:12], row["to"][:12], count)
+    row["behind_after"] = int(value(path, "rev-list", "--count", "HEAD..@{u}"))
+    return row
+
+
+def atomic_write(path, content):
+    fd, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+try:
+    version = git(root, "rev-parse", "HEAD", check=False).stdout.decode().strip() or "unknown"
+    report = dict(host=socket.gethostname(),
+                  ran_at=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  version=version, repos=[])
+    for name, path in [("hermes-config", home / ".hermes"),
+                       ("hermes-host-bootstrap", root),
+                       ("hermes-automation-wiki", home / "code/hermes-automation-wiki")]:
+        row = inspect(name, path)
+        report["repos"].append(row)
+        print("{}: {}{}".format(name, row["result"],
+              " " + json.dumps(row["files"]) if row["files"] else ""))
+    if not dry:
+        atomic_write(state / "status.json", json.dumps(report, indent=2) + "\n")
+        log = state / "log"
+        with log.open("a") as stream:
+            stream.write(json.dumps(report, separators=(",", ":")) + "\n")
+        lines = log.read_text().splitlines(keepends=True)
+        if len(lines) > 500:
+            atomic_write(log, "".join(lines[-500:]))
+except (OSError, ValueError, RuntimeError) as exc:
+    print("fleet-update-easy: " + str(exc), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+main "$@"
