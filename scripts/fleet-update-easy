@@ -96,6 +96,10 @@ def inspect(row, path):
     if no_git:
         row["result"] = "skipped:no_git"
         return row
+    if name == "hermes-config" and (home / ".config/fleet-update/preserve-hermes-config").exists():
+        # Preserved hosts (h-af, h-btp): their own skills, memory and config are protected; scripts still update.
+        row["result"] = "skipped:preserved"
+        return row
     if path.exists() and path.stat().st_uid != os.geteuid():
         row["result"] = "held:not_owner"
         return row

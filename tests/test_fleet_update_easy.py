@@ -427,6 +427,21 @@ def test_absent(fleet, mode):
     assert fleet.row()["result"] == "skipped:absent"
 
 
+
+def test_preserved_host_leaves_hermes_config_alone(fleet):
+    fleet.advance()
+    marker = fleet.home / ".config/fleet-update/preserve-hermes-config"
+    marker.parent.mkdir(parents=True)
+    marker.touch()
+    repo = fleet.repos["hermes-config"]
+    before = snapshot(repo)
+    fleet.advance("hermes-host-bootstrap")
+    rows = {r["name"]: r for r in fleet.run()["repos"]}
+    assert rows["hermes-config"]["result"] == "skipped:preserved"
+    assert str(repo) not in fleet.calls.read_text()
+    assert snapshot(repo) == before
+    assert rows["hermes-host-bootstrap"]["result"].startswith("updated")
+
 def snapshot(path):
     return {str(p.relative_to(path)): p.read_bytes() for p in path.rglob("*") if p.is_file()}
 

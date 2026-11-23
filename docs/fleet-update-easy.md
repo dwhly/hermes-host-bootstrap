@@ -68,3 +68,10 @@ disable/unload them before cutover. This implementation does not deploy to hosts
 or change the master converger. The external M2 inventory is
 `chief/docs/edd/evidence/fleet-self-convergence/m2-config-updater-and-dirty-tree.md`;
 this note supplies the new entry for that owner.
+
+## Preserved hosts
+
+On owner-managed hosts (h-af, h-btp) the host's own skills, memory and config are
+protected. Create `~/.config/fleet-update/preserve-hermes-config` and `~/.hermes`
+reports `skipped:preserved` and is never fetched or touched; the bootstrap scripts
+(including `hmw`) and the wiki still update.
