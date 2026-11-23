@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Fake 1Password CLI for tests/test_fleet_google_dwd.py. Reads its fixture from $HOME/fake-op (HOME is the
+# config's run_as home, which the module passes to op). Never prints the token.
+d="$HOME/fake-op"
+printf '%s\n' "$*" >> "$d/calls.log"
+env | cut -d= -f1 | grep -vxE 'PWD|SHLVL|_|OLDPWD' | LC_ALL=C sort > "$d/env-names"
+if [ "${OP_SERVICE_ACCOUNT_TOKEN:-}" != "$(cat "$d/expected-token")" ]; then echo "fake-op: wrong token" >&2; exit 6; fi
+if [ "$#" -ne 5 ] || [ "$1" != document ] || [ "$2" != get ] || [ "$3" != "$(cat "$d/item")" ] \
+   || [ "$4" != --vault ] || [ "$5" != "$(cat "$d/vault")" ]; then echo "fake-op: unexpected args" >&2; exit 7; fi
+if [ -f "$d/fail" ]; then cat "$d/fail" >&2; exit 1; fi
+cat "$d/key.json"

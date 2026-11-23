@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""fleet-google-dwd-check [--company NAME]: read-only DWD smoke test.
+
+For the configured smoke subject, mints one token per configured scope and makes one tiny read each:
+Gmail labels count, Calendar calendarList count, Drive about user (prints only whether it matches the
+subject). Prints counts only, never message, event or file content.
+Exit: 0 all OK; 3 DWD not authorised yet in Google Admin (nothing else wrong); 2 config error; 1 other failure.
+"""
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+import fleet_google_dwd as d  # noqa: E402
+
+CAL = "https://www.googleapis.com/calendar/v3/users/me/calendarList?maxResults=250&fields=items(id),nextPageToken"
+DRIVE = "https://www.googleapis.com/drive/v3/about?fields=user/emailAddress"
+
+
+def _gmail(r, subj):
+    return f"labels={len(r.get('labels') or [])}"
+
+
+def _cal(r, subj):
+    n = len(r.get("items") or [])
+    return f"calendars={n}{'+' if r.get('nextPageToken') else ''}"
+
+
+def _drive(r, subj):
+    e = ((r.get("user") or {}).get("emailAddress") or "").lower()
+    return "user=matches-subject" if e == subj else "user=DOES-NOT-MATCH-SUBJECT"
+
+
+CHECKS = [("gmail", d.G + "/labels", _gmail), ("calendar", CAL, _cal), ("drive", DRIVE, _drive)]
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--company", default=None, help="company config name (default: this host's company)")
+    a = ap.parse_args(argv)
+    try:
+        company = d.configure(a.company)
+    except Exception as e:
+        print(f"config: FAILED ({type(e).__name__}: {str(e)[:200]})")
+        return 2
+    subj = d.SMOKE_SUBJECT
+    print(f"company={company} subject={subj}")
+    unauth, failed = 0, 0
+    for service, url, fmt in CHECKS:
+        if service not in d.SCOPES_READ:
+            print(f"{service}: SKIPPED (scope not configured)")
+            continue
+        try:
+            r = d.get(subj, service, url, f"dwd-check.{service}")
+            line = fmt(r, subj)
+            if "DOES-NOT-MATCH" in line:
+                failed += 1
+            print(f"{service}: OK {line}")
+        except d.TokenError as e:
+            if e.error == "unauthorized_client":
+                unauth += 1
+                try:
+                    cid = d.service_account_client_id()
+                except Exception:
+                    cid = "<the service account's unique ID>"
+                print(f"{service}: NOT AUTHORISED YET. Google Admin has no domain-wide delegation entry for this "
+                      f"service account with scope {d.SCOPES_READ[service]}. Add it at admin.google.com > Security > "
+                      f"Access and data control > API controls > Domain-wide delegation: client ID {cid}.")
+            else:
+                failed += 1
+                print(f"{service}: FAILED (token endpoint {e.status} {e.error or 'error'})")
+        except d.ApiError as e:
+            failed += 1
+            print(f"{service}: FAILED ({service} API {e.status})")
+        except d.Refused as e:
+            failed += 1
+            print(f"{service}: REFUSED ({str(e)[:200]})")
+        except Exception as e:
+            failed += 1
+            print(f"{service}: FAILED ({type(e).__name__}: {str(e)[:200]})")
+    if failed:
+        return 1
+    return 3 if unauth else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

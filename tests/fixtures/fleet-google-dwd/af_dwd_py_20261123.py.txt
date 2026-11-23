@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""Hermes Google domain-wide-delegation (DWD) connector.
+
+- The service-account key lives ONLY in 1Password (vault "Hermes", item
+  "Google Service Account"). It is fetched per process via the op CLI into
+  memory and never written to disk.
+- Impersonation is restricted to ALLOWED_SUBJECTS below (Google itself would
+  allow any amforge.com user; this allowlist is the Hermes-side limit).
+- Every token mint and API call is appended to AUDIT_LOG (metadata only, no
+  message content, no secrets).
+- This module currently exposes READ operations only. Send/delete/modify are
+  intentionally not implemented here; they require an explicit user "send"
+  instruction and a separate reviewed code path.
+- Draft removal: ONLY via gmail_trash_draft(), which trashes (never hard-deletes)
+  a single draft that this same Hermes session created (see DRAFT_LEDGER).
+  Never call the Gmail drafts DELETE endpoint from ad-hoc code.
+
+Run from a directory other than /root (a stray /root/inspect.py shadows the
+stdlib module there).
+"""
+from __future__ import annotations
+
+import base64
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+
+OP_TOKEN_FILE = Path("/root/.config/amforge/op_sa_token")
+OP_VAULT = "Hermes"
+OP_ITEM_ID = "a3vszgwqaf3an2uigjrdqooc5y"  # "Google Service Account" (Document)
+AUDIT_LOG = Path("/root/.hermes/google-workspace/dwd_audit.log")
+
+# Hermes-side impersonation allowlist. Anything else is refused.
+# Dan 2026-11-02: board Do it may work in Al's and Becki's own accounts (their cards), "but no one else".
+ALLOWED_SUBJECTS = {"dwhaley@amforge.com", "amendez@amforge.com", "becki@amforge.com"}
+# Dan 2026-11-09 (#af-ops thread 1794237768.526349): "you can act on all GHI mailboxes". Any @ghi.gl
+# address is delegable (ghi.gl Admin DWD entry for this SA's client ID). Who may ask is gated in
+# af_policy.check_ghi_mailbox (Slack: Dan, Becki, Al only).
+ALLOWED_DOMAINS = {"ghi.gl"}
+
+
+# Dan 2026-11-12 (#af-ai thread 1794517563.537949): "authenticate Neil to be able to create documents under
+# his account". Drive/Docs/Sheets ONLY (the full drive scope; Gmail and Calendar refused for these subjects).
+# Deliberately NOT in ALLOWED_SUBJECTS, so the board's ownerbox rule (Do it mailbox choice) is unchanged.
+# Who may ask from Slack: the account owner or Dan (af_policy.check_docs_only_subject).
+DOCS_ONLY_SUBJECTS = {"ncohn@amforge.com"}
+
+
+# Dan 2026-11-23: "allow our system to read Drive, Docs, email and calendar for the purpose of informing our overall
+# systems. The individuals themselves are not allowed broad visibility of other people's emails and calendars and so
+# forth, except to the extent that we specify in the interface."
+# So: READ ONLY, and only for declared system jobs (e.g. the meetings importer), never for an agent session someone is
+# driving (Slack, board Do it/prompts, cron agents). af_policy.check_system_read_subject enforces who; every write
+# helper below refuses these subjects (Neil keeps his Drive/Docs writes from DOCS_ONLY_SUBJECTS).
+# Deliberately NOT in ALLOWED_SUBJECTS, so the board's ownerbox rule (Do it mailbox choice) is unchanged.
+import sys as _sys0
+if "/root/.hermes/hooks" not in _sys0.path:
+    _sys0.path.insert(0, "/root/.hermes/hooks")
+from af_policy import SYSTEM_READ_SUBJECTS  # noqa: E402  (one list, defined with its gate)
+
+
+def _refuse_system_write(subject: str, action: str, drive: bool = False):
+    s = (subject or "").lower().strip()
+    if s in SYSTEM_READ_SUBJECTS and not (drive and s in DOCS_ONLY_SUBJECTS):
+        _audit("refused", subject=s, action=action, reason="system-read subject: writes are not allowed")
+        raise Refused(f"{s} is delegated to the system for reading only; {action} refused")
+    if s in SYSTEM_READ_SUBJECTS:
+        _audit("allowed", subject=s, action=action, reason="Drive write under the owner's Docs-only grant")
+
+
+def subject_allowed(subject: str) -> bool:
+    s = (subject or "").lower().strip()
+    return (s in ALLOWED_SUBJECTS or s in DOCS_ONLY_SUBJECTS or s in SYSTEM_READ_SUBJECTS
+            or ("@" in s and s.rsplit("@", 1)[1] in ALLOWED_DOMAINS))
+
+# DWD only mints tokens for the EXACT scope strings authorized in Admin
+# (a narrower scope like gmail.readonly is refused unless also listed there).
+# These are the authorized (full) scopes; this module's code paths are still
+# read-only — write capability is gated by code, not by the scope string.
+SCOPES_READ = {
+    "gmail": "https://mail.google.com/",
+    "calendar": "https://www.googleapis.com/auth/calendar",
+    "drive": "https://www.googleapis.com/auth/drive",
+}
+
+_key_cache: dict | None = None
+_tok_cache: dict[tuple, tuple[str, float]] = {}
+
+
+class Refused(Exception):
+    pass
+
+
+def _audit(event: str, **kw):
+    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": event,
+           "requester": os.environ.get("HERMES_REQUESTER", "cli-session"), **kw}
+    fd = os.open(AUDIT_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def _load_key() -> dict:
+    global _key_cache
+    if _key_cache is None:
+        tok = OP_TOKEN_FILE.read_text().strip()
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": "/root",
+               "OP_SERVICE_ACCOUNT_TOKEN": tok}
+        r = subprocess.run(["op", "document", "get", OP_ITEM_ID, "--vault", OP_VAULT],
+                           env=env, capture_output=True, timeout=60)
+        del tok, env
+        if r.returncode != 0:
+            raise RuntimeError("1Password fetch failed: " + r.stderr.decode()[:200])
+        k = json.loads(r.stdout)
+        if k.get("type") != "service_account":
+            raise RuntimeError("1Password item is not a service-account key")
+        _key_cache = k
+    return _key_cache
+
+
+def _b64(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+def access_token(subject: str, scopes: list[str], *, read_only: bool = False) -> str:
+    subject = subject.lower().strip()
+    if not subject_allowed(subject):
+        _audit("refused", subject=subject, reason="subject not in allowlist")
+        raise Refused(f"impersonation of {subject} is not allowed")
+    # Dan 2026-11-06: "block direct inquiries into my email and other things". From Slack, acting as
+    # dwhaley@ (mail, calendar, Drive) is allowed only when Dan is the one asking. Fails closed.
+    # Dan 2026-11-09: @ghi.gl mailboxes only when Dan, Becki or Al is asking. Fails closed.
+    try:
+        import sys as _sys
+        if "/root/.hermes/hooks" not in _sys.path:
+            _sys.path.insert(0, "/root/.hermes/hooks")
+        import af_policy
+        af_policy.check_dan_mailbox(subject)
+        af_policy.check_ghi_mailbox(subject)
+        bad = [s for s in scopes if s != SCOPES_READ["drive"]]
+        if subject in DOCS_ONLY_SUBJECTS and not bad:
+            af_policy.check_docs_only_subject(subject)          # Neil's own Drive/Docs, as before
+        elif subject in SYSTEM_READ_SUBJECTS:
+            # Review 2026-11-23: read-only by default, not by a list of refused writes. A token for these accounts is
+            # handed out only to a caller that declares it will only read (dwd.get, the meetings importer's GETs).
+            if not read_only:
+                raise Refused(f"{subject} is delegated to the system for reading only; ask with read_only=True")
+            af_policy.check_system_read_subject(subject)        # system jobs only (their own systemd unit)
+        elif subject in DOCS_ONLY_SUBJECTS:
+            raise Refused(f"{subject} is delegated for Drive/Docs/Sheets only; refused scopes: {bad}")
+    except Exception as exc:
+        _audit("refused", subject=subject, reason="af_policy: " + type(exc).__name__ + ": " + str(exc)[:200])
+        raise Refused(str(exc))
+    ck = (subject, tuple(sorted(scopes)))
+    hit = _tok_cache.get(ck)
+    if hit and hit[1] - 60 > time.time():
+        return hit[0]
+    k = _load_key()
+    now = int(time.time())
+    header = {"alg": "RS256", "typ": "JWT", "kid": k["private_key_id"]}
+    claims = {"iss": k["client_email"], "sub": subject, "scope": " ".join(scopes),
+              "aud": k["token_uri"], "iat": now, "exp": now + 3600}
+    signing_input = f"{_b64(json.dumps(header).encode())}.{_b64(json.dumps(claims).encode())}".encode()
+    pk = serialization.load_pem_private_key(k["private_key"].encode(), password=None)
+    sig = pk.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+    assertion = signing_input.decode() + "." + _b64(sig)
+    data = urllib.parse.urlencode({"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                                   "assertion": assertion}).encode()
+    try:
+        resp = json.load(urllib.request.urlopen(k["token_uri"], data, timeout=30))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:300]
+        _audit("token_error", subject=subject, scopes=scopes, status=e.code, detail=body)
+        raise RuntimeError(f"token mint failed ({e.code}): {body}")
+    _audit("token_minted", subject=subject, scopes=scopes)
+    _tok_cache[ck] = (resp["access_token"], time.time() + int(resp.get("expires_in", 3600)))
+    return resp["access_token"]
+
+
+def get(subject: str, service: str, url: str, action: str, target: str = "") -> dict:
+    tok = access_token(subject, [SCOPES_READ[service]], read_only=True)   # GET only, below
+    _audit("api_read", subject=subject, service=service, action=action, target=target[:200])
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok})
+    try:
+        return json.load(urllib.request.urlopen(req, timeout=60))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"{service} API {e.code}: {e.read().decode()[:300]}")
+
+
+# ---------------- Gmail helpers (read-only) ----------------
+G = "https://gmail.googleapis.com/gmail/v1/users/me"
+
+
+def gmail_search(subject: str, q: str, n: int = 20) -> list[dict]:
+    r = get(subject, "gmail", f"{G}/messages?maxResults={n}&q=" + urllib.parse.quote(q), "gmail.search", q)
+    out = []
+    for m in r.get("messages", []):
+        md = get(subject, "gmail", f"{G}/messages/{m['id']}?format=metadata&metadataHeaders=From"
+                 "&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Subject&metadataHeaders=Date",
+                 "gmail.metadata", m["id"])
+        h = {x["name"]: x["value"] for x in md["payload"]["headers"]}
+        out.append({"id": m["id"], "threadId": md["threadId"], "date": h.get("Date", ""),
+                    "from": h.get("From", ""), "to": h.get("To", ""), "cc": h.get("Cc", ""),
+                    "subject": h.get("Subject", ""), "snippet": md.get("snippet", ""),
+                    "labels": md.get("labelIds", [])})
+    return out
+
+
+def _walk_parts(p, texts, atts):
+    mt = p.get("mimeType", "")
+    if p.get("filename"):
+        atts.append({"filename": p["filename"], "mimeType": mt, "size": p.get("body", {}).get("size"),
+                     "attachmentId": p.get("body", {}).get("attachmentId")})
+    elif mt == "text/plain" and p.get("body", {}).get("data"):
+        texts.append(base64.urlsafe_b64decode(p["body"]["data"]).decode("utf-8", "ignore"))
+    for c in p.get("parts", []) or []:
+        _walk_parts(c, texts, atts)
+
+
+def gmail_thread(subject: str, thread_id: str) -> list[dict]:
+    t = get(subject, "gmail", f"{G}/threads/{thread_id}?format=full", "gmail.thread", thread_id)
+    msgs = []
+    for m in t.get("messages", []):
+        h = {x["name"]: x["value"] for x in m["payload"]["headers"]}
+        texts, atts = [], []
+        _walk_parts(m["payload"], texts, atts)
+        msgs.append({"id": m["id"], "date": h.get("Date", ""), "from": h.get("From", ""),
+                     "to": h.get("To", ""), "cc": h.get("Cc", ""), "subject": h.get("Subject", ""),
+                     "body": "\n".join(texts), "attachments": atts})
+    return msgs
+
+
+# ---------------- Gmail DRAFT creation (write, reversible; never sends) ----------------
+def gmail_create_draft(subject: str, *, to: list[str], cc: list[str], subj: str, body: str,
+                       thread_id: str | None = None, in_reply_to: str | None = None,
+                       attachments: list[tuple[str, str]] | None = None) -> dict:
+    """Create a Gmail DRAFT in `subject`'s mailbox. Does NOT send.
+    attachments: list of (local_path, filename_to_show)."""
+    _refuse_system_write(subject, "gmail.draft.create")
+    from email.message import EmailMessage
+    msg = EmailMessage()
+    msg["To"] = ", ".join(to)
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    msg["Subject"] = subj
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = in_reply_to
+    msg.set_content(body)
+    import mimetypes
+    for path, name in attachments or []:
+        mt = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        maintype, subtype = mt.split("/", 1)
+        with open(path, "rb") as f:
+            msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=name)
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    payload = {"message": {"raw": raw}}
+    if thread_id:
+        payload["message"]["threadId"] = thread_id
+    tok = access_token(subject, [SCOPES_READ["gmail"]])
+    _audit("gmail.draft.create", subject=subject, to=to, cc=cc, subj=subj[:150],
+           thread=thread_id or "", attachments=[n for _, n in attachments or []])
+    req = urllib.request.Request(f"{G}/drafts", data=json.dumps(payload).encode(), method="POST",
+                                 headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"})
+    try:
+        res = json.load(urllib.request.urlopen(req, timeout=60))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"gmail draft create {e.code}: {e.read().decode()[:300]}")
+    _ledger_add(subject, res["id"], res.get("message", {}).get("id", ""), to, subj)
+    return res
+
+
+# ---------------- Draft cleanup guard (added 2026-10-01 after an incident) ----------------
+# Incident: an ad-hoc cleanup called DELETE /drafts/{id} for every draft matching a recipient
+# query, permanently destroying 5 drafts Hermes had not created. Rules enforced here:
+#   1. Only drafts recorded in DRAFT_LEDGER as created by THIS Hermes session can be removed.
+#   2. Removal is by exact draft id only (no query/recipient-based bulk removal).
+#   3. Removal TRASHES the underlying message (recoverable for 30 days); it never hard-deletes.
+# Never call the Gmail drafts DELETE endpoint directly from ad-hoc code; use gmail_trash_draft.
+DRAFT_LEDGER = Path("/root/.hermes/google-workspace/state/draft_ledger.jsonl")
+
+
+def _session_id() -> str:
+    return os.environ.get("HERMES_SESSION_ID", "")
+
+
+def _ledger_add(subject: str, draft_id: str, message_id: str, to, subj: str):
+    DRAFT_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "session": _session_id(),
+           "subject": subject, "draft_id": draft_id, "message_id": message_id,
+           "to": to, "subj": subj[:150]}
+    fd = os.open(DRAFT_LEDGER, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def _ledger_lookup(subject: str, draft_id: str) -> dict | None:
+    if not DRAFT_LEDGER.exists():
+        return None
+    hit = None
+    for line in DRAFT_LEDGER.read_text().splitlines():
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if r.get("draft_id") == draft_id and r.get("subject") == subject:
+            hit = r
+    return hit
+
+
+def gmail_trash_draft(subject: str, draft_id: str) -> dict:
+    """Move ONE Hermes-created draft to Trash (recoverable). Refuses anything else."""
+    _refuse_system_write(subject, "gmail.draft.trash")
+    rec = _ledger_lookup(subject, draft_id)
+    sid = _session_id()
+    if not rec:
+        _audit("refused", subject=subject, action="gmail.draft.trash", draft_id=draft_id,
+               reason="draft not created by Hermes (not in ledger)")
+        raise Refused(f"draft {draft_id} was not created by Hermes; refusing to remove it")
+    if not sid or rec.get("session") != sid:
+        _audit("refused", subject=subject, action="gmail.draft.trash", draft_id=draft_id,
+               reason="draft created in a different session")
+        raise Refused(f"draft {draft_id} was created in another session; ask the user to remove it")
+    tok = access_token(subject, [SCOPES_READ["gmail"]])
+    H = {"Authorization": "Bearer " + tok}
+    d = json.load(urllib.request.urlopen(urllib.request.Request(f"{G}/drafts/{draft_id}?format=minimal",
+                                                                 headers=H), timeout=60))
+    mid = d["message"]["id"]
+    _audit("gmail.draft.trash", subject=subject, draft_id=draft_id, message_id=mid, subj=rec.get("subj", ""))
+    req = urllib.request.Request(f"{G}/messages/{mid}/trash", data=b"", method="POST", headers=H)
+    return json.load(urllib.request.urlopen(req, timeout=60))
+
+
+# ---------------- Calendar event creation (write) ----------------
+def calendar_create_event(subject: str, *, summary: str, start: str, end: str, tz: str,
+                          attendees: list[str], description: str = "", with_meet: bool = True,
+                          send_updates: str = "none", visibility: str = "default") -> dict:
+    """Create an event on `subject`'s primary calendar. send_updates: none|externalOnly|all.
+    Default 'none' = no invitation emails go out (a separate explicit step sends them)."""
+    _refuse_system_write(subject, "calendar.event.create")
+    import uuid
+    ev = {"summary": summary, "description": description, "visibility": visibility,
+          "start": {"dateTime": start, "timeZone": tz}, "end": {"dateTime": end, "timeZone": tz},
+          "attendees": [{"email": a} for a in attendees], "guestsCanSeeOtherGuests": True}
+    if with_meet:
+        ev["conferenceData"] = {"createRequest": {"requestId": uuid.uuid4().hex,
+                                                  "conferenceSolutionKey": {"type": "hangoutsMeet"}}}
+    tok = access_token(subject, [SCOPES_READ["calendar"]])
+    _audit("calendar.event.create", subject=subject, summary=summary[:150], start=start,
+           attendees=attendees, send_updates=send_updates)
+    url = ("https://www.googleapis.com/calendar/v3/calendars/primary/events?conferenceDataVersion=1"
+           f"&sendUpdates={send_updates}")
+    req = urllib.request.Request(url, data=json.dumps(ev).encode(), method="POST",
+                                 headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"})
+    try:
+        return json.load(urllib.request.urlopen(req, timeout=60))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"calendar create {e.code}: {e.read().decode()[:300]}")
+
+
+def calendar_send_invites(subject: str, event_id: str) -> dict:
+    """Send invitations for an event created with send_updates='none'.
+    Removes guests silently, then re-adds them with sendUpdates=all so each
+    receives a real invitation (a no-op PATCH does not reliably notify)."""
+    _refuse_system_write(subject, "calendar.invites.send")
+    tok = access_token(subject, [SCOPES_READ["calendar"]])
+    base = f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{event_id}"
+    hdr = {"Authorization": "Bearer " + tok, "Content-Type": "application/json"}
+    ev = json.load(urllib.request.urlopen(urllib.request.Request(base, headers=hdr), timeout=60))
+    guests = [{"email": a["email"]} for a in ev.get("attendees", []) if not a.get("self")]
+    _audit("calendar.invites.send", subject=subject, event_id=event_id, attendees=[g["email"] for g in guests])
+
+    def _patch(body, send):
+        r = urllib.request.Request(f"{base}?sendUpdates={send}&conferenceDataVersion=1",
+                                   data=json.dumps(body).encode(), method="PATCH", headers=hdr)
+        try:
+            return json.load(urllib.request.urlopen(r, timeout=60))
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"calendar patch {e.code}: {e.read().decode()[:300]}")
+    _patch({"attendees": []}, "none")
+    return _patch({"attendees": guests}, "all")
+
+
+# ---------------- Drive sharing (write) ----------------
+def drive_share(subject: str, file_id: str, emails: list[str], role: str = "writer",
+                notify: bool = False) -> list[dict]:
+    """Share a Drive file with specific people (never 'anyone'/domain links)."""
+    _refuse_system_write(subject, "drive.share", drive=True)
+    import urllib.request as _u
+    tok = access_token(subject, ["https://www.googleapis.com/auth/drive"])
+    out = []
+    for e in emails:
+        body = json.dumps({"type": "user", "role": role, "emailAddress": e}).encode()
+        url = (f"https://www.googleapis.com/drive/v3/files/{file_id}/permissions"
+               f"?sendNotificationEmail={'true' if notify else 'false'}&supportsAllDrives=true"
+               f"&fields=id,emailAddress,role")
+        req = _u.Request(url, data=body, method="POST",
+                         headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"})
+        out.append(json.load(_u.urlopen(req, timeout=60)))
+    _audit("drive.share", subject=subject, file_id=file_id, emails=emails, role=role, notify=notify)
+    return out
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", choices=["search", "thread", "whoami"])
+    ap.add_argument("arg", nargs="?", default="")
+    ap.add_argument("--as", dest="subject", default="dwhaley@amforge.com")
+    ap.add_argument("-n", type=int, default=20)
+    a = ap.parse_args()
+    if a.cmd == "whoami":
+        print(json.dumps(get(a.subject, "gmail", f"{G}/profile", "gmail.profile"), indent=1))
+    elif a.cmd == "search":
+        print(json.dumps(gmail_search(a.subject, a.arg, a.n), indent=1))
+    else:
+        print(json.dumps(gmail_thread(a.subject, a.arg), indent=1))

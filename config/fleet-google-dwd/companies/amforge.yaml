@@ -1,0 +1,27 @@
+# AmForge: mirrors h-af /root/.hermes/google-workspace/dwd.py constants as of 2026-11-23 (reviewed; no secrets).
+# Not installed anywhere yet (hosts/h-af.env is ROLLOUT=hold). SYSTEM_READ_SUBJECTS stay defined in af_policy.
+company: amforge
+op_vault: Hermes
+op_item: a3vszgwqaf3an2uigjrdqooc5y        # "Google Service Account" (Document)
+op_token_file: /root/.config/amforge/op_sa_token
+run_as:
+  user: root
+  home: /root
+allowed_subjects:          # Dan 2026-11-02: board Do it may work in Al's and Becki's own accounts, "but no one else"
+  - dwhaley@amforge.com
+  - amendez@amforge.com
+  - becki@amforge.com
+allowed_domains:           # Dan 2026-11-09: "you can act on all GHI mailboxes" (who may ask: af_policy)
+  - ghi.gl
+docs_only_subjects:        # Dan 2026-11-12: Neil, Drive/Docs/Sheets only
+  - ncohn@amforge.com
+scopes:
+  gmail: https://mail.google.com/
+  calendar: https://www.googleapis.com/auth/calendar
+  drive: https://www.googleapis.com/auth/drive
+audit_log: /root/.hermes/google-workspace/dwd_audit.log
+draft_ledger: /root/.hermes/google-workspace/state/draft_ledger.jsonl
+smoke_subject: dwhaley@amforge.com
+policy:
+  hooks_dir: /root/.hermes/hooks
+  module: af_policy
