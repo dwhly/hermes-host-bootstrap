@@ -113,20 +113,30 @@ if have op && [[ -f "$ENV_TEMPLATE" ]] && ! is_skipped op-resolve; then
     info "resolving $ENV_TEMPLATE → $ENV_RESOLVED via op inject"
     if op inject --force -i "$ENV_TEMPLATE" -o "$ENV_RESOLVED.tmp" 2>/dev/null; then
       # Per-host overlay: if a .env.template.<hostname> exists, resolve it and
-      # append. Lines in the overlay override (later-wins is the convention
-      # python-dotenv and most env loaders follow).
+      # REPLACE the shared lines it names, so every key appears exactly once
+      # with the overlay's value (readers like `grep | head -1` must not see
+      # the shared value first).
+      overlay_failed=0
       if [[ -f "$ENV_TEMPLATE_HOST" ]]; then
         info "applying per-host overlay: $ENV_TEMPLATE_HOST"
         if op inject --force -i "$ENV_TEMPLATE_HOST" -o "$ENV_RESOLVED.host.tmp" 2>/dev/null; then
+          overlay_keys=$( { grep -E '^[A-Z_][A-Z0-9_]*=' "$ENV_RESOLVED.host.tmp" || true; } | cut -d= -f1 | sort -u)
+          if [[ -n "$overlay_keys" ]]; then
+            ( umask 077; grep -vE "^($(echo "$overlay_keys" | paste -sd'|' -))=" "$ENV_RESOLVED.tmp" > "$ENV_RESOLVED.base.tmp" || true )
+            mv -f "$ENV_RESOLVED.base.tmp" "$ENV_RESOLVED.tmp"
+          fi
           {
             echo ""
             echo "# ── per-host overlay ($(basename "$ENV_TEMPLATE_HOST")) ──"
-            grep -E '^[A-Z_][A-Z0-9_]*=' "$ENV_RESOLVED.host.tmp"
+            grep -E '^[A-Z_][A-Z0-9_]*=' "$ENV_RESOLVED.host.tmp" || true
           } >> "$ENV_RESOLVED.tmp"
           rm -f "$ENV_RESOLVED.host.tmp"
         else
-          warn "op inject failed on $ENV_TEMPLATE_HOST — overlay skipped"
-          rm -f "$ENV_RESOLVED.host.tmp"
+          # Never fall back to the shared values for keys the host overrides
+          # (e.g. a per-host billing key): keep the existing .env untouched.
+          warn "op inject failed on $ENV_TEMPLATE_HOST — keeping existing $ENV_RESOLVED unchanged"
+          rm -f "$ENV_RESOLVED.host.tmp" "$ENV_RESOLVED.tmp"
+          overlay_failed=1
         fi
       fi
 
@@ -134,6 +144,9 @@ if have op && [[ -f "$ENV_TEMPLATE" ]] && ! is_skipped op-resolve; then
       # in the resolved template OR overlay. This lets a user have inline
       # secrets in .env (e.g. tokens not yet migrated to 1Password) that
       # survive repeated resolutions. The template wins for any key it defines.
+      if (( overlay_failed )); then
+        :   # existing .env kept as-is (warned above)
+      else
       if [[ -f "$ENV_RESOLVED" ]]; then
         template_keys=$(grep -E '^[A-Z_][A-Z0-9_]*=' "$ENV_RESOLVED.tmp" | cut -d= -f1 | sort -u)
         {
@@ -152,6 +165,7 @@ if have op && [[ -f "$ENV_TEMPLATE" ]] && ! is_skipped op-resolve; then
       mv "$ENV_RESOLVED.tmp" "$ENV_RESOLVED"
       resolved_count=$(grep -cE '^[A-Z_][A-Z0-9_]*=' "$ENV_RESOLVED" 2>/dev/null || echo 0)
       ok "resolved + merged: $resolved_count variables total in .env"
+      fi
     else
       warn "op inject failed — check that referenced vault items exist and you're signed in"
       rm -f "$ENV_RESOLVED.tmp"

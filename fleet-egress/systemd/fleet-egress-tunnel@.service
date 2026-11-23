@@ -1,0 +1,15 @@
+[Unit]
+Description=fleet-egress home tunnel to %i (ssh -D SOCKS5, residential egress)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/fleet-egress/tunnel-%i.env
+ExecStart=/usr/bin/ssh -N -o BatchMode=yes -o IdentitiesOnly=yes -i /root/.ssh/id_ed25519 \
+  -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+  -o ConnectTimeout=10 -D 127.0.0.1:${SOCKS_PORT} ${SSH_TARGET}
+Restart=always
+RestartSec=20
+
+[Install]
+WantedBy=multi-user.target
