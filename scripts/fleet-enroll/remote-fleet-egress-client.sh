@@ -16,7 +16,11 @@ payload="${1:?usage: remote-fleet-egress-client.sh <payload.tgz> <user>...}"; sh
 dest=/opt/fleet-egress-client
 rm -rf "$dest.new"; install -d -m 0755 "$dest.new"
 tar -xzf "$payload" -C "$dest.new" --no-same-owner
-chown -R 0:0 "$dest.new"; chmod -R go-w "$dest.new"; chmod 0755 "$dest.new"/bin/*
+# Explicit modes (never inherit the builder's umask): dirs + commands 0755, everything else 0644.
+chown -R 0:0 "$dest.new"
+find "$dest.new" -type d -exec chmod 0755 {} +
+find "$dest.new" -type f -exec chmod 0644 {} +
+chmod 0755 "$dest.new"/bin/*
 rm -rf "$dest.old"; [[ ! -d "$dest" ]] || mv "$dest" "$dest.old"; mv "$dest.new" "$dest"; rm -rf "$dest.old"
 echo "payload: $(cat "$dest/PROVENANCE" 2>/dev/null | tr '\n' ' ')"
 rc_status=0

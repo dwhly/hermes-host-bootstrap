@@ -24,6 +24,7 @@ import base64
 import json
 import logging
 import os
+import re
 import socket
 import struct
 import sys
@@ -32,6 +33,25 @@ import urllib.parse
 
 log = logging.getLogger("fleet-egress")
 CONNECT_TIMEOUT = 10.0
+HEADER_TIMEOUT = 15.0       # whole request head (line + headers) must arrive within this
+HEADER_MAX_BYTES = 16384    # and fit in this many bytes
+IDLE_TIMEOUT = 300.0        # an established tunnel with no traffic either way for this long is closed
+MAX_CONNECTIONS = 256       # concurrent client connections; beyond this => 503
+DEFAULT_PORTS = [443]       # per-policy "ports" overrides; CONNECT to anything else => 403
+# Strict DNS hostname (no IP literals, no control chars/NUL, no empty labels). The canonical, validated
+# name is what is forwarded upstream — never the raw client bytes (SOCKS5 servers such as OpenSSH
+# truncate at NUL, so "127.0.0.1\0.youtube.com" would otherwise reach the tunnel host's loopback).
+_LABEL = r"(?!-)[a-z0-9-]{1,63}(?<!-)"
+_HOST_RE = re.compile(rf"^(?=.{{1,253}}$){_LABEL}(?:\.{_LABEL})+$")
+
+
+def canonical_host(raw: str) -> str | None:
+    h = raw.strip().lower().rstrip(".")
+    if not _HOST_RE.fullmatch(h) or re.fullmatch(r"[0-9.]+", h):
+        return None
+    if h.rsplit(".", 1)[-1].isdigit():  # numeric TLD => IP-ish, refuse
+        return None
+    return h
 
 
 class Route:
@@ -47,6 +67,19 @@ class Route:
         self.caps = {60: spec.get("per_minute"), 3600: spec.get("per_hour")}
         self.recent: list[float] = []
         self.capped = 0
+
+    def reserve(self) -> float | None:
+        """Atomically (no await in between) check the shared cap window and take a slot."""
+        if self.over_cap():
+            return None
+        t = time.time(); self.recent.append(t)
+        return t
+
+    def refund(self, t: float) -> None:
+        try:
+            self.recent.remove(t)  # failed attempts don't consume the scarce budget
+        except ValueError:
+            pass
 
     def over_cap(self) -> bool:
         now = time.time()
@@ -106,6 +139,8 @@ class Gateway:
         self.policies = cfg["policies"]
         self.started = time.time()
         self.rejected = 0
+        self.busy = 0
+        self.sem = asyncio.Semaphore(MAX_CONNECTIONS)
 
     def policy_for(self, host: str):
         host = host.lower().rstrip(".")
@@ -117,12 +152,33 @@ class Gateway:
         return None
 
     async def handle(self, reader, writer):
-        peer = writer.get_extra_info("peername")
+        if self.sem.locked():
+            self.busy += 1
+            writer.write(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            try:
+                await writer.drain()
+            finally:
+                writer.close()
+            return
+        async with self.sem:
+            await self._handle(reader, writer)
+
+    @staticmethod
+    async def _read_head(reader) -> bytes:
+        head = b""
+        while True:
+            line = await reader.readline()
+            head += line
+            if len(head) > HEADER_MAX_BYTES:
+                raise ValueError("request head too large")
+            if line in (b"\r\n", b"\n", b""):
+                return head
+
+    async def _handle(self, reader, writer):
+        peer = writer.get_extra_info("peername") or ("?",)
         try:
-            line = await asyncio.wait_for(reader.readline(), 15)
-            parts = line.decode(errors="replace").split()
-            while (await reader.readline()) not in (b"\r\n", b"\n", b""):
-                pass
+            head = await asyncio.wait_for(self._read_head(reader), HEADER_TIMEOUT)
+            parts = head.split(b"\n", 1)[0].decode(errors="replace").split()
             if len(parts) < 2:
                 return
             method, target = parts[0].upper(), parts[1]
@@ -132,28 +188,35 @@ class Gateway:
                 code = "200 OK" if target.startswith("/status") else "405 Method Not Allowed"
                 writer.write(f"HTTP/1.1 {code}\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}".encode())
                 await writer.drain(); return
-            host, _, port = target.rpartition(":")
-            host, port = host.strip("[]"), int(port or 443)
-            pol = self.policy_for(host)
-            if pol is None:
+            raw_host, _, raw_port = target.rpartition(":")
+            host = canonical_host(raw_host)
+            port = int(raw_port) if raw_port.isdigit() else -1
+            pol = self.policy_for(host) if host else None
+            if pol is None or port not in pol.get("ports", DEFAULT_PORTS):
                 self.rejected += 1
-                log.info("REJECT %s %s:%s (no policy)", peer[0], host, port)
+                log.info("REJECT %s %r:%s (%s)", peer[0], raw_host[:80], raw_port[:8],
+                         "bad host" if host is None else "no policy" if pol is None else "port")
                 writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"); await writer.drain(); return
             up = None
             for rn in pol["routes"]:
                 route = self.routes[rn]
                 if time.time() < route.down_until:
                     continue
-                if route.over_cap():
+                slot = route.reserve() if any(route.caps.values()) else 0.0
+                if slot is None:
                     route.capped += 1
                     log.info("route %s over rate cap, skipping for %s", rn, host)
                     continue
                 try:
                     up = await asyncio.wait_for(route.open(host, port), CONNECT_TIMEOUT)
-                    route.ok += 1; route.last_ok_at = time.time(); route.recent.append(time.time())
+                    route.ok += 1; route.last_ok_at = time.time()
+                    if not slot:
+                        route.recent.append(time.time())  # uncapped routes: usage stats only
                     log.info("OK %s %s:%s via %s [%s]", peer[0], host, port, rn, pol["name"])
                     break
                 except Exception as e:  # try next route
+                    if slot:
+                        route.refund(slot)
                     route.fail += 1; route.last_error = f"{type(e).__name__}: {e}"[:200]
                     route.down_until = time.time() + 30
                     log.warning("route %s failed for %s: %s", rn, host, route.last_error)
@@ -161,7 +224,8 @@ class Gateway:
                 writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"); await writer.drain(); return
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n"); await writer.drain()
             ur, uw = up
-            await asyncio.gather(_pipe(reader, uw), _pipe(ur, writer))
+            act = [time.monotonic()]  # shared last-activity: a tunnel is idle only when BOTH directions are
+            await asyncio.gather(_pipe(reader, uw, act), _pipe(ur, writer, act))
         except Exception as e:
             log.debug("conn error %s: %s", peer, e)
         finally:
@@ -169,13 +233,23 @@ class Gateway:
 
     def status(self) -> dict:
         return {"service": "fleet-egress", "uptime_s": int(time.time() - self.started), "rejected": self.rejected,
+                "busy_rejected": self.busy,
                 "policies": [{"name": p["name"], "match": p["match"], "routes": p["routes"]} for p in self.policies],
                 "routes": {n: r.status() for n, r in self.routes.items()}}
 
 
-async def _pipe(r, w):
+async def _pipe(r, w, act):
     try:
-        while data := await r.read(65536):
+        while True:
+            try:
+                data = await asyncio.wait_for(r.read(65536), 30)
+            except asyncio.TimeoutError:
+                if time.monotonic() - act[0] > IDLE_TIMEOUT:
+                    break
+                continue
+            if not data:
+                break
+            act[0] = time.monotonic()
             w.write(data); await w.drain()
     except Exception:
         pass

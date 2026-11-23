@@ -67,13 +67,19 @@ sudo install -d -m 0755 /opt/fleet-egress "$ETC"
 inst 0644 "$SRC_DIR/fleet_egress_gateway.py" /opt/fleet-egress/fleet_egress_gateway.py
 inst 0644 "$SRC_DIR/config.json" "$ETC/config.json"
 inst 0644 "$SRC_DIR/systemd/fleet-egress-gateway.service" /etc/systemd/system/fleet-egress-gateway.service
+before="$changed"; changed=0
 inst 0644 "$SRC_DIR/systemd/fleet-egress-tunnel@.service" /etc/systemd/system/fleet-egress-tunnel@.service
+tmpl_changed="$changed"   # template change => restart EVERY tunnel instance (not only the gateway)
+changed=$(( before | changed ))
 
 # Home-IP reserve tunnels (non-secret: ssh target + local SOCKS port), one per tunnels/<host>.env.
 tunnels=(); tchanged=()
 for t in "$SRC_DIR"/tunnels/*.env; do
   [[ -f "$t" ]] || continue
-  name="$(basename "$t" .env)"; tunnels+=("$name")
+  name="$(basename "$t" .env)"
+  # file name = registry host name (e.g. h-mini2.env); instance unit = fleet-egress-tunnel@<host>
+  if [[ ! "$name" =~ ^h-[a-z0-9-]+$ ]]; then warn "tunnels/$name.env: name must be a host name like h-mini2; skipped"; continue; fi
+  tunnels+=("$name")
   before="$changed"; changed=0
   inst 0644 "$t" "$ETC/tunnel-$name.env"
   [[ "$changed" == 1 ]] && tchanged+=("$name")
@@ -107,12 +113,16 @@ print("FLEET_EGRESS_PAID_PROXY_URL=http://%s:%s@p.webshare.io:80" % (q.quote(u +
   rm -f "$tmp"
 }
 render_secrets
+# Metadata is reconciled independently of content (and even when op failed): root:root 0600.
+if sudo test -e "$ETC/secrets.env"; then
+  sudo chown root:root "$ETC/secrets.env"; sudo chmod 0600 "$ETC/secrets.env"
+fi
 
 sudo systemctl daemon-reload
 sudo systemctl enable fleet-egress-gateway.service >/dev/null 2>&1 || true
 for name in "${tunnels[@]}"; do
   sudo systemctl enable "fleet-egress-tunnel@$name.service" >/dev/null 2>&1 || true
-  if [[ " ${tchanged[*]:-} " == *" $name "* ]] || ! systemctl is-active --quiet "fleet-egress-tunnel@$name.service"; then
+  if [[ "$tmpl_changed" == 1 || " ${tchanged[*]:-} " == *" $name "* ]] || ! systemctl is-active --quiet "fleet-egress-tunnel@$name.service"; then
     sudo systemctl restart "fleet-egress-tunnel@$name.service"
   fi
 done

@@ -128,6 +128,8 @@ def via_supadata(vid, langs, proxy, ai=False):
 
 def _fix_dash_ids(argv):
     # 11-char video ids may start with '-' (e.g. -j8PzkZ70Lg); argparse would read them as options.
+    if "--" in argv:  # caller already separated positionals
+        return argv
     out, ids = [], []
     for x in argv:
         if re.fullmatch(r"-[\w-]{10}", x) and not x.startswith("--"):

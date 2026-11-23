@@ -278,8 +278,9 @@ step_fleet_egress_client() {  # client half of lib/72-fleet-egress.sh, from comm
     | sed 's/^/    /' >&2 || { remote 'rm -f /tmp/fleet-egress-client.tgz'; die "fleet-egress client did not install for every account"; }
   remote 'rm -f /tmp/fleet-egress-client.tgz'
   local u; for u in "${users[@]}"; do
-    remote "runuser -u $(printf '%q' "$u") -- bash -lc 'test -x ~/.local/bin/fleet-yt-transcript && ~/.local/bin/fleet-egress status >/dev/null'" \
-      || die "$u: client not runnable or gateway unreachable"
+    # Execute it for real (uv shebang => proves uv + deps resolve for that account), then reach the gateway.
+    remote "runuser -u $(printf '%q' "$u") -- bash -lc 'export PATH=\$HOME/.local/bin:\$PATH; command -v uv >/dev/null && fleet-yt-transcript --help >/dev/null && fleet-egress status >/dev/null'" \
+      || die "$u: fleet-yt-transcript not runnable (uv missing?) or gateway unreachable"
   done
   evidence fleet_egress_client "\"${users[*]}\""
   commit_registry "fleet($HOST): fleet-egress client installed"
