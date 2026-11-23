@@ -122,7 +122,7 @@ if have op && [[ -f "$ENV_TEMPLATE" ]] && ! is_skipped op-resolve; then
         if op inject --force -i "$ENV_TEMPLATE_HOST" -o "$ENV_RESOLVED.host.tmp" 2>/dev/null; then
           overlay_keys=$( { grep -E '^[A-Z_][A-Z0-9_]*=' "$ENV_RESOLVED.host.tmp" || true; } | cut -d= -f1 | sort -u)
           if [[ -n "$overlay_keys" ]]; then
-            grep -vE "^($(echo "$overlay_keys" | paste -sd'|' -))=" "$ENV_RESOLVED.tmp" > "$ENV_RESOLVED.base.tmp" || true
+            ( umask 077; grep -vE "^($(echo "$overlay_keys" | paste -sd'|' -))=" "$ENV_RESOLVED.tmp" > "$ENV_RESOLVED.base.tmp" || true )
             mv -f "$ENV_RESOLVED.base.tmp" "$ENV_RESOLVED.tmp"
           fi
           {
