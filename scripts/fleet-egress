@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# fleet-egress — run any command with residential egress via the fleet-egress gateway.
+#   fleet-egress run -- yt-dlp ...        # env-proxied command
+#   fleet-egress status                   # gateway route health JSON
+#   fleet-egress url                      # print the proxy URL (for tools taking --proxy)
+# Only domains allowlisted in the gateway policy are proxied; others get 403.
+set -euo pipefail
+GW="${FLEET_EGRESS_PROXY:-http://100.122.202.37:3128}"
+case "${1:-}" in
+  url) echo "$GW" ;;
+  status) curl -s -m5 "$GW/status" ;;
+  run) shift; [ "${1:-}" = "--" ] && shift
+       export HTTPS_PROXY="$GW" https_proxy="$GW" HTTP_PROXY="$GW" http_proxy="$GW" ALL_PROXY="$GW"
+       exec "$@" ;;
+  *) sed -n '2,6p' "$0"; exit 64 ;;
+esac

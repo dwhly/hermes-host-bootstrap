@@ -1,0 +1,60 @@
+{
+  "listen": [
+    "100.122.202.37:3128",
+    "127.0.0.1:3128"
+  ],
+  "routes": {
+    "home-h-mini2": {
+      "type": "socks5",
+      "addr": "127.0.0.1:1081",
+      "ip_group": "dan-home",
+      "per_minute": 2,
+      "per_hour": 10,
+      "note": "LAST-RESORT reserve only (Dan 2026-11-22): protect household IP; never primary"
+    },
+    "home-h-mini": {
+      "type": "socks5",
+      "addr": "127.0.0.1:1082",
+      "ip_group": "dan-home",
+      "per_minute": 2,
+      "per_hour": 10,
+      "note": "LAST-RESORT reserve only (Dan 2026-11-22): protect household IP; never primary"
+    },
+    "paid-residential": {
+      "type": "http",
+      "url": "${FLEET_EGRESS_PAID_PROXY_URL}"
+    }
+  },
+  "policies": [
+    {
+      "name": "youtube",
+      "match": [
+        "youtube.com",
+        "youtu.be",
+        "googlevideo.com",
+        "ytimg.com",
+        "youtube-nocookie.com",
+        "youtubei.googleapis.com"
+      ],
+      "routes": [
+        "paid-residential",
+        "home-h-mini2",
+        "home-h-mini"
+      ]
+    },
+    {
+      "name": "residential-general",
+      "match": [
+        "ifconfig.me",
+        "api.ipify.org",
+        "reddit.com",
+        "redd.it"
+      ],
+      "routes": [
+        "paid-residential",
+        "home-h-mini2",
+        "home-h-mini"
+      ]
+    }
+  ]
+}

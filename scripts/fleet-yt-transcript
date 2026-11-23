@@ -1,0 +1,191 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["youtube-transcript-api>=1.2.4"]
+# ///
+"""fleet-yt-transcript — get a YouTube transcript from anywhere in the fleet.
+
+Strategy chain (first success wins; every attempt is reported on stderr with -v):
+  0. cache        ~/.cache/fleet/yt-transcripts/<id>.<lang>.json (transcripts don't change)
+  1. direct       youtube-transcript-api from this host (works on residential hosts)
+  2. egress       same, via the fleet-egress gateway (residential egress for cloud hosts)
+  3. yt-dlp       subtitles via yt-dlp through the gateway (independent extractor, if the
+                  library breaks on a YouTube change)
+  4. supadata     hosted transcript API if SUPADATA_API_KEY is set (incl. AI fallback for
+                  videos with no captions: --ai)
+Exit 0 + transcript on stdout, or exit 2 with a per-strategy failure report.
+Env: FLEET_EGRESS_PROXY (default http://100.122.202.37:3128), SUPADATA_API_KEY,
+     FLEET_YT_STRATEGIES (comma list to override order).
+"""
+from __future__ import annotations
+
+import argparse, glob, json, os, re, shutil, subprocess, sys, tempfile, time, urllib.parse, urllib.request
+from pathlib import Path
+
+EGRESS = os.environ.get("FLEET_EGRESS_PROXY", "http://100.122.202.37:3128")
+CACHE = Path(os.environ.get("FLEET_YT_CACHE", Path.home() / ".cache/fleet/yt-transcripts"))
+NO_CAPTIONS = "no-captions"  # terminal (not a block): the video genuinely has no transcript
+
+
+def video_id(s: str) -> str:
+    s = s.strip()
+    if re.fullmatch(r"[\w-]{11}", s):
+        return s
+    m = re.search(r"(?:v=|youtu\.be/|shorts/|embed/|live/|/v/)([\w-]{11})", s)
+    if not m:
+        raise SystemExit(f"cannot parse a YouTube video id from {s!r}")
+    return m.group(1)
+
+
+def via_library(vid, langs, proxy):
+    # On egress, a flagged exit IP shows up as RequestBlocked (the library retries those) OR as a
+    # redirect to google.com/sorry (a CAPTCHA) that the gateway refuses -> ProxyError. Retry that
+    # too: every new attempt = new CONNECT = new residential IP.
+    import requests
+    tries = int(os.environ.get("FLEET_YT_OUTER_RETRIES", "4")) if proxy else 1
+    for i in range(tries):
+        try:
+            return _via_library(vid, langs, proxy)
+        except (requests.exceptions.ProxyError, requests.exceptions.ConnectionError):
+            if i == tries - 1:
+                raise
+
+
+def _via_library(vid, langs, proxy):
+    from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
+    from youtube_transcript_api.proxies import GenericProxyConfig
+    class RotatingEgress(GenericProxyConfig):
+        # the gateway's paid upstream rotates IP per CONNECT: no keep-alive + retry on block = new IP each try
+        @property
+        def prevent_keeping_connections_alive(self):
+            return True
+
+        @property
+        def retries_when_blocked(self):
+            return int(os.environ.get("FLEET_YT_RETRIES", "4"))
+
+    api = YouTubeTranscriptApi(proxy_config=RotatingEgress(http_url=proxy, https_url=proxy) if proxy else None)
+    try:
+        tl = api.list(vid)
+        try:
+            t = tl.find_transcript(langs)
+        except NoTranscriptFound:
+            t = next(iter(tl))  # any language beats nothing; caller sees .language
+        f = t.fetch()
+        return {"language": f.language_code, "generated": f.is_generated,
+                "segments": [{"start": s.start, "duration": s.duration, "text": s.text} for s in f.snippets]}
+    except (TranscriptsDisabled, StopIteration):
+        raise LookupError(NO_CAPTIONS)
+
+
+def via_ytdlp(vid, langs, proxy):
+    exe = shutil.which("yt-dlp")
+    cmd = [exe] if exe else (["uvx", "yt-dlp"] if shutil.which("uvx") else None)
+    if not cmd:
+        raise RuntimeError("yt-dlp/uvx not installed")
+    with tempfile.TemporaryDirectory() as d:
+        args = cmd + ["--skip-download", "--write-subs", "--write-auto-subs", "--sub-format", "json3",
+                      "--sub-langs", ",".join(langs), "-o", f"{d}/%(id)s", "--no-warnings", "-q"]
+        if proxy:
+            args += ["--proxy", proxy]
+        if shutil.which("node") and not shutil.which("deno"):
+            args += ["--js-runtimes", "node"]
+        p = subprocess.run(args + [f"https://www.youtube.com/watch?v={vid}"], capture_output=True, text=True, timeout=180)
+        files = sorted(glob.glob(f"{d}/*.json3"))
+        if not files:
+            raise RuntimeError((p.stderr or "no subtitle file").strip().splitlines()[-1][:200])
+        f = files[0]
+        lang = f.rsplit(".", 2)[-2]
+        segs = []
+        for ev in json.load(open(f)).get("events", []):
+            txt = "".join(x.get("utf8", "") for x in ev.get("segs") or []).strip()
+            if txt:
+                segs.append({"start": ev.get("tStartMs", 0) / 1000, "duration": ev.get("dDurationMs", 0) / 1000, "text": txt})
+        return {"language": lang, "generated": None, "segments": segs}
+
+
+def via_supadata(vid, langs, proxy, ai=False):
+    key = os.environ.get("SUPADATA_API_KEY")
+    if not key:
+        raise RuntimeError("SUPADATA_API_KEY not set (skipped)")
+    q = urllib.parse.urlencode({"url": f"https://www.youtube.com/watch?v={vid}", "lang": langs[0],
+                                "text": "false", "mode": "auto" if ai else "native"})
+    req = urllib.request.Request(f"https://api.supadata.ai/v1/transcript?{q}", headers={"x-api-key": key})
+    d = json.load(urllib.request.urlopen(req, timeout=120))
+    if "jobId" in d:  # async job for long/AI transcripts
+        for _ in range(60):
+            time.sleep(5)
+            d = json.load(urllib.request.urlopen(urllib.request.Request(
+                f"https://api.supadata.ai/v1/transcript/{d['jobId']}", headers={"x-api-key": key}), timeout=60))
+            if d.get("status") in ("completed", None) and "content" in d:
+                break
+    segs = [{"start": c.get("offset", 0) / 1000, "duration": c.get("duration", 0) / 1000, "text": c.get("text", "")}
+            for c in d.get("content", [])]
+    if not segs:
+        raise RuntimeError(f"supadata: empty ({str(d)[:150]})")
+    return {"language": d.get("lang"), "generated": None, "segments": segs}
+
+
+def _fix_dash_ids(argv):
+    # 11-char video ids may start with '-' (e.g. -j8PzkZ70Lg); argparse would read them as options.
+    out, ids = [], []
+    for x in argv:
+        if re.fullmatch(r"-[\w-]{10}", x) and not x.startswith("--"):
+            ids.append(x)
+        else:
+            out.append(x)
+    return out + (["--"] + ids if ids else [])
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("video")
+    ap.add_argument("--language", default="en", help="comma preference list, e.g. en,de")
+    ap.add_argument("--format", choices=["text", "timestamps", "json"], default="text")
+    ap.add_argument("--no-cache", action="store_true")
+    ap.add_argument("--ai", action="store_true", help="allow paid AI transcription when no captions (supadata)")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    a = ap.parse_args(_fix_dash_ids(sys.argv[1:]))
+    vid, langs = video_id(a.video), [l.strip() for l in a.language.split(",") if l.strip()]
+    cache_f = CACHE / f"{vid}.{langs[0]}.json"
+    log = (lambda m: print(f"[fleet-yt] {m}", file=sys.stderr)) if a.verbose else (lambda m: None)
+
+    result, report = None, []
+    if not a.no_cache and cache_f.exists():
+        result = json.load(open(cache_f)); result["strategy"] = "cache"; log("cache hit")
+    order = os.environ.get("FLEET_YT_STRATEGIES", "direct,egress,ytdlp,supadata").split(",")
+    plan = {"direct": lambda: via_library(vid, langs, None),
+            "egress": lambda: via_library(vid, langs, EGRESS),
+            "ytdlp": lambda: via_ytdlp(vid, langs, EGRESS),
+            "supadata": lambda: via_supadata(vid, langs, None, a.ai)}
+    for name in ([] if result else order):
+        t0 = time.time()
+        try:
+            result = plan[name.strip()]()
+            result["strategy"] = name; log(f"{name}: OK in {time.time()-t0:.1f}s"); break
+        except LookupError as e:
+            report.append(f"{name}: video has no captions"); log(report[-1])
+            if not a.ai:
+                break  # definitive answer; don't burn other strategies (with --ai, supadata may still generate one)
+        except Exception as e:
+            report.append(f"{name}: {type(e).__name__}: {str(e).strip().splitlines()[0][:160] if str(e).strip() else ''}")
+            log(report[-1])
+    if not result:
+        print("fleet-yt-transcript: FAILED for " + vid + "\n  " + "\n  ".join(report), file=sys.stderr)
+        sys.exit(3 if report and all("no captions" in r for r in report) else 2)
+    if result.get("strategy") != "cache":
+        CACHE.mkdir(parents=True, exist_ok=True)
+        json.dump({k: v for k, v in result.items() if k != "strategy"} | {"video_id": vid, "fetched_at": int(time.time())},
+                  open(cache_f, "w"))
+    if a.format == "json":
+        print(json.dumps(result | {"video_id": vid}, ensure_ascii=False))
+    elif a.format == "timestamps":
+        for s in result["segments"]:
+            m, sec = divmod(int(s["start"]), 60); h, m = divmod(m, 60)
+            print(f"{h:d}:{m:02d}:{sec:02d} {s['text']}" if h else f"{m:02d}:{sec:02d} {s['text']}")
+    else:
+        print(" ".join(s["text"].replace("\n", " ") for s in result["segments"]))
+
+
+if __name__ == "__main__":
+    main()

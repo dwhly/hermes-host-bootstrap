@@ -1,0 +1,17 @@
+[Unit]
+Description=fleet-egress gateway (allowlisting CONNECT proxy, residential egress for bot-walled sites)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=-/etc/fleet-egress/secrets.env
+ExecStart=/usr/bin/python3 /opt/fleet-egress/fleet_egress_gateway.py /etc/fleet-egress/config.json
+Restart=always
+RestartSec=5
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -10,7 +10,7 @@
 #
 #   fleet-enroll-existing <host> <tailnet_ip> [steps...]
 #
-# Steps (default = all of: preflight backup prep registry telemetry hmw-target verify):
+# Steps (default = all of: preflight backup prep registry telemetry hmw-target fleet-egress-client verify):
 #   preflight    reachability, identity, record running-service fingerprint (PIDs, cron jobs)
 #   backup       protected backup on the target (/var/backups/hermes-fleet/<host>-enrollment-*)
 #   prep         pin hostname against cloud-init, /etc/hosts, swap on small hosts
@@ -19,6 +19,8 @@
 #   hmw-target   herdr + workspace helpers so `hmw <host>` works (then runs shell-aliases)
 #   shell-aliases  fleet aliases (hm, hmw, hmx...) for the SSH user + registry `shell_users: "a b"`;
 #                  touches only the alias file + rc source lines, never helpers or services
+#   fleet-egress-client  fleet-yt-transcript + fleet-egress commands and the youtube-transcripts skill for
+#                  the SSH user + registry shell_users (lib/72-fleet-egress.sh's client half; never services)
 #   cli-tools    (optional) 1Password CLI + GitHub CLI from official apt repos — no credentials
 #   client:<c>   authorize client <c>'s key, give it the registry entry + pinned host key, prove hmw
 #   verify       prove the node's pre-existing services survived untouched + smoke-ok
@@ -37,7 +39,7 @@ fi
 HOST="${1:?usage: fleet-enroll-existing <host> <tailnet_ip> [steps...]}"
 IP="${2:?usage: fleet-enroll-existing <host> <tailnet_ip> [steps...]}"
 shift 2
-STEPS=("$@"); [[ ${#STEPS[@]} -eq 0 ]] && STEPS=(preflight backup prep registry telemetry hmw-target verify)
+STEPS=("$@"); [[ ${#STEPS[@]} -eq 0 ]] && STEPS=(preflight backup prep registry telemetry hmw-target fleet-egress-client verify)
 
 USER_="${ENROLL_SSH_USER:-root}"
 TGT="${USER_}@${IP}"
@@ -253,6 +255,36 @@ step_shell_aliases() {  # fleet shell aliases for the SSH user + registry shell_
   evidence shell_aliases "\"${users[*]}\""
 }
 
+step_fleet_egress_client() {  # client half of lib/72-fleet-egress.sh, from committed sources only
+  local skill="$CFG/skills/media/youtube-transcripts/SKILL.md"
+  [[ -f "$skill" ]] || die "missing $skill (hermes-config)"
+  [[ -z "$(git -C "$REPO" status --porcelain -- scripts/fleet-yt-transcript scripts/fleet-egress)" ]] \
+    || die "fleet-egress client scripts have uncommitted changes — commit them first"
+  [[ -z "$(git -C "$CFG" status --porcelain -- skills/media/youtube-transcripts)" ]] \
+    || die "youtube-transcripts skill has uncommitted changes in hermes-config — commit it first"
+  local tmp; tmp="$(mktemp -d)"
+  mkdir -p "$tmp/p/bin" "$tmp/p/skill"
+  git -C "$REPO" show HEAD:scripts/fleet-yt-transcript >"$tmp/p/bin/fleet-yt-transcript"
+  git -C "$REPO" show HEAD:scripts/fleet-egress >"$tmp/p/bin/fleet-egress"
+  git -C "$CFG" show HEAD:skills/media/youtube-transcripts/SKILL.md >"$tmp/p/skill/SKILL.md"
+  printf 'bootstrap=%s\nhermes_config=%s\nbuilt=%s\n' "$(git -C "$REPO" rev-parse --short HEAD)" \
+    "$(git -C "$CFG" rev-parse --short HEAD)" "$(date -u +%FT%TZ)" >"$tmp/p/PROVENANCE"
+  tar -czf "$tmp/payload.tgz" -C "$tmp/p" .
+  scp -q -o BatchMode=yes "$tmp/payload.tgz" "$TGT:/tmp/fleet-egress-client.tgz"
+  rm -rf "$tmp"
+  local users; mapfile -t users < <(shell_alias_users)
+  log "fleet-egress client for: ${users[*]}"
+  run_remote_script "$REPO/scripts/fleet-enroll/remote-fleet-egress-client.sh" /tmp/fleet-egress-client.tgz "${users[@]}" \
+    | sed 's/^/    /' >&2 || { remote 'rm -f /tmp/fleet-egress-client.tgz'; die "fleet-egress client did not install for every account"; }
+  remote 'rm -f /tmp/fleet-egress-client.tgz'
+  local u; for u in "${users[@]}"; do
+    remote "runuser -u $(printf '%q' "$u") -- bash -lc 'test -x ~/.local/bin/fleet-yt-transcript && ~/.local/bin/fleet-egress status >/dev/null'" \
+      || die "$u: client not runnable or gateway unreachable"
+  done
+  evidence fleet_egress_client "\"${users[*]}\""
+  commit_registry "fleet($HOST): fleet-egress client installed"
+}
+
 step_client() {  # client:<name>
   local c="$1" cy="$CFG/hosts/$1.yaml"
   [[ -f "$cy" ]] || die "no registry entry for client $c"
@@ -305,6 +337,7 @@ for STEP in "${STEPS[@]}"; do
     preflight) step_preflight ;; backup) step_backup ;; prep) step_prep ;;
     registry) step_registry ;; telemetry) step_telemetry ;; hmw-target) step_hmw_target ;;
     cli-tools) step_cli_tools ;; shell-aliases) step_shell_aliases ;;
+    fleet-egress-client) step_fleet_egress_client ;;
     client:*) step_client "${STEP#client:}" ;; verify) step_verify ;;
     *) die "unknown step" ;;
   esac
