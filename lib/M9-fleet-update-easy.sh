@@ -39,6 +39,9 @@ else
     h-do1) ;;
     h-af|h-btp)
       # Preserved hosts: fail closed unless their own ~/.hermes is marked protected.
+      # The timer runs as root (HOME=/root) and only reads /root/.hermes, this bootstrap checkout and
+      # /root/code/hermes-automation-wiki. Other users' homes (h-btp: /home/hermes) are never inspected,
+      # so the root marker covers every ~/.hermes this job could touch.
       if [[ ! -f "$HOME/.config/fleet-update/preserve-hermes-config" ]]; then
         skip "fleet-update-easy: preserved host without ~/.config/fleet-update/preserve-hermes-config"
         exit 0

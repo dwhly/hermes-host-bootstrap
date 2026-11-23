@@ -959,28 +959,39 @@ def test_native_remains_updatable_after_offline_rollback(fleet):
     assert fleet.row()['result'] == 'updated 1.0.0->2.0.0'
 
 
-@pytest.mark.parametrize("has_home", [True, False])
-def test_module_linux_installs_for_another_user(module, tmp_path, has_home):
+@pytest.mark.parametrize("case", ["installs", "no_home", "running"])
+def test_module_linux_installs_for_another_user(module, tmp_path, case):
     _, home, env = module
     other = tmp_path / "other-home"
-    if has_home:
+    if case != "no_home":
         other.mkdir()
     bins = Path(env["PATH"].split(":")[0])
     executable(bins / "getent", '#!/bin/sh\n[ "$2" = clihost ] && echo "clihost:x:4242:4242::' + str(other) + ':/bin/sh"\n')
-    executable(bins / "chown", '#!/bin/sh\nprintf "chown %s\\n" "$*" >> "$TEST_CALLS"\n')
+    # Record every runuser call, then run the command (tests cannot switch users).
+    executable(bins / "runuser", '#!/bin/sh\nprintf "runuser %s\\n" "$*" >> "$TEST_CALLS"\nshift 3\nexec "$@"\n')
+    executable(bins / "systemctl", '#!/bin/sh\nprintf "%s\\n" "$*" >> "$TEST_CALLS"\n'
+               'if [ "$1" = is-active ]; then [ -n "$TEST_ACTIVE" ]; exit $?; fi\n')
     env.update(TEST_OS="Linux", FLEET_TOOLS_USER="clihost")
-    result = bootstrap(module, "--role=server")
+    if case == "running":
+        env["TEST_ACTIVE"] = "1"
+    result = command(["bash", module[0] / "bootstrap.sh", "--only=N0-fleet-update-tools", "--role=server"], env)
+    output = result.stdout + result.stderr
     service = Path(env["HERMES_SYSTEMD_DIR"]) / "hermes-fleet-update-tools.service"
     if os.getuid() != 0:
-        assert not service.exists() and "requires root" in result.stdout + result.stderr
+        assert not service.exists() and "requires root" in output
         return
-    if not has_home:
-        assert not service.exists() and "has no home" in result.stdout + result.stderr
+    if case == "no_home":
+        assert not service.exists() and "has no home" in output
+        return
+    calls = Path(env["TEST_CALLS"]).read_text()
+    assert "runuser -u clihost -- mkdir -p " + str(other / ".local/bin") in calls
+    assert "runuser -u clihost -- ln -s " in calls
+    assert not (other / ".local/state/fleet-update-tools/lock").exists()  # root never opens it
+    assert not (home / ".local/bin/fleet-update-tools").exists()
+    assert (other / ".local/bin/fleet-update-tools").is_symlink()
+    if case == "running":
+        assert not service.exists() and "is running; skipping reload" in output
         return
     text = service.read_text()
     assert "User=clihost\n" in text and 'Environment="HOME=' + str(other) + '"' in text
-    assert (other / ".local/bin/fleet-update-tools").is_symlink()
-    assert not (home / ".local/bin/fleet-update-tools").exists()
-    calls = Path(env["TEST_CALLS"]).read_text()
-    assert "chown clihost: " + str(other / ".local/state/fleet-update-tools") in calls
-    assert "chown -h clihost: " + str(other / ".local/bin/fleet-update-tools") in calls
+    assert "daemon-reload" in calls and "start hermes-fleet-update-tools.timer" in calls

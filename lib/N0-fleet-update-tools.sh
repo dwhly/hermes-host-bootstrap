@@ -49,8 +49,10 @@ fi
 script="$REPO_ROOT/scripts/fleet-update-tools"
 bash -n "$script"
 # Linux: root may install the job for the user who owns the CLIs (h-btp: hermes, which has no sudo).
+# Everything inside that user's home runs AS that user (runuser), so root never follows links they control.
 tools_user="$(id -un)"
 tools_home="$HOME"
+as_tools_user() { "$@"; }
 if [[ "$OS" != macos && -n "${FLEET_TOOLS_USER:-}" && "$FLEET_TOOLS_USER" != "$tools_user" ]]; then
   if [[ "$(id -u)" != 0 ]]; then
     warn "fleet-update-tools: FLEET_TOOLS_USER requires root; skipping"
@@ -62,16 +64,17 @@ if [[ "$OS" != macos && -n "${FLEET_TOOLS_USER:-}" && "$FLEET_TOOLS_USER" != "$t
     exit 0
   fi
   tools_user="$FLEET_TOOLS_USER"
+  as_tools_user() { runuser -u "$tools_user" -- "$@"; }
+  if ! as_tools_user test -r "$script"; then
+    warn "fleet-update-tools: $tools_user cannot read $script; skipping"
+    exit 0
+  fi
 fi
-for dir in "$tools_home/.local" "$tools_home/.local/bin" "$tools_home/.local/state" "$tools_home/.local/state/fleet-update-tools"; do
-  [[ -d "$dir" ]] || install -d -m 0755 "$dir"
-  [[ "$tools_user" == "$(id -un)" ]] || chown "$tools_user:" "$dir"
-done
+as_tools_user mkdir -p "$tools_home/.local/bin" "$tools_home/.local/state/fleet-update-tools"
 target="$tools_home/.local/bin/fleet-update-tools"
-if [[ ! -L "$target" || "$(readlink "$target")" != "$script" ]]; then
-  rm -f "$target"
-  ln -s "$script" "$target"
-  [[ "$tools_user" == "$(id -un)" ]] || chown -h "$tools_user:" "$target"
+if ! as_tools_user test -L "$target" || [[ "$(as_tools_user readlink "$target")" != "$script" ]]; then
+  as_tools_user rm -f "$target"
+  as_tools_user ln -s "$script" "$target"
 fi
 
 tmp="$(mktemp -d)"
@@ -169,10 +172,19 @@ UNIT
     fi
   done
   if [[ "$changed" == 1 ]]; then
-    exec 8>>"$tools_home/.local/state/fleet-update-tools/lock"
-    if ! perl -MFcntl=:flock -e 'open(my $f, ">>&=", 8) or exit 2; $SIG{ALRM} = sub { exit 1 }; alarm 300; flock($f, LOCK_EX) or exit 2; alarm 0;'; then
-      warn "$unit updater lock unavailable after waiting up to 300 s; skipping reload"
-      exit 0
+    if [[ "$tools_user" != "$(id -un)" ]]; then
+      # Never open a path in another user's home as root; the unit's own state says whether a run is live.
+      if $SUDO systemctl is-active --quiet "$unit.service"; then
+        warn "$unit is running; skipping reload"
+        exit 0
+      fi
+      exec 8>/dev/null
+    else
+      exec 8>>"$tools_home/.local/state/fleet-update-tools/lock"
+      if ! perl -MFcntl=:flock -e 'open(my $f, ">>&=", 8) or exit 2; $SIG{ALRM} = sub { exit 1 }; alarm 300; flock($f, LOCK_EX) or exit 2; alarm 0;'; then
+        warn "$unit updater lock unavailable after waiting up to 300 s; skipping reload"
+        exit 0
+      fi
     fi
     $SUDO install -d -m 0755 "$systemd_dir"
     for kind in service timer; do
