@@ -45,7 +45,7 @@ any fleet host ──HTTPS_PROXY──▶ fleet-egress gateway (h-do1 100.122.20
 - `fleet-egress/systemd/*.service` — gateway + `fleet-egress-tunnel@<host>` (ssh -D home reserve).
 - `fleet-egress/tunnels/<host>.env` — non-secret tunnel targets (ssh target + local SOCKS port).
 - `scripts/fleet-egress` — `fleet-egress run -- <cmd>` / `status` / `url` (general consumer).
-- `scripts/fleet-yt-transcript` — cache → direct → egress → yt-dlp → Supadata (`SUPADATA_API_KEY`).
+- `scripts/fleet-yt-transcript` — cache → egress → yt-dlp (via egress) → Supadata (`SUPADATA_API_KEY`); `direct` (this host's own IP) is opt-in only via `FLEET_YT_STRATEGIES` (home-IP policy).
 - `lib/72-fleet-egress.sh` — installs the client on every host; on the boss (owns 100.122.202.37) also
   the gateway, tunnels, and `/etc/fleet-egress/secrets.env` rebuilt from 1Password
   (`op://hermes/Webshare/proxy_username` + `-rotate`, `proxy_password`; kept as-is if op is unavailable).
