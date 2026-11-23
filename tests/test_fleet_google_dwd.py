@@ -183,7 +183,7 @@ def test_repo_btp_config_is_exactly_the_brief():
     c = yaml.safe_load((CFG_SRC / "companies" / "btp.yaml").read_text())
     assert c["allowed_subjects"] == ["dwhaley@btpautomation.com"]
     assert c["smoke_subject"] == "dwhaley@btpautomation.com"
-    assert c["op_vault"] == "BTP Automation Agent" and c["op_item"] == "Google Service Account BTP"
+    assert c["op_vault"] == "iyktnqfzgmtz2uciqo5dmdxfwe" and c["op_item"] == "vv7olza4h5wc7kemplkdu4gv7a"   # vault "Agent", Document "Google Service Account BTP"
     assert c["op_token_file"] == "/home/hermes/.config/btp/op_sa_token"
     assert c["audit_log"] == "/home/hermes/.hermes/google-workspace/dwd_audit.log"
     assert c["run_as"] == {"user": "hermes", "home": "/home/hermes"}
