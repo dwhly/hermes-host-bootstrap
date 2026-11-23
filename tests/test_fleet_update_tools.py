@@ -463,7 +463,7 @@ def test_module_mac_calendar_idempotent_reload(module):
     data = plistlib.loads(plist.read_bytes())
     assert data["StartCalendarInterval"] == {"Hour": 3, "Minute": 41}
     assert "StartInterval" not in data and "RunAtLoad" not in data
-    assert data["ExitTimeOut"] == 900
+    assert data["ExitTimeOut"] == 1200
     assert data["ProgramArguments"] == ["/bin/bash", str(repo / "scripts/fleet-update-tools")]
     state = home / ".local/state/fleet-update-tools"
     assert Path(data["StandardOutPath"]).parent == state
@@ -578,7 +578,7 @@ def test_module_linux_units_idempotent(module):
     service = units / "hermes-fleet-update-tools.service"
     timer = units / "hermes-fleet-update-tools.timer"
     assert "User=" + __import__("pwd").getpwuid(os.getuid()).pw_name + "\n" in service.read_text()
-    assert "TimeoutStartSec=infinity\nTimeoutStopSec=15min\nKillMode=mixed\n" in service.read_text()
+    assert "TimeoutStartSec=2h\nTimeoutStopSec=20min\nKillMode=mixed\n" in service.read_text()
     assert str(repo / "scripts/fleet-update-tools") in service.read_text()
     assert "OnCalendar=*-*-* 03:41:00\n" in timer.read_text()
     assert "Persistent=true\n" in timer.read_text()
