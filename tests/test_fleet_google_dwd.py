@@ -168,6 +168,10 @@ def env(tmp_path, monkeypatch):
             os.chmod(tf, 0o600)
         (fop / "item").write_text(str(c.get("op_item")))
         (fop / "vault").write_text(str(c.get("op_vault")))
+        if c.get("op_field") is not None:
+            (fop / "field").write_text(str(c["op_field"]))
+        elif (fop / "field").exists():
+            (fop / "field").unlink()
         return c
     e.write_cfg = write_cfg
     e.op_calls = lambda: (fop / "calls.log").read_text().splitlines() if (fop / "calls.log").exists() else []
@@ -183,8 +187,9 @@ def test_repo_btp_config_is_exactly_the_brief():
     c = yaml.safe_load((CFG_SRC / "companies" / "btp.yaml").read_text())
     assert c["allowed_subjects"] == ["dwhaley@btpautomation.com"]
     assert c["smoke_subject"] == "dwhaley@btpautomation.com"
-    assert c["op_vault"] == "iyktnqfzgmtz2uciqo5dmdxfwe" and c["op_item"] == "vv7olza4h5wc7kemplkdu4gv7a"   # vault "Agent", Document "Google Service Account BTP"
-    assert c["op_token_file"] == "/home/hermes/.config/btp/op_sa_token"
+    assert c["op_vault"] == "iyktnqfzgmtz2uciqo5dmdxfwe" and c["op_item"] == "vv7olza4h5wc7kemplkdu4gv7a"   # vault "Agent", item "Google Service Account BTP"
+    assert c["op_field"] == "JSON"   # API Credential item; the key is pasted in field "JSON"
+    assert c["op_token_file"] == "/home/hermes/.op_sa_token"
     assert c["audit_log"] == "/home/hermes/.hermes/google-workspace/dwd_audit.log"
     assert c["run_as"] == {"user": "hermes", "home": "/home/hermes"}
     assert not c["allowed_domains"] and not c["docs_only_subjects"] and "policy" not in c
@@ -855,3 +860,43 @@ def test_installer_holds_without_go(tmp_path):
         assert r.returncode == 0, r.stderr
         assert ("ROLLOUT is not go" in r.stdout + r.stderr) or ("not a Google DWD node" in r.stdout + r.stderr)
         assert "installed" not in r.stdout
+
+
+# --- op_field: key pasted as text in a field of a non-Document item (BTP's API Credential "JSON") ---------------
+def test_op_field_mode_reads_key_from_field(env):
+    env.write_cfg("btp", op_field="JSON")
+    env.mod.configure("btp")
+    k = env.mod._load_key()
+    assert k["type"] == "service_account" and k["client_email"] == env.sa["client_email"]
+    call = env.op_calls()[-1].split()
+    assert call[:2] == ["item", "get"] and "label=JSON" in call and "--reveal" in call and call[-2:] == ["--format", "json"]
+
+
+def test_op_field_mode_rejects_plain_csv_quoted_output(env):
+    env.write_cfg("btp", op_field="JSON")
+    (env.fop / "raw-field-output").write_text('"{""type"": ""service_account""}"\n')
+    env.mod.configure("btp")
+    with pytest.raises(RuntimeError, match="not a JSON service-account key"):
+        env.mod._load_key()
+
+
+def test_op_field_mode_rejects_wrong_label(env):
+    env.write_cfg("btp", op_field="JSON")
+    (env.fop / "raw-field-output").write_text(json.dumps({"label": "notes", "value": (env.fop / "key.json").read_text()}))
+    env.mod.configure("btp")
+    with pytest.raises(RuntimeError, match="not a JSON service-account key"):
+        env.mod._load_key()
+
+
+@pytest.mark.parametrize("bad", ["", "JSON;rm", "label=JSON", "x" * 41, 7])
+def test_op_field_must_be_a_plain_label(env, bad):
+    env.write_cfg("btp", op_field=bad)
+    with pytest.raises(env.mod.ConfigError, match="op_field"):
+        env.mod.configure("btp")
+
+
+def test_document_mode_unchanged_when_no_op_field(env):
+    env.write_cfg("btp", op_field=None)
+    env.mod.configure("btp")
+    env.mod._load_key()
+    assert env.op_calls()[-1].split()[:2] == ["document", "get"]

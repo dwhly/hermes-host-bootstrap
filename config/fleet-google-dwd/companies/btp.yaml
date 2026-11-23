@@ -2,8 +2,9 @@
 # Installed root:root 0644 as /etc/fleet-google-dwd/btp.yaml by lib/63-fleet-google-dwd.sh.
 company: btp
 op_vault: iyktnqfzgmtz2uciqo5dmdxfwe   # vault "Agent" (shown as BTP Automation > Agent); by ID so a rename cannot break it
-op_item: vv7olza4h5wc7kemplkdu4gv7a    # Document "Google Service Account BTP" (hermes-dwd SA JSON key)
-op_token_file: /home/hermes/.config/btp/op_sa_token   # owner step: hermes:hermes 0600, a 1Password SA that can read vault Agent
+op_item: vv7olza4h5wc7kemplkdu4gv7a    # API Credential "Google Service Account BTP"; the SA JSON key is pasted in its field "JSON"
+op_field: JSON
+op_token_file: /home/hermes/.op_sa_token   # h-btp's existing 1Password SA token (sees vault Agent, read+write); hermes 0600
 run_as:
   user: hermes
   home: /home/hermes

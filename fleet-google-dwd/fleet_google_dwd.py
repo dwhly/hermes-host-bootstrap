@@ -56,7 +56,7 @@ G = "https://gmail.googleapis.com/gmail/v1/users/me"
 
 _CONFIG_KEYS = {"company", "op_vault", "op_item", "op_token_file", "run_as", "allowed_subjects",
                 "allowed_domains", "docs_only_subjects", "scopes", "audit_log", "draft_ledger",
-                "smoke_subject", "policy"}
+                "smoke_subject", "policy", "op_field"}
 _REQUIRED_KEYS = {"company", "op_vault", "op_item", "op_token_file", "run_as", "allowed_subjects",
                   "scopes", "audit_log", "draft_ledger", "smoke_subject"}
 _NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
@@ -69,6 +69,7 @@ CONFIG_PATH: Path | None = None
 OP_TOKEN_FILE: Path | None = None
 OP_VAULT: str | None = None
 OP_ITEM_ID: str | None = None
+OP_FIELD: str | None = None
 AUDIT_LOG: Path | None = None
 DRAFT_LEDGER: Path | None = None
 RUN_AS_USER: str | None = None
@@ -176,6 +177,9 @@ def _load_config(company: str) -> dict:
         raise ConfigError(f"config company {cfg['company']!r} != file name {company!r}")
     out = {"company": company, "op_vault": _str(cfg, "op_vault"), "op_item": _str(cfg, "op_item"),
            "op_token_file": Path(_str(cfg, "op_token_file", path=True)),
+           # op_field: the key is pasted as text in this field of a non-Document item (e.g. API Credential "JSON").
+           # Absent = the item is a Document holding the key file (AmForge).
+           "op_field": _op_field(cfg),
            "audit_log": Path(_str(cfg, "audit_log", path=True)),
            "draft_ledger": Path(_str(cfg, "draft_ledger", path=True)),
            "allowed_subjects": _emails(cfg, "allowed_subjects", required=True),
@@ -227,7 +231,7 @@ def _load_policy(pol: dict):
 
 def configure(company: str | None = None) -> str:
     """Load CONFIG_DIR/<company>.yaml (default: the name in CONFIG_DIR/host-company). Fails closed."""
-    global COMPANY, CONFIG_PATH, OP_TOKEN_FILE, OP_VAULT, OP_ITEM_ID, AUDIT_LOG, DRAFT_LEDGER, RUN_AS_USER
+    global COMPANY, CONFIG_PATH, OP_TOKEN_FILE, OP_VAULT, OP_ITEM_ID, OP_FIELD, AUDIT_LOG, DRAFT_LEDGER, RUN_AS_USER
     global RUN_AS_HOME, SMOKE_SUBJECT, ALLOWED_SUBJECTS, ALLOWED_DOMAINS, DOCS_ONLY_SUBJECTS
     global SYSTEM_READ_SUBJECTS, SCOPES_READ, _policy, _key_cache, _tok_cache
     if company is None:
@@ -246,11 +250,11 @@ def configure(company: str | None = None) -> str:
             if not n:
                 raise ConfigError(f"policy SYSTEM_READ_SUBJECTS has a bad address {e!r}")
             sys_read.add(n)
-    ident = (company, c["op_vault"], c["op_item"], str(c["op_token_file"]))
-    if ident != (COMPANY, OP_VAULT, OP_ITEM_ID, str(OP_TOKEN_FILE) if OP_TOKEN_FILE else None):
+    ident = (company, c["op_vault"], c["op_item"], str(c["op_token_file"]), c["op_field"])
+    if ident != (COMPANY, OP_VAULT, OP_ITEM_ID, str(OP_TOKEN_FILE) if OP_TOKEN_FILE else None, OP_FIELD):
         _key_cache, _tok_cache = None, {}      # a different company or credential: nothing carries over
     COMPANY, CONFIG_PATH = company, CONFIG_DIR / f"{company}.yaml"
-    OP_TOKEN_FILE, OP_VAULT, OP_ITEM_ID = c["op_token_file"], c["op_vault"], c["op_item"]
+    OP_TOKEN_FILE, OP_VAULT, OP_ITEM_ID, OP_FIELD = c["op_token_file"], c["op_vault"], c["op_item"], c["op_field"]
     AUDIT_LOG, DRAFT_LEDGER = c["audit_log"], c["draft_ledger"]
     RUN_AS_USER, RUN_AS_HOME, SMOKE_SUBJECT = c["run_as_user"], c["run_as_home"], c["smoke_subject"]
     ALLOWED_SUBJECTS, ALLOWED_DOMAINS = c["allowed_subjects"], c["allowed_domains"]
@@ -375,6 +379,18 @@ def _read_op_token() -> str:
     return tok
 
 
+_FIELD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _-]{0,39}")
+
+
+def _op_field(cfg):
+    f = cfg.get("op_field")
+    if f is None:
+        return None
+    if not isinstance(f, str) or not _FIELD_RE.fullmatch(f):
+        raise ConfigError("op_field: must be a plain field label (letters, digits, space, _ or -)")
+    return f
+
+
 def _load_key() -> dict:
     global _key_cache
     _ensure()
@@ -382,7 +398,10 @@ def _load_key() -> dict:
         tok = _read_op_token()
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": RUN_AS_HOME,
                "OP_SERVICE_ACCOUNT_TOKEN": tok}
-        r = subprocess.run(["op", "document", "get", OP_ITEM_ID, "--vault", OP_VAULT],
+        argv = (["op", "document", "get", OP_ITEM_ID, "--vault", OP_VAULT] if OP_FIELD is None else
+                ["op", "item", "get", OP_ITEM_ID, "--vault", OP_VAULT, "--fields", f"label={OP_FIELD}",
+                 "--reveal", "--format", "json"])
+        r = subprocess.run(argv,
                            env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
         del tok, env
         if r.returncode != 0:
@@ -395,7 +414,16 @@ def _load_key() -> dict:
             del err
             raise RuntimeError(f"1Password fetch failed (op exit {r.returncode}: {why})")
         try:
-            k = json.loads(r.stdout)
+            raw = r.stdout
+            if OP_FIELD is not None:
+                # `op item get --fields --format json` wraps the field: {"label": ..., "value": "<key json>"}.
+                # (Plain `--fields` output CSV-quotes multi-line values, so it is never parsed.)
+                outer = json.loads(raw)
+                raw = outer.get("value") if isinstance(outer, dict) and outer.get("label") == OP_FIELD else None
+                if not isinstance(raw, str):
+                    raise ValueError
+            k = json.loads(raw)
+            del raw
         except ValueError:
             raise RuntimeError("1Password item is not a JSON service-account key") from None
         if not isinstance(k, dict) or k.get("type") != "service_account":

@@ -5,6 +5,16 @@ d="$HOME/fake-op"
 printf '%s\n' "$*" >> "$d/calls.log"
 env | cut -d= -f1 | grep -vxE 'PWD|SHLVL|_|OLDPWD' | LC_ALL=C sort > "$d/env-names"
 if [ "${OP_SERVICE_ACCOUNT_TOKEN:-}" != "$(cat "$d/expected-token")" ]; then echo "fake-op: wrong token" >&2; exit 6; fi
+if [ "$1" = item ]; then
+  if [ "$#" -ne 10 ] || [ "$2" != get ] || [ "$3" != "$(cat "$d/item")" ] || [ "$4" != --vault ] \
+     || [ "$5" != "$(cat "$d/vault")" ] || [ "$6" != --fields ] || [ ! -f "$d/field" ] \
+     || [ "$7" != "label=$(cat "$d/field")" ] || [ "$8" != --reveal ] || [ "$9" != --format ] || [ "${10}" != json ]; then
+    echo "fake-op: unexpected args" >&2; exit 7; fi
+  if [ -f "$d/fail" ]; then cat "$d/fail" >&2; exit 1; fi
+  if [ -f "$d/raw-field-output" ]; then cat "$d/raw-field-output"; exit 0; fi
+  python3 -c 'import json,sys; print(json.dumps({"id": "x", "type": "STRING", "label": sys.argv[1], "value": open(sys.argv[2]).read()}))' "$(cat "$d/field")" "$d/key.json"
+  exit 0
+fi
 if [ "$#" -ne 5 ] || [ "$1" != document ] || [ "$2" != get ] || [ "$3" != "$(cat "$d/item")" ] \
    || [ "$4" != --vault ] || [ "$5" != "$(cat "$d/vault")" ]; then echo "fake-op: unexpected args" >&2; exit 7; fi
 if [ -f "$d/fail" ]; then cat "$d/fail" >&2; exit 1; fi
