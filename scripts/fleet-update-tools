@@ -56,7 +56,7 @@ root = Path(sys.argv[1]).resolve().parent.parent
 dry = sys.argv[2] == "1"
 canary_tool, canary_version = sys.argv[3:5]
 canary = bool(canary_tool)
-home = Path.home()
+home = Path.home().resolve()
 state = home / ".local/state/fleet-update-tools"
 env = dict(os.environ, LC_ALL="C", HOMEBREW_NO_AUTO_UPDATE="1", HOMEBREW_NO_ANALYTICS="1",
            npm_config_update_notifier="false")
@@ -383,7 +383,7 @@ def prepare_canary(name):
     native = name == "claude" and inside(resolved, home / ".local/share/claude/versions")
     if not native and not npm:
         raise Failure("canary_unsupported_install")
-    sandbox = Path(tempfile.mkdtemp(prefix="fleet-tools-canary-"))
+    sandbox = Path(tempfile.mkdtemp(prefix="fleet-tools-canary-")).resolve()
     home = sandbox / "home"
     home.mkdir()
     state = home / ".local/state/fleet-update-tools"
