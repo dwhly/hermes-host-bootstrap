@@ -900,3 +900,24 @@ def test_document_mode_unchanged_when_no_op_field(env):
     env.mod.configure("btp")
     env.mod._load_key()
     assert env.op_calls()[-1].split()[:2] == ["document", "get"]
+
+
+@pytest.mark.parametrize("first,second", [(None, "JSON"), ("JSON", None), ("JSON", "Key JSON")])
+def test_op_field_change_alone_clears_both_caches(env, first, second):
+    m = env.mod
+    env.write_cfg("btp", op_field=first)
+    m.configure("btp")
+    m.access_token("dwhaley@btpautomation.com", [GMAIL])
+    assert m._key_cache is not None and m._tok_cache
+    env.write_cfg("btp", op_field=second)                 # only op_field differs
+    m.configure("btp")
+    assert m._key_cache is None and m._tok_cache == {}
+    m.access_token("dwhaley@btpautomation.com", [GMAIL])
+    last = env.op_calls()[-1].split()
+    assert last[:2] == (["document", "get"] if second is None else ["item", "get"])
+    if second is not None:
+        assert f"label={second.split()[0]}" in last       # argv is space-split in the log; first word suffices
+    n = len(env.op_calls())
+    m.configure("btp")                                    # same identity: caches kept, no new op call
+    m.access_token("dwhaley@btpautomation.com", [GMAIL])
+    assert m._key_cache is not None and m._tok_cache and len(env.op_calls()) == n
