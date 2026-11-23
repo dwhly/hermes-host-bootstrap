@@ -127,5 +127,69 @@ class Handle(unittest.IsolatedAsyncioTestCase):
             gw.HEADER_TIMEOUT = old
 
 
+class Tunnel(unittest.IsolatedAsyncioTestCase):
+    async def test_non_reading_client_cannot_pin_the_slot(self):
+        """Upstream floods, client never reads: drain() blocks forever without the watchdog."""
+        import socket
+
+        async def flood(_r, w):
+            try:
+                while True:
+                    w.write(b"x" * 65536)
+                    await w.drain()
+            except Exception:
+                pass
+        up = await asyncio.start_server(flood, "127.0.0.1", 0)
+        up_port = up.sockets[0].getsockname()[1]
+        finished = asyncio.Event()
+
+        async def handler(cr, cw):
+            ur, uw = await asyncio.open_connection("127.0.0.1", up_port)
+            await gw._tunnel(cr, cw, ur, uw, idle=0.5, tick=0.1)
+            finished.set()
+        front = await asyncio.start_server(handler, "127.0.0.1", 0)
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        s.connect(front.sockets[0].getsockname())   # connect, then never read
+        try:
+            await asyncio.wait_for(finished.wait(), 5)
+        finally:
+            s.close(); front.close(); up.close()
+
+    async def test_busy_one_way_stream_is_not_cut(self):
+        """Steady download while the client sends nothing must outlive the idle window."""
+        async def trickle(_r, w):
+            for _ in range(15):
+                w.write(b"y" * 100); await w.drain(); await asyncio.sleep(0.1)
+            w.close()
+        up = await asyncio.start_server(trickle, "127.0.0.1", 0)
+        got = bytearray()
+
+        async def handler(cr, cw):
+            ur, uw = await asyncio.open_connection("127.0.0.1", up.sockets[0].getsockname()[1])
+            await gw._tunnel(cr, cw, ur, uw, idle=0.5, tick=0.1)
+        front = await asyncio.start_server(handler, "127.0.0.1", 0)
+        r, w = await asyncio.open_connection(*front.sockets[0].getsockname())
+        while chunk := await asyncio.wait_for(r.read(4096), 3):
+            got += chunk
+        w.close(); front.close(); up.close()
+        self.assertEqual(len(got), 1500)
+
+
+class Accounting(unittest.IsolatedAsyncioTestCase):
+    async def test_uncapped_usage_is_pruned_on_the_request_path(self):
+        import time as _t
+        g = gw.Gateway({"listen": [], "routes": {"paid": {"type": "http", "url": "http://x:1"}},
+                        "policies": [{"name": "yt", "match": ["youtube.com"], "routes": ["paid"]}]})
+        r = g.routes["paid"]
+        r.recent.extend([_t.time() - 7200] * 10000)
+
+        async def ok_open(host, port):
+            return reader_for(b""), FakeWriter()
+        r.open = ok_open
+        await g.handle(reader_for(b"CONNECT www.youtube.com:443 HTTP/1.1\r\n\r\n"), FakeWriter())
+        self.assertEqual(len(r.recent), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

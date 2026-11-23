@@ -81,9 +81,13 @@ class Route:
         except ValueError:
             pass
 
-    def over_cap(self) -> bool:
+    def prune(self) -> None:
         now = time.time()
         self.recent[:] = [t for t in self.recent if now - t < 3600]  # in place: list is shared per ip_group
+
+    def over_cap(self) -> bool:
+        self.prune()
+        now = time.time()
         return any(lim is not None and sum(1 for t in self.recent if now - t < win) >= lim
                    for win, lim in self.caps.items())
 
@@ -211,7 +215,7 @@ class Gateway:
                     up = await asyncio.wait_for(route.open(host, port), CONNECT_TIMEOUT)
                     route.ok += 1; route.last_ok_at = time.time()
                     if not slot:
-                        route.recent.append(time.time())  # uncapped routes: usage stats only
+                        route.prune(); route.recent.append(time.time())  # uncapped: usage stats only, bounded to 1h
                     log.info("OK %s %s:%s via %s [%s]", peer[0], host, port, rn, pol["name"])
                     break
                 except Exception as e:  # try next route
@@ -224,8 +228,7 @@ class Gateway:
                 writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"); await writer.drain(); return
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n"); await writer.drain()
             ur, uw = up
-            act = [time.monotonic()]  # shared last-activity: a tunnel is idle only when BOTH directions are
-            await asyncio.gather(_pipe(reader, uw, act), _pipe(ur, writer, act))
+            await _tunnel(reader, writer, ur, uw)
         except Exception as e:
             log.debug("conn error %s: %s", peer, e)
         finally:
@@ -238,26 +241,39 @@ class Gateway:
                 "routes": {n: r.status() for n, r in self.routes.items()}}
 
 
-async def _pipe(r, w, act):
+async def _tunnel(cr, cw, ur, uw, idle=None, tick=None):
+    """Splice client<->upstream. One watchdog owns expiry: when NEITHER direction has moved bytes for
+    `idle` seconds (a blocked write that never drains counts as no progress), both pumps are cancelled
+    and both transports aborted, so a stalled peer can never pin a connection slot."""
+    idle = IDLE_TIMEOUT if idle is None else idle
+    tick = min(30.0, idle / 4) if tick is None else tick
+    act = [time.monotonic()]
+
+    async def pump(r, w):
+        while data := await r.read(65536):
+            w.write(data)
+            await w.drain()          # may block on a non-reading peer; the watchdog bounds it
+            act[0] = time.monotonic()
+
+    tasks = [asyncio.ensure_future(pump(cr, uw)), asyncio.ensure_future(pump(ur, cw))]
     try:
         while True:
-            try:
-                data = await asyncio.wait_for(r.read(65536), 30)
-            except asyncio.TimeoutError:
-                if time.monotonic() - act[0] > IDLE_TIMEOUT:
-                    break
-                continue
-            if not data:
+            done, _ = await asyncio.wait(tasks, timeout=tick, return_when=asyncio.FIRST_COMPLETED)
+            if done:          # one side finished (EOF/error): half-close is not needed for CONNECT use
                 break
-            act[0] = time.monotonic()
-            w.write(data); await w.drain()
-    except Exception:
-        pass
+            if time.monotonic() - act[0] > idle:
+                log.debug("tunnel idle > %ss, closing", idle)
+                break
     finally:
-        try:
-            w.close()
-        except Exception:
-            pass
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for w in (uw, cw):
+            try:
+                tr = getattr(w, "transport", None)
+                (tr.abort() if tr is not None else w.close())
+            except Exception:
+                pass
 
 
 def _expand_env(obj):
