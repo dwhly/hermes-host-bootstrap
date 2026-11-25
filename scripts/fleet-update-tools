@@ -459,7 +459,9 @@ def inspect(row):
         row["result"] = "held:dry_run"
         print(name + ": would check ownership, idle state and npm's 24-hour-soaked target; no commands run")
         return
-    if in_use():
+    # Canary mode installs into a throwaway sandbox HOME and never touches the live tools,
+    # so live agent sessions (busy build hosts run them all night) must not defer it.
+    if not canary and in_use():
         row["result"] = "deferred:in_use"
         return
     owned = False if canary else brew_owns(name, entry, resolved)
@@ -495,7 +497,7 @@ def inspect(row):
     if (home / ".config/fleet-update/pause-tools").exists():
         row["result"] = "paused"
         return
-    if in_use():
+    if not canary and in_use():
         row["result"] = "deferred:in_use"
         return
 
@@ -507,7 +509,7 @@ def inspect(row):
         return
     backup = save_backup(name, entry, resolved, prefix, old)
     # The backup copy can take a while; re-check that no agent started meanwhile.
-    if in_use():
+    if not canary and in_use():
         row["result"] = "deferred:in_use"
         return
 

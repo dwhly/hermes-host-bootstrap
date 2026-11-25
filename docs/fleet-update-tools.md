@@ -129,7 +129,11 @@ updates the original prefix. Unsupported layouts fail rather than mutate them.
 Its temporary HOME is retained and printed, including backup/status/log evidence.
 Only a verified update followed by verified forced rollback prints `Canary PASS`
 and exits 0; a hold, install failure, or a version unavailable as a native build
-fails the canary. Normal updates are unaffected by the forced-failure mode.
+fails the canary. Normal updates are unaffected by the forced-failure mode. The canary
+ignores live agent sessions (it never touches the live tools), so it can run on a busy
+build host; normal updates still defer while an agent runs. If another session
+self-updates the tool while the canary copies it, the copy can be torn; that shows
+as a canary FAIL (rerun), never as damage to the live install.
 
 From the checkout on **each host**, select stable, non-deprecated versions that
 have soaked for 24 hours and differ from the installed versions. This exact

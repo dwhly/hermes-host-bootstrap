@@ -907,6 +907,21 @@ def test_canary_isolated_real_transaction_with_forced_failure(fleet, name, metho
     assert len(fleet.installs()) == 1
 
 
+
+def test_canary_ignores_live_agent_sessions(fleet):
+    # The canary works in a throwaway HOME; a busy host's live sessions must not defer it.
+    fleet.install('claude', 'native')
+    fleet.cfg['processes'] = '/tmp/claude -p hello'
+    before = snapshot(fleet.home)
+    proc = fleet.run('--canary-check', 'claude', '2.0.0')
+    assert 'Canary PASS' in proc.stdout
+    assert snapshot(fleet.home) == before
+    # ...while a normal (non-canary) run on the same host still defers.
+    normal = fleet.run()
+    assert next(r for r in normal['tools'] if r['name'] == 'claude')['result'] == 'deferred:in_use'
+    assert len(fleet.installs()) == 1  # only the canary's sandbox install
+
+
 def test_unsupported_atomic_exchange_holds_before_install(fleet):
     fleet.install('codex')
     with (fleet.tmp / 'patches/sitecustomize.py').open('a') as stream:
