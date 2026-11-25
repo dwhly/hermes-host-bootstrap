@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Tier 1 easy repos only. Installed as a symlink by M9-fleet-update-easy.
-# --dry-run prints the fetch plan and cached rev-list counts; no state writes.
+# Tier 1 easy repos and installed shell snippets. Symlinked by M9-fleet-update-easy.
+# --dry-run prints repo/snippet plans and cached rev-list counts; no writes.
 # Keep the entire runner in a function: fast-forwarding this checkout may replace
 # this script while it is running. Bash parses the function before invoking it.
 set -euo pipefail
@@ -30,10 +30,13 @@ main() {
   fi
   python3 - "${BASH_SOURCE[0]}" "$dry" "$no_git" <<'PY'
 import datetime
+import errno
 import json
 import os
 from pathlib import Path
+import re
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -48,7 +51,7 @@ env = dict(os.environ, LC_ALL="C", GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="
 ssh_defaults = {}
 
 
-def git(path, *args, capped=False, check=True):
+def git(path, *args, capped=False, check=True, input_bytes=None):
     command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0",
                "-c", "maintenance.auto=false", "-c", "merge.autoStash=false",
                "-c", "submodule.recurse=false", "-c", "core.quotePath=false",
@@ -79,7 +82,8 @@ def git(path, *args, capped=False, check=True):
             proc = subprocess.CompletedProcess(command, 124 if timed_out else child.returncode,
                                                stdout, stderr)
     else:
-        proc = subprocess.run(command, env=env, stdin=subprocess.DEVNULL,
+        proc = subprocess.run(command, env=env, input=input_bytes,
+                              stdin=subprocess.DEVNULL if input_bytes is None else None,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if check and proc.returncode:
         raise RuntimeError(proc.stderr.decode(errors="replace").strip() or
@@ -210,17 +214,270 @@ def inspect(row, path):
     return row
 
 
-def atomic_write(path, content):
+def copy_signature(info):
+    # Ignore atime, which our own read may have changed.
+    return tuple(getattr(info, key) for key in (
+        "st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_nlink",
+        "st_size", "st_mtime_ns", "st_ctime_ns"))
+
+
+def copy_hold(info):
+    if not stat.S_ISREG(info.st_mode):
+        return "held:not_regular"
+    if info.st_uid != os.geteuid():
+        return "held:foreign_owner"
+    if info.st_gid != os.getegid():
+        return "held:foreign_group"
+    if info.st_nlink > 1:
+        return "held:hardlinked"
+    return None
+
+
+def read_copy(path):
+    try:
+        # Never follow links or block on a FIFO, including one swapped in during
+        # inspection. Validate and read the same descriptor, not a reopened path.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            before = os.fstat(fd)
+            reason = copy_hold(before)
+            if reason:
+                return reason, None, None
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                content = stream.read()
+            if copy_signature(before) != copy_signature(os.fstat(fd)):
+                return "held:local_edits", None, None
+            # A path swap after open must not authorize replacing a different inode.
+            after = path.lstat()
+            reason = copy_hold(after)
+            if reason:
+                return reason, None, None
+            if copy_signature(before) != copy_signature(after):
+                return "held:local_edits", None, None
+            return None, before, content
+        finally:
+            os.close(fd)
+    except FileNotFoundError:
+        return "skipped:absent", None, None
+    except PermissionError:
+        return "held:unreadable", None, None
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EISDIR, errno.ENXIO):
+            return "held:not_regular", None, None
+        raise
+
+
+def check_copy(path, before, content):
+    reason, after, actual = read_copy(path)
+    if reason:
+        return "held:local_edits" if reason == "skipped:absent" else reason
+    if copy_signature(before) != copy_signature(after) or actual != content:
+        return "held:local_edits"
+    return None
+
+
+def prepare_write(path, content, mode=None):
     fd, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent))
     try:
-        with os.fdopen(fd, "w") as stream:
+        with os.fdopen(fd, "wb" if isinstance(content, bytes) else "w") as stream:
             stream.write(content)
             stream.flush()
+            if mode is not None:
+                os.fchmod(stream.fileno(), mode)
             os.fsync(stream.fileno())
+        return temporary
+    except BaseException:
+        os.unlink(temporary)
+        raise
+
+
+def atomic_write(path, content):
+    temporary = prepare_write(path, content)
+    try:
         os.replace(temporary, path)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+SNIPPETS = [
+    ("dotfiles/aliases.sh", ".hermes-host-bootstrap.aliases.sh"),
+    ("dotfiles/zshrc-snippet.sh", ".hermes-host-bootstrap.zshrc"),
+    ("dotfiles/zshenv-snippet.sh", ".hermes-host-bootstrap.zshenv.sh"),
+    ("dotfiles/tmux-autoattach.sh", ".hermes-host-bootstrap.tmux-autoattach.sh"),
+    ("dotfiles/hssh.sh", ".hermes-host-bootstrap.hssh.sh"),
+    ("dotfiles/mouse-heal.sh", ".hermes-host-bootstrap.mouse-heal.sh"),
+    ("dotfiles/tmux-workspace-colors.conf", ".hermes-host-bootstrap.tmux-workspace-colors.conf"),
+]
+
+
+def snippet_error(entry, exc):
+    entry["result"] = "error"
+    # Git stderr can contain private config; never report it or file contents.
+    entry["message"] = "snippet refresh failed ({})".format(type(exc).__name__)
+
+
+def hold_snippets(row):
+    for entry in row["files"]:
+        result = entry["result"]
+        if result.startswith("held:") or result == "error":
+            row["result"] = "held:error" if result == "error" else result
+            for other in row["files"]:
+                if other["result"] == "refreshable":
+                    other["result"] = "skipped:set_held"
+            return True
+    return False
+
+
+def inspect_snippets(bootstrap):
+    row = dict(name="shell-snippets", path=str(home), result="current",
+               **{"from": None, "to": None, "behind_after": None, "files": []})
+    if bootstrap is None:
+        row["result"] = "skipped:no_bootstrap_row"
+        return row
+    checkout = Path(bootstrap["path"])
+    result = bootstrap["result"]
+    ready = (result == "current" or result.startswith("updated ")
+             or (dry and result.startswith("would_update ")))
+    if checkout.resolve() != root:
+        ready = False
+        row["result"] = "skipped:checkout_mismatch"
+    elif not ready:
+        row["result"] = result if result.startswith("skipped:") else "skipped:" + result
+    if dry:
+        print("shell-snippets: preview against the current (pre-merge) checkout")
+    if ready:
+        try:
+            module = git(checkout, "show", "HEAD:lib/30-shell.sh").stdout.decode().replace("\\\n", " ")
+            copies = re.findall(r'\bcp "\$REPO_ROOT/(dotfiles/[^"\n]+)"\s+"\$HOME/(\.hermes-host-bootstrap\.[^"\n]+)"', module)
+        except Exception as exc:
+            snippet_error(row, exc)
+            return row
+        if sorted(copies) != sorted(SNIPPETS):
+            row["result"] = "held:mapping_changed"
+            return row
+    plans = []
+    for source, target in SNIPPETS:
+        path = home / target
+        entry = dict(source=source, path=str(path), result=row["result"])
+        row["files"].append(entry)
+        if ready:
+            try:
+                reason, before, installed = read_copy(path)
+                if reason:
+                    entry["result"] = reason
+                else:
+                    plans.append(dict(entry=entry, path=path, before=before, installed=installed))
+            except Exception as exc:
+                snippet_error(entry, exc)
+    if not ready:
+        return row
+
+    sources = [source for source, _ in SNIPPETS]
+    if plans:
+        try:
+            # A deleted/renamed HEAD source is held even if an untracked file was
+            # recreated at its old path. All Git and source reads use the row path.
+            tree = git(checkout, "ls-tree", "--name-only", "-z", "HEAD", "--", *sources).stdout
+            present = set(tree.decode().split("\0"))
+        except Exception as exc:
+            for plan in plans:
+                snippet_error(plan["entry"], exc)
+            hold_snippets(row)
+            return row
+        for plan in plans:
+            entry = plan["entry"]
+            try:
+                if entry["source"] not in present:
+                    entry["result"] = "held:source_absent"
+                    continue
+                plan["current"] = git(checkout, "show", "HEAD:" + entry["source"]).stdout
+                entry["result"] = ("current" if plan["installed"] == plan["current"]
+                                   else "refreshable")
+            except FileNotFoundError:
+                entry["result"] = "held:source_absent"
+            except PermissionError:
+                entry["result"] = "held:unreadable"
+            except Exception as exc:
+                snippet_error(entry, exc)
+
+    different = [plan for plan in plans if plan["entry"]["result"] == "refreshable"]
+    if different:
+        try:
+            # One walk for the whole set, with separate blob IDs for each path.
+            history = git(checkout, "log", "--format=", "--raw", "-z", "--no-abbrev",
+                          "--no-renames", "--no-ext-diff", "--no-textconv", "--full-history",
+                          "--root", "-m", "--", *sources).stdout.split(b"\0")
+            blobs = {source: set() for source in sources}
+            for index in range(0, len(history) - 1, 2):
+                header, source = history[index:index + 2]
+                if header.startswith(b":") and os.fsdecode(source) in blobs:
+                    blobs[os.fsdecode(source)].update(header.split()[2:4])
+            shallow = value(checkout, "rev-parse", "--is-shallow-repository") == "true"
+        except Exception as exc:
+            for plan in different:
+                snippet_error(plan["entry"], exc)
+        else:
+            for plan in different:
+                entry = plan["entry"]
+                try:
+                    # Hash inspected bytes without clean filters or writing an object.
+                    blob = git(checkout, "hash-object", "--stdin",
+                               input_bytes=plan["installed"]).stdout.strip()
+                    if blob not in blobs[entry["source"]]:
+                        entry["result"] = "held:no_history" if shallow else "held:local_edits"
+                except Exception as exc:
+                    snippet_error(entry, exc)
+    if hold_snippets(row):
+        return row
+
+    # Stage every replacement before changing any destination. Preparation errors
+    # and edits during staging therefore hold the entire set, including current files.
+    temporary = {}
+    try:
+        if not dry:
+            for plan in different:
+                try:
+                    temporary[plan["path"]] = prepare_write(
+                        plan["path"], plan["current"], stat.S_IMODE(plan["before"].st_mode))
+                except Exception as exc:
+                    snippet_error(plan["entry"], exc)
+        if hold_snippets(row):
+            return row
+        for plan in plans:
+            try:
+                reason = check_copy(plan["path"], plan["before"], plan["installed"])
+                if reason:
+                    plan["entry"]["result"] = reason
+            except Exception as exc:
+                snippet_error(plan["entry"], exc)
+        if hold_snippets(row):
+            return row
+        for plan in different:
+            entry = plan["entry"]
+            try:
+                if dry:
+                    print("shell-snippets: would refresh ~/" + plan["path"].name)
+                    entry["result"] = "would_refresh"
+                else:
+                    # Recheck immediately before each atomic replacement too.
+                    reason = check_copy(plan["path"], plan["before"], plan["installed"])
+                    if reason:
+                        entry["result"] = reason
+                    else:
+                        os.replace(temporary[plan["path"]], plan["path"])
+                        entry["result"] = "refreshed"
+            except Exception as exc:
+                snippet_error(entry, exc)
+            if hold_snippets(row):
+                return row
+        if different:
+            row["result"] = "refreshed {}".format(len(different))
+    finally:
+        for path in temporary.values():
+            if os.path.exists(path):
+                os.unlink(path)
+    return row
 
 
 try:
@@ -248,6 +505,14 @@ try:
         print("{}: {}{}".format(name, row["result"],
               " " + row["message"] if "message" in row else
               " " + json.dumps(row["files"]) if row["files"] else ""))
+    bootstrap = next((row for row in report["repos"] if row["name"] == "hermes-host-bootstrap"), None)
+    snippets = inspect_snippets(bootstrap)
+    report["repos"].append(snippets)
+    summary = snippets["result"]
+    if dry and summary.startswith("refreshed "):
+        summary = "would refresh " + summary.split()[1]
+    print("shell-snippets: {}{}".format(summary,
+          " " + json.dumps(snippets["files"]) if snippets["result"] != "current" else ""))
     if not dry:
         atomic_write(state / "status.json", json.dumps(report, indent=2) + "\n")
         log = state / "log"
@@ -256,7 +521,8 @@ try:
         lines = log.read_text().splitlines(keepends=True)
         if len(lines) > 500:
             atomic_write(log, "".join(lines[-500:]))
-    if any(row["result"] == "error" for row in report["repos"]):
+    if (any(row["result"] == "error" for row in report["repos"])
+            or any(entry["result"] == "error" for entry in snippets["files"])):
         sys.exit(1)
 except (OSError, ValueError, RuntimeError) as exc:
     print("fleet-update-easy: " + str(exc), file=sys.stderr)

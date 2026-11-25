@@ -25,9 +25,12 @@ and stderr go to `launchd.stdout.log` and `launchd.stderr.log` in the state dire
 Linux enables and starts only the timer, restarting it only when the unit files
 change. M9 never starts or restarts the oneshot service.
 
-Run `hmu` (or `fleet-update-easy`) for an immediate update. `--dry-run` only prints
-the fetch/merge plan and reads cached `rev-list --count` counts; it does not fetch
-objects, change refs, acquire/create the state lock, or write status files. Cached
+Run `hmu` (or `fleet-update-easy`) for an immediate update. `--dry-run` prints
+the fetch/merge plan, reads cached `rev-list --count` counts, and previews snippet
+refreshes against the current **pre-merge** checkout and its local history.
+The output explicitly identifies this preview; a real run may fast-forward to
+different source bytes before refreshing. It does not fetch
+objects, change refs, acquire/create the state lock, or write any files. Cached
 counts can lag the remote; a missing cached remote HEAD reports `unknown_default`.
 Fetches in normal runs have a 120-second cap, followed by SIGTERM and up to 10
 seconds for Git to clean up its locks before a forced kill.
@@ -52,6 +55,90 @@ Git hooks, auto-stash, recursive submodule updates, and automatic maintenance ar
 disabled for these operations. SSH defaults to `BatchMode=yes` only when neither
 `core.sshCommand` nor `GIT_SSH_COMMAND` is set. A concurrent invocation prints
 `busy` and exits 0.
+
+After the three repository rows, `repos` contains one `shell-snippets` row. It
+looks up `hermes-host-bootstrap` by name and uses that row's path for every source
+read and snippet Git command. That path must resolve to the running script's
+checkout; otherwise the snippets report `skipped:checkout_mismatch`. Using the
+checkout's Git HEAD after its fast-forward (never worktree bytes), tier 1 refreshes
+these existing copies installed verbatim (plain `cp`, without templating) by
+`30-shell`:
+
+| Repository source | Installed copy |
+| --- | --- |
+| `dotfiles/aliases.sh` | `~/.hermes-host-bootstrap.aliases.sh` |
+| `dotfiles/zshrc-snippet.sh` | `~/.hermes-host-bootstrap.zshrc` |
+| `dotfiles/zshenv-snippet.sh` | `~/.hermes-host-bootstrap.zshenv.sh` |
+| `dotfiles/tmux-autoattach.sh` | `~/.hermes-host-bootstrap.tmux-autoattach.sh` |
+| `dotfiles/hssh.sh` | `~/.hermes-host-bootstrap.hssh.sh` |
+| `dotfiles/mouse-heal.sh` | `~/.hermes-host-bootstrap.mouse-heal.sh` |
+| `dotfiles/tmux-workspace-colors.conf` | `~/.hermes-host-bootstrap.tmux-workspace-colors.conf` |
+
+Before inspecting copies, the runner parses the snippet `cp` mapping from Git
+HEAD's `lib/30-shell.sh`. Any added, removed, or renamed pair holds the entire set with
+`held:mapping_changed` and exits 0. This also guards against new snippets that
+existing ones source. A missing bootstrap row reports `skipped:no_bootstrap_row`.
+
+Once the mapping matches, its `files` list contains `source`, installed `path`,
+and `result` for each pair.
+Absent copies are `skipped:absent`, never created, and do not block the other
+copies: `30-shell` installs some conditionally (tmux workspace colours only when
+tmux is present), so absence is normal. There is no present-versus-absent
+"incomplete" rule; the mapping guard above protects against new files.
+Identical bytes are `current` without hashing or Git history lookups.
+When any copy differs, one `git log` over all seven source paths collects
+historical blob IDs, kept separate by source path with rename detection disabled.
+A differing copy is eligible only if its bytes match a historical blob of its
+exact source path.
+
+The refresh decision is all-or-nothing: every present copy is inspected before
+any replacement. If any copy is held or inspection fails, **none are refreshed**.
+The row reports `held:<first reason>` in the table's order, with each file's own
+reason preserved; otherwise eligible copies report `skipped:set_held`. Current
+copies remain `current`. The possible per-file holds are:
+
+- `held:local_edits`: differing bytes are not in that source's history, or a copy
+  changed during the run.
+- `held:source_absent`: the source was deleted or renamed at HEAD.
+  This is a normal hold, not an error.
+- `held:unreadable`: access to the copy or source raises `PermissionError`.
+- `held:not_regular`: a copy is a symlink (including a dangling link), FIFO,
+  directory, or another nonregular file.
+- `held:foreign_owner`: the copy's owner differs from the updater's effective UID.
+- `held:foreign_group`: the copy's group differs from the updater's effective GID.
+- `held:hardlinked`: the copy has more than one hard link.
+- `held:no_history`: the checkout is shallow and the installed bytes have no
+  match in its available history. Missing history cannot establish whether those
+  bytes are an older copy or local edits. The updater does not deepen clones;
+  the owner must restore sufficient history or resolve the copy manually.
+
+Installed copies are opened with `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`, checked
+with `fstat`, and read from that same descriptor. Links are never followed and
+FIFOs cannot block the updater. All replacements are prepared in temporary files
+in the same directory, flushed and fsynced, preserving installed modes. Refreshed
+copies take the runner's group and lose extended attributes (xattrs) and ACLs.
+Copies with a different group are held instead. The whole
+present set is checked again after preparation, and each destination is checked
+again immediately before its atomic rename. Preparation failures also block the
+whole set. The renames are individual filesystem operations, not a transaction
+across seven paths: an interruption or a new failure during the rename phase
+stops further replacements. Running shells are not locked by the updater.
+
+The row result is `current` when nothing needs refreshing (including absent
+copies), `refreshed N`, or the first hold reason. Unexpected per-file failures
+report `error` with a sanitized exception type; the row is `held:error` if that
+is the first blocker. Any per-file error exits 1 after reporting, even if an
+earlier hold supplies the row reason. Ordinary holds and absent copies exit 0.
+If the bootstrap row is held, skipped, or errored, all snippets are skipped with
+that reason, such as `skipped:held:local_edits`, `skipped:absent`, or
+`skipped:error`. Dry runs apply the same set-wide decision and print
+`would refresh` and per-file `would_refresh` only for an eligible set, without
+writing. The snippet row's commit and distance fields are null. Current sets
+omit per-file JSON from stdout; the status and log retain all seven outcomes.
+
+Tier 1 never touches user-owned `~/.tmux.conf`, `~/.inputrc`, or
+`~/.config/ghostty/config`. Shells pick up refreshed snippets on their next start;
+the updater does not reload running shells.
 
 No stash, reset, checkout, rebase, or commit is performed. Holds and fetch failures
 exit 0; fetch failures have a null `behind_after`. An unexpected repository error
