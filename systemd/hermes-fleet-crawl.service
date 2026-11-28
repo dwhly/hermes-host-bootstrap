@@ -1,0 +1,14 @@
+[Unit]
+Description=fleet-crawl relay (PROTOTYPE): shared fleet crawl/search service; nodes hold no vendor key
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/srv/fleet-crawl/fleet-crawl-run.sh
+Restart=on-failure
+RestartSec=5
+MemoryMax=128M
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

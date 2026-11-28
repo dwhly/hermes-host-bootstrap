@@ -1,0 +1,5 @@
+# fleet-crawl relay settings (non-secret). The upstream vendor appears ONLY here.
+FLEETCRAWL_UPSTREAM=https://api.firecrawl.dev
+FLEETCRAWL_KEY_REF="op://hermes/Firecrawl - Service and key/API key"
+FLEETCRAWL_LISTEN=127.0.0.1:3991
+FLEETCRAWL_LOG=/var/log/fleet-crawl/requests.tsv
